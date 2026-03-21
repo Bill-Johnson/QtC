@@ -1,0 +1,32 @@
+{
+    "user": {
+        "callsign": "",
+        "name": "",
+        "qth": "",
+        "zip": "",
+        "telnet_user": "",
+        "password": "",
+        "home_bbs": ""
+    },
+    "bbs_list": [],
+    "vara": {
+        "hf_host": "127.0.0.1",
+        "hf_cmd_port": 8300,
+        "hf_data_port": 8301,
+        "fm_host": "127.0.0.1",
+        "fm_cmd_port": 8300,
+        "fm_data_port": 8301
+    },
+    "ptt": {
+        "mode": "none",
+        "port": "",
+        "signal": "rts"
+    },
+    "app": {
+        "auto_check_mail": true,
+        "download_prompt": true,
+        "max_message_size_kb": 50,
+        "data_dir": "data"
+    },
+    "visited_bbs": {}
+}

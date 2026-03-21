@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400">
+
+  <!-- Background circle -->
+  <circle cx="200" cy="200" r="190" fill="#1a2a1a"/>
+  <circle cx="200" cy="200" r="190" fill="none" stroke="#3a5a3a" stroke-width="6"/>
+
+  <!-- Radio waves -->
+  <path d="M 270 155 A 50 50 0 0 1 270 245"
+        fill="none" stroke="#00ff88" stroke-width="9"
+        stroke-linecap="round" opacity="1.0"/>
+  <path d="M 270 125 A 80 80 0 0 1 270 275"
+        fill="none" stroke="#00ff88" stroke-width="7"
+        stroke-linecap="round" opacity="0.65"/>
+  <path d="M 270 92 A 115 115 0 0 1 270 308"
+        fill="none" stroke="#00ff88" stroke-width="5"
+        stroke-linecap="round" opacity="0.35"/>
+
+  <!-- QtC text -->
+  <text x="68" y="237"
+        font-family="'Helvetica Neue', Arial, sans-serif"
+        font-weight="700"
+        font-size="118"
+        fill="#00ff88"
+        letter-spacing="-4">QtC</text>
+
+</svg>
