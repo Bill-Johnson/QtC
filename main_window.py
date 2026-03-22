@@ -1,4 +1,4 @@
-# QtC v0.9.6-beta — main_window.py  (built 2026-03-21)
+# QtC v0.9.7-beta — main_window.py  (built 2026-03-22)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
-APP_VERSION = "0.9.6-beta"  # keep in sync with header comment
+APP_VERSION = "0.9.7-beta"  # keep in sync with header comment
 """
 QtC — Main Window (PyQt6)
 v0.2 — Quick-connect bar, auto-download, terminal swap button
@@ -1014,11 +1014,15 @@ class MailView(QWidget):
         self.msg_table.setColumnWidth(4, 52)
         self.msg_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
+        self.msg_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         self.msg_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers)
         self.msg_table.setAlternatingRowColors(True)
         self.msg_table.verticalHeader().setVisible(False)
         self.msg_table.currentCellChanged.connect(self._row_selected)
+        self.msg_table.selectionModel().selectionChanged.connect(
+            self._on_selection_changed)
         v.addWidget(self.msg_table)
 
         # Preview pane
@@ -1233,11 +1237,41 @@ class MailView(QWidget):
         if not it:
             return
         row_id = it.data(Qt.ItemDataRole.UserRole)
-        # Search results store folder in UserRole+1; normal view uses current folder
         folder_override = it.data(Qt.ItemDataRole.UserRole + 1)
         if row_id is not None:
             folder = folder_override if folder_override else self._current_folder()
             self.sig_row_selected.emit(row_id, folder)
+
+    def _on_selection_changed(self):
+        """Update delete button label to show count when multiple selected."""
+        rows = self.get_selected_ids()
+        count = len(rows)
+        if count > 1:
+            self.btn_delete.setText(f"🗑  Delete ({count})")
+            self.btn_delete.setEnabled(True)
+        elif count == 1:
+            self.btn_delete.setText("🗑  Delete")
+            self.btn_delete.setEnabled(True)
+        else:
+            self.btn_delete.setText("🗑  Delete")
+            self.btn_delete.setEnabled(False)
+
+    def get_selected_ids(self) -> list:
+        """Return list of (row_id, folder) tuples for all selected rows."""
+        seen = set()
+        result = []
+        for idx in self.msg_table.selectionModel().selectedRows():
+            it = self.msg_table.item(idx.row(), 1)
+            if not it:
+                continue
+            row_id = it.data(Qt.ItemDataRole.UserRole)
+            if row_id is None or row_id in seen:
+                continue
+            seen.add(row_id)
+            folder_override = it.data(Qt.ItemDataRole.UserRole + 1)
+            folder = folder_override if folder_override else self._current_folder()
+            result.append((row_id, folder))
+        return result
 
     def _current_folder(self):
         cur = self.folder_tree.currentItem()
@@ -3471,19 +3505,42 @@ class MainWindow(QMainWindow):
                 break
 
     def _on_delete(self):
-        if not self._current_row_id:
+        selected = self.mail_view.get_selected_ids()
+        if not selected:
             return
-        is_bulletin = self._current_folder.startswith("bulletin:")
-        label = "bulletin" if is_bulletin else "message"
-        r = QMessageBox.question(
-            self, f"Delete {label.capitalize()}",
-            f"Remove this {label} from local storage?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if r == QMessageBox.StandardButton.Yes:
-            if is_bulletin:
-                self.db.delete_bulletin(self._current_row_id)
+
+        count = len(selected)
+        # Determine label — all bulletins, all messages, or mixed
+        bulletin_ids = [(rid, f) for rid, f in selected
+                        if f.startswith("bulletin:") or f == "bulletins"]
+        msg_ids      = [(rid, f) for rid, f in selected
+                        if not (f.startswith("bulletin:") or f == "bulletins")]
+
+        if count == 1:
+            label = "bulletin" if bulletin_ids else "message"
+            prompt = f"Remove this {label} from local storage?"
+        else:
+            if bulletin_ids and not msg_ids:
+                label = f"{count} bulletins"
+            elif msg_ids and not bulletin_ids:
+                label = f"{count} messages"
             else:
-                self.db.delete_message(self._current_row_id)
+                label = f"{count} items"
+            prompt = f"Remove {label} from local storage?"
+
+        r = QMessageBox.question(
+            self, "Delete",
+            prompt,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+
+        if r == QMessageBox.StandardButton.Yes:
+            for row_id, folder in bulletin_ids:
+                self.db.delete_bulletin(row_id)
+            for row_id, folder in msg_ids:
+                self.db.delete_message(row_id)
+            self._current_row_id = None
+            self.mail_view.preview_header.setText("")
+            self.mail_view.preview_body.clear()
             self._refresh_folder(self._current_folder)
             self._update_folder_counts()
 

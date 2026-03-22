@@ -1,31 +1,53 @@
 # QtC — BBS Client for Amateur Radio  
-**v0.9.0-beta** · Linux · Windows 11 · Raspberry Pi
+**v0.9.7-beta** · Linux · Windows 11 · Raspberry Pi
 
 > *QTC — Q-code for "I have messages for you."*
 
 QtC is a modern desktop BBS client for amateur radio operators.  
-It connects to LinBPQ / BPQ32 nodes via **VARA HF** and **Telnet**,  
-and handles mail download, compose, send, address book, and a clean three-pane GUI.
+It connects to LinBPQ / BPQ32 nodes via **VARA HF**, **VARA FM**, and **Telnet**,  
+and handles mail download, bulletin subscriptions, compose, send, address book,  
+and a clean three-pane GUI.
 
 Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 
 ---
 
+## Screenshots
+
+![Inbox](screenshots/Inbox.png)
+*Three-pane inbox — folder tree, message list, and preview pane*
+
+![Bulletins](screenshots/Bulletins.png)
+*Bulletin view — SITREP category with full message preview*
+
+![Compose Message](screenshots/Compose_message.png)
+*Compose window — personal and bulletin message types, address book auto-fill*
+
+![BBS List](screenshots/BBS_List.png)
+*Settings — BBS List tab showing VARA HF and Telnet entries*
+
+---
+
 ## Features
 
-- **VARA HF** — RF connect with busy-channel detection and PTT control
-- **Telnet** — for local testing and LAN-connected nodes
+- **VARA HF / VARA FM** — RF connect with busy-channel detection and PTT control
+- **Telnet** — for local testing and LAN-connected nodes; auto-disconnects after mail check
 - **Mail check** — `LM` with new-only (PN) or full (PN+PY) options
 - **Auto-download** — new personal mail downloads automatically on connect
+- **Bulletins** — subscribe to categories (SITREP, EWN, WX, etc.); browse in folder panel
 - **Compose & reply** — personal (P) and bulletin (B) message types
 - **Outbox queue** — stage messages, send in one batch when connected
 - **Address book** — auto-fill in compose, use-count ranked dropdown
+- **Multi-select delete** — Ctrl+click or Shift+click to select and delete multiple messages
+- **Message search** — real-time filter with scope dropdown and amber highlight in preview
 - **Progress tracking** — download and send progress in toolbar and status bar
 - **VARA link stats** — live bitrate, SN, and bandwidth in status bar
-- **Terminal view** — clean dumb terminal with quick-command buttons
+- **Terminal view** — clean dumb terminal for manual BBS commands
 - **Debug view** — verbose session log for troubleshooting
-- **Folder badges** — Inbox (N new), Outbox (N), Sent (N)
+- **Folder badges** — Inbox (N new), Outbox (N), Bulletins (N new)
 - **Mark all read** — one-click bulk read in inbox
+- **Dark mode** — full Fusion dark palette, toggled in Settings → App
+- **Font size** — adjustable message font with live preview
 - **PTT control** — RTS or DTR via serial port
 - **Cross-platform** — Linux, Windows 11, Raspberry Pi OS
 
@@ -49,18 +71,15 @@ Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 
 ```bash
 sudo apt install python3-pyqt6 python3-pyserial
-tar -xzf QtC-0.9.0-beta.tar.gz
-cd QtC-0.9.0-beta
+tar -xzf QtC-0.9.7-beta.tar.gz
+cd QtC-0.9.7-beta
 ./install.sh
 ```
 
-Once installed, you can launch QtC two ways:
-- **Desktop icon** — look for the QtC icon in your applications menu or desktop
-- **Terminal** — type `qtc` from anywhere and press Enter
+Once installed, launch QtC from your applications menu or type `qtc` in a terminal.
 
 **Pi notes:**
-- VARA HF does not run natively on Pi — most Pi users have the best luck with
-  Pi-Apps and Winetricks. Search online for install and troubleshooting instructions
+- VARA HF does not run natively on Pi — most Pi users have the best luck with Pi-Apps and Winetricks
 - For a pure Telnet setup (LAN node), no VARA or PTT needed
 - PTT serial ports: `/dev/ttyUSB0`, `/dev/ttyACM0`, etc.
 - Serial port permission error? Run: `sudo usermod -aG dialout $USER` then log out and back in
@@ -70,17 +89,12 @@ Once installed, you can launch QtC two ways:
 ### Linux (Fedora / Ubuntu / Debian)
 
 ```bash
-tar -xzf QtC-0.9.0-beta.tar.gz
-cd QtC-0.9.0-beta
+tar -xzf QtC-0.9.7-beta.tar.gz
+cd QtC-0.9.7-beta
 ./install.sh
 ```
 
-The installer checks all five source files, installs dependencies, and places  
-a `qtc` launcher in `~/.local/bin/`. Config and messages are preserved on reinstall.
-
-Once installed, you can launch QtC two ways:
-- **Desktop icon** — look for the QtC icon in your applications menu or desktop
-- **Terminal** — type `qtc` from anywhere and press Enter
+The installer checks all five source files, installs dependencies, and places a `qtc` launcher in `/usr/local/bin/`. Config and messages are preserved on reinstall.
 
 To run manually without installing:
 ```bash
@@ -101,153 +115,84 @@ sudo apt install python3-pyqt6 python3-pyserial
 
 ### Windows 11
 
-QtC installs itself — you just need to get Python on your computer first,
-then run the installer script once. After that, a **QtC shortcut appears on
-your Desktop** and you never need to touch the command line again.
-
----
+QtC installs itself — you just need Python on your computer first, then run the installer script once. After that a **QtC shortcut appears on your Desktop**.
 
 #### Step 1 — Install Python (one time only)
 
-Python is the programming language QtC is written in. You only do this once.
+1. Go to: **https://www.python.org/downloads/**
+2. Click the big **"Download Python 3.x.x"** button
+3. Run the installer — **check "Add Python to PATH"** before clicking Install Now
+4. Click **Install Now** and let it finish
 
-1. Open your web browser and go to: **https://www.python.org/downloads/**
-2. Click the big yellow **"Download Python 3.x.x"** button
-3. Run the downloaded installer
-4. **Important:** On the very first screen, check the box that says
-   **"Add Python to PATH"** before clicking Install Now
-
-   > If you miss this checkbox, the installer won't be able to find Python.
-   > If that happens, uninstall Python and run the installer again with the
-   > box checked.
-
-5. Click **Install Now** and let it finish
-
-To verify Python installed correctly:
-- Press **Windows key + R**, type `cmd`, press Enter
-- In the black window, type `python --version` and press Enter
-- You should see something like `Python 3.12.x`
-- Close the window
-
----
+To verify: press **Win+R**, type `cmd`, press Enter, type `python --version`.
 
 #### Step 2 — Extract the QtC files
 
-QtC comes in a `.tar.gz` archive file (similar to a `.zip`).
+1. Right-click `QtC-0.9.7-beta.tar.gz` → **Extract All**
+2. You may need to extract twice — `.tar.gz` → `.tar` → folder
+3. Result: a folder called `QtC-0.9.7-beta` containing `.py` files
 
-**Windows 11 can open it directly:**
-1. Right-click `QtC-0.9.0-beta.tar.gz`
-2. Select **Extract All...**
-3. Click **Extract**
-4. You may need to extract twice — once for the `.tar.gz` → `.tar`,
-   then again for the `.tar` → folder. Keep extracting until you see
-   a folder called `QtC-0.9.0-beta` containing `.py` files.
-
-**Or use 7-Zip** (free, recommended): https://www.7-zip.org/
-Right-click the file → **7-Zip → Extract Here**
-
-When done, you should have a folder called `QtC-0.9.0-beta` with files
-like `main_window.py`, `install.ps1`, etc. inside it.
-
----
+**Or use 7-Zip** (free): https://www.7-zip.org/
 
 #### Step 3 — Run the installer
 
-Windows has a security feature that blocks scripts downloaded from the
-internet. You need to do one extra step to allow the QtC installer to run.
-
-1. Open the `QtC-0.9.0-beta` folder
-2. Hold **Shift** and right-click on **`install.ps1`**
-3. Select **"Run with PowerShell"**
-
-   > A blue PowerShell window will appear. This is normal — it's the
-   > installer running.
-
-4. If Windows shows a warning like *"Windows protected your PC"* or
-   *"Do you want to allow this app?"* — click **"Run anyway"** or **"Yes"**
-
-5. If you see a red error like *"cannot be loaded because running scripts
-   is disabled"*, do this:
-   - Press **Windows key**, search for **PowerShell**
-   - Right-click PowerShell → **Run as administrator**
-   - Type this command and press Enter:
-     ```
-     Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-     ```
-   - Type `Y` and press Enter
-   - Close PowerShell, then go back to Step 3 and try again
-
-6. The installer will check for Python, install the required libraries
-   (PyQt6 and pyserial), and create a **QtC shortcut on your Desktop**
-
-7. When it says **"QtC installed successfully!"** press Enter to close
-
----
+1. Open the `QtC-0.9.7-beta` folder
+2. Hold **Shift** + right-click **`install.ps1`** → **"Run with PowerShell"**
+3. If Windows shows *"Windows protected your PC"* — click **"Run anyway"**
+4. If you see *"scripts is disabled"* — open PowerShell as administrator and run:
+   ```
+   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+   ```
+5. When it says **"QtC installed successfully!"** press Enter to close
 
 #### Step 4 — Run QtC
 
-Double-click the **QtC** shortcut on your Desktop. That's it.
-
-The first time it opens, a setup window will appear automatically —
-enter your callsign and BBS details there.
-
----
+Double-click the **QtC** shortcut on your Desktop.
 
 **Windows notes:**
 - VARA HF must be running before you click Connect in QtC
-- Windows Firewall may ask to allow QtC when it first connects to VARA
-  (ports 8300/8301) — click **Allow access**
-- PTT serial ports show as `COM3`, `COM4`, etc. — select yours in
-  **Settings → PTT** and click **Test PTT** to verify
-- If QtC won't start after install, open a Command Prompt and run:
-  `python %APPDATA%\qtc\main_window.py` — any error will show there
+- Windows Firewall may ask to allow QtC on ports 8300/8301 — click **Allow access**
+- PTT serial ports show as `COM3`, `COM4`, etc. — select yours in **Settings → PTT**
 
 ---
 
 ## First-Time Setup
 
-1. Open **File → Settings → My Station**
-   - Enter your callsign, name, QTH, and Home BBS (Home BBS is optional)
-   - *New to BBS? Just fill in your Name and Callsign — that is all you need
-     to get connected. Add QTH, Home BBS, and other details later as you
-     learn your way around.*
-2. Go to the **BBS List** tab
-   - Edit the example entry or add your own
-   - Set transport (VARA HF recommended for HF operations)
-3. Go to the **PTT** tab
-   - Select your COM / serial port and signal (RTS recommended for Digirig)
-   - Click **Test PTT** to verify keying
-4. Close Settings and select your BBS from the dropdown
-5. Click **⚡ Connect**
+1. Open **File → Settings → My Station** — enter callsign, name, QTH, and Home BBS
+2. Go to the **BBS List** tab — add your BBS with transport (VARA HF or Telnet)
+3. Go to the **PTT** tab — select serial port and signal (RTS recommended for Digirig)
+4. Go to the **Bulletins** tab — enter category subscriptions (e.g. SITREP, EWN, WX)
+5. Close Settings, select your BBS from the dropdown, and click **⚡ Connect**
 
-On your first connection, QtC will ask whether to download all personal messages  
-or new ones only. After that, only new messages (PN) are fetched automatically —  
-keeping sessions short and efficient over slow RF links.
+On your first connection QtC will ask whether to download all personal messages or new only. After that, only new messages (PN) are fetched automatically — keeping sessions short and efficient over slow RF links.
 
 ---
 
-## VARA Setup — Beta
+## VARA Setup
 
 - VARA HF must be running on the **same machine** as QtC
 - VARA command port: **8300** (default)
 - VARA data port: **8301** (default)
 - Set your callsign in VARA to match the callsign in QtC Settings
-- Set VARA's own PTT setting to **None** — QtC keys the radio via RTS/DTR directly
-- *Access to VARA on a remote machine via IP address — coming soon*
+- Set VARA's PTT setting to **None** — QtC keys the radio via RTS/DTR directly
 
 ---
 
 ## Data Storage
 
-| Platform | Location |
+| Platform | Path |
 |---|---|
-| Linux / Pi | `~/.local/share/qtc/` |
-| Windows | `%APPDATA%\qtc\` |
-
-- `messages.db` — SQLite database (inbox, outbox, sent, contacts)
-- `config.json` — all settings
+| Linux / Pi — database | `~/.local/share/qtc/data/messages.db` |
+| Linux / Pi — config | `~/.local/share/qtc/config.json` |
+| Windows — database | `%APPDATA%\qtc\data\messages.db` |
+| Windows — config | `%APPDATA%\qtc\config.json` |
 
 Both files are preserved when you reinstall or upgrade.
+
+**To force a full bulletin re-download:**
+```bash
+sqlite3 ~/.local/share/qtc/data/messages.db "DELETE FROM bulletin_tombstones; DELETE FROM bulletins;"
+```
 
 ---
 
@@ -257,61 +202,56 @@ Both files are preserved when you reinstall or upgrade.
 |---|---|
 | `main_window.py` | GUI — PyQt6 main window, toolbar, mail view, terminal, dialogs |
 | `bbs_session.py` | BBS login, mail check, message download and send |
-| `transport.py` | VARA HF and Telnet transports, VaraControl |
+| `transport.py` | VARA HF, VARA FM, and Telnet transports |
 | `ptt.py` | PTT control via serial RTS/DTR |
-| `database.py` | SQLite inbox/outbox/sent/contacts |
+| `database.py` | SQLite inbox/outbox/sent/bulletins/contacts |
 
 ---
 
 ## Known Limitations (Beta)
 
 - No rig control yet — set frequency manually on your radio
-- Bulletin sending via compose works — bulletin *receiving* requires subscriptions in Settings → Bulletins
 - VARA FM support in code but not yet field tested
-- Direwolf and Soundmodem transports are planned for a future release
-- Windows 11 install script not yet tested on real hardware (0.9.0)
+- Direwolf and Soundmodem transports planned for a future release
+- Windows NSIS clickable installer planned — currently uses PowerShell script
 
 ---
 
 ## Changelog
 
+### 0.9.7-beta (2026-03-22)
+- Multi-select delete — Ctrl+click or Shift+click to select multiple messages or bulletins; Delete button shows count; confirm dialog names quantity and type
+
+### 0.9.6-beta (2026-03-21)
+- Fixed: Telnet Terminal View frozen after login — added background reader thread to TelnetTransport
+- Fixed: Telnet Mail View not downloading messages — terminal monitor was consuming socket data during download
+- Fixed: Toolbar status text hard-clipped — now elides with … at 480px
+- Telnet auto-disconnect — Mail View sessions disconnect cleanly after downloads and outbox complete
+
 ### 0.9.5-beta (2026-03-18)
-- Fixed: Bulletin body blank in preview pane after download
-- Fixed: Second+ bulletin subscriptions returning empty — flush and settle between L> commands
-- Fixed: Terminal mode not disabled during bulletin download
+- Fixed: Message download body bleeding — two-stage read waits for `[End of Message]` before BBS prompt; fixes false matches on `>` in forwarding headers (VARA and Telnet)
+- Fixed: BBS List edit crash — `_BBSEntryDialog` missing `_note_color`
+- Fixed: Telnet `flush_input` crash
+- Bulletin tombstone 120-day cleanup on every launch
 
 ### 0.9.4-beta (2026-03-17)
-- Bulletin support — Settings → Bulletins tab with subscription list
-- Bulletin folder panel — category subfolders with unread counts
-- Bulletin selection dialog — checkbox list with size and time estimates
-- Search now includes Bulletins scope
-- Dark mode note text readable in both modes
-- Search highlight — amber highlight on matched terms in message body
+- Bulletin support — subscribe to categories, browse in folder panel, selection dialog with size estimates
+- Search highlight — amber highlight on matched terms in message preview
 
 ### 0.9.3-beta (2026-03-17)
-- Fixed: VARA reconnect after BBS idle timeout — cmd monitor thread and PTT port now released on remote disconnect
-- Fixed: Dynamic VARA reset delay after disconnect
-- Message search — 🔍 button, scope dropdown, real-time filtering
-- Fixed: VARA Error 111 on reconnect after failed RF connect (station not responding)
-- Manual refresh — mail check logic implemented, button hidden pending field testing
-- Mark All Read — bulk mark inbox as read in one click
-- Inbox column widths — Date and Size fixed, Subject stretches to fill available space
-- Date display normalized — Sent folder now shows `16-Mar` style (was `2026-03-16`)
-- VARA link stats in status bar — live bitrate, SN, and bandwidth during connection
-- App name corrected to **QtC** throughout
-- README rewritten with QtC branding and complete install instructions
+- Message search — real-time filter with scope dropdown
+- Dark mode and font size in Settings → App
+- Fixed: VARA reconnect after BBS idle timeout
 
-### 0.8.2-beta (2026-03-15)
-- Windows 11 support — `install.ps1`, cross-platform data paths
+### 0.9.1-beta
+- Fixed: Windows crash on missing or corrupt config.json
+- GPL-3 headers, qtc_icon.ico for Windows
 
-### 0.8.1-beta
-- Linux release — battle tested, demo-ready
-- VARA HF RF connect/disconnect with busy channel detection
-- Mail check, download with progress tracker
-- Compose, reply, outbox queue, sequential send
-- Address book with auto-fill and use-count ranking
-- Terminal view, Debug view, folder badges
+### 0.9.0-beta (2026-03-16)
+- Fixed: VARA Error 111 on reconnect
+- Mark All Read, VARA link stats, inbox column widths
 
 ---
 
-*73 de KC9MTP*
+*73 de KC9MTP — Bill Johnson — Valparaiso, IN*  
+*GPL-3 — https://github.com/Bill-Johnson/QtC*
