@@ -1,4 +1,4 @@
-# QtC v0.9.6-beta — transport.py  (built 2026-03-21)
+# QtC v0.9.8-beta — transport.py  (built 2026-03-22)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify

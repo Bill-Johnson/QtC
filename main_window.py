@@ -1,4 +1,4 @@
-# QtC v0.9.7-beta — main_window.py  (built 2026-03-22)
+# QtC v0.9.8-beta — main_window.py  (built 2026-03-22)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
-APP_VERSION = "0.9.7-beta"  # keep in sync with header comment
+APP_VERSION = "0.9.8-beta"  # keep in sync with header comment
 """
 QtC — Main Window (PyQt6)
 v0.2 — Quick-connect bar, auto-download, terminal swap button

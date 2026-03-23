@@ -4,7 +4,7 @@
 #   or:  powershell -ExecutionPolicy Bypass -File install.ps1
 
 $ErrorActionPreference = "Stop"
-$VERSION = "0.9.6-beta"
+$VERSION = "0.9.8-beta"
 $INSTALL_DIR = "$env:APPDATA\qtc"
 $BACKUP_CONFIG = "$env:USERPROFILE\qtc_config_backup.json"
 $BACKUP_DB     = "$env:USERPROFILE\qtc_messages_backup.db"
@@ -15,11 +15,21 @@ Write-Host "  Install directory: $INSTALL_DIR"
 Write-Host ""
 
 # --- 1. Check Python ---
+# Try 'py' launcher first (handles Python 3.12+ on Windows where 'python'
+# may not be on PATH), then fall back to 'python'.
 Write-Host "Checking Python..." -NoNewline
-try {
-    $pyver = python --version 2>&1
-    Write-Host " $pyver" -ForegroundColor Green
-} catch {
+$pyCmd = $null
+foreach ($candidate in @("py", "python")) {
+    try {
+        $ver = & $candidate --version 2>&1
+        if ($ver -match "Python (\d+\.\d+)") {
+            $pyCmd = $candidate
+            Write-Host " $ver" -ForegroundColor Green
+            break
+        }
+    } catch {}
+}
+if (-not $pyCmd) {
     Write-Host " NOT FOUND" -ForegroundColor Red
     Write-Host ""
     Write-Host "Python 3.10 or newer is required." -ForegroundColor Yellow
@@ -29,7 +39,7 @@ try {
     exit 1
 }
 
-$pyvernum = (python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>&1) | Select-Object -First 1
+$pyvernum = (& $pyCmd -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>&1) | Select-Object -First 1
 if ([version]$pyvernum -lt [version]"3.10") {
     Write-Host "Python 3.10 or newer required (found $pyvernum)." -ForegroundColor Red
     Read-Host "Press Enter to exit"
@@ -39,30 +49,30 @@ if ([version]$pyvernum -lt [version]"3.10") {
 # --- 2. Check / install PyQt6 and pyserial ---
 Write-Host "Checking PyQt6..." -NoNewline
 try {
-    $null = python -c "import PyQt6" 2>&1
+    $null = & $pyCmd -c "import PyQt6" 2>&1
     if ($LASTEXITCODE -eq 0) {
         Write-Host " OK" -ForegroundColor Green
     } else {
         Write-Host " installing..." -ForegroundColor Yellow
-        python -m pip install --user PyQt6
+        & $pyCmd -m pip install --user PyQt6
     }
 } catch {
     Write-Host " installing..." -ForegroundColor Yellow
-    python -m pip install --user PyQt6
+    & $pyCmd -m pip install --user PyQt6
 }
 
 Write-Host "Checking pyserial..." -NoNewline
 try {
-    $null = python -c "import serial" 2>&1
+    $null = & $pyCmd -c "import serial" 2>&1
     if ($LASTEXITCODE -eq 0) {
         Write-Host " OK" -ForegroundColor Green
     } else {
         Write-Host " installing..." -ForegroundColor Yellow
-        python -m pip install --user pyserial
+        & $pyCmd -m pip install --user pyserial
     }
 } catch {
     Write-Host " installing..." -ForegroundColor Yellow
-    python -m pip install --user pyserial
+    & $pyCmd -m pip install --user pyserial
 }
 
 # --- 3. Verify all source files match version ---
@@ -132,10 +142,11 @@ if (-not (Test-Path "$INSTALL_DIR\config.json") -and (Test-Path $BACKUP_CONFIG))
 
 # --- 6. Create launcher batch file ---
 $launcherPath = "$INSTALL_DIR\qtc.bat"
+$pyExe = (Get-Command $pyCmd).Source
 @"
 @echo off
 cd /d "%APPDATA%\qtc"
-python main_window.py %*
+"$pyExe" main_window.py %*
 "@ | Set-Content $launcherPath
 
 # --- 7. Generate icon and create desktop shortcut ---
@@ -181,7 +192,7 @@ with open(ico_path, 'wb') as f:
 print('icon OK')
 "@
 try {
-    $result = python -c $iconScript 2>&1
+    $result = & $pyCmd -c $iconScript 2>&1
     if ($result -match "icon OK") {
         Write-Host "  Icon generated." -ForegroundColor Green
     } else {
@@ -193,7 +204,7 @@ try {
 
 $WScriptShell = New-Object -ComObject WScript.Shell
 $shortcut = $WScriptShell.CreateShortcut("$env:USERPROFILE\Desktop\QtC.lnk")
-$shortcut.TargetPath = "python"
+$shortcut.TargetPath = (Get-Command $pyCmd).Source
 $shortcut.Arguments = "$INSTALL_DIR\main_window.py"
 $shortcut.WorkingDirectory = $INSTALL_DIR
 $shortcut.Description = "QtC BBS Client v$VERSION"
@@ -214,7 +225,7 @@ if ($userPath -notlike "*$INSTALL_DIR*") {
 # --- 9. Create default config if none exists ---
 if (-not (Test-Path "$INSTALL_DIR\config.json")) {
     Write-Host "  Creating default config.json..."
-    python -c @"
+    & $pyCmd -c @"
 import json, os
 config = {
     'user': {'callsign': 'NOCALL', 'name': '', 'qth': '', 'zip': '', 'home_bbs': ''},
