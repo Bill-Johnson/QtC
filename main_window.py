@@ -1,4 +1,4 @@
-# QtC v0.9.8-beta — main_window.py  (built 2026-03-22)
+# QtC v0.9.9-beta — main_window.py  (built 2026-03-23)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
-APP_VERSION = "0.9.8-beta"  # keep in sync with header comment
+APP_VERSION = "0.9.9-beta"  # keep in sync with header comment
 """
 QtC — Main Window (PyQt6)
 v0.2 — Quick-connect bar, auto-download, terminal swap button
@@ -339,9 +339,38 @@ class SessionWorker(QThread):
         _time.sleep(0.5)
         results = self.session.check_bulletins(subscriptions)
         # Terminal mode stays OFF — download_bulletins will re-enable it after
-        # Filter out any already in local database or tombstoned (deleted)
+
+        # Build bbs_id for tombstone/exists checks
         bbs_id = (f"{self.config.get('user',{}).get('callsign','NOCALL').upper()}"
                   f"@{self.bbs_entry['callsign']}")
+
+        # ── First bulletin connect — auto-tombstone all but 2 newest ──────
+        # Detect first time bulletins have been checked on this BBS by looking
+        # for a "bulletins_seen" key in visited_bbs. If absent, tombstone all
+        # but the 2 most recent per category so the user doesn't see a huge
+        # backlog on first connect.
+        mycall    = self.config.get("user", {}).get("callsign", "NOCALL").upper()
+        visit_key = f"{mycall}@{self.bbs_entry['callsign']}"
+        bull_key  = f"bulletins_seen@{self.bbs_entry['callsign']}"
+        visited   = self.config.get("visited_bbs", {})
+
+        if bull_key not in visited:
+            # First time — tombstone everything except 2 newest per category
+            for cat, msgs in results.items():
+                # msgs are already newest-first from L> (descending)
+                to_keep     = msgs[:2]
+                to_tombstone = msgs[2:]
+                if to_tombstone:
+                    self.db.add_bulletin_tombstones_batch(to_tombstone, bbs_id)
+                    self.sig_log.emit(
+                        f"[SYS] First bulletin connect — tombstoned "
+                        f"{len(to_tombstone)} old {cat} bulletins, "
+                        f"keeping {len(to_keep)} newest")
+            # Mark bulletins as seen so we never do this again
+            self.config.setdefault("visited_bbs", {})[bull_key] = True
+            save_config(self.config)
+
+        # Filter out already downloaded and tombstoned
         filtered = {}
         for cat, msgs in results.items():
             new_msgs = [m for m in msgs
@@ -3170,39 +3199,8 @@ class MainWindow(QMainWindow):
                 self._set_status("Checking bulletins…", connected=True)
                 QTimer.singleShot(200, lambda: self.worker.do_check_bulletins(subs))
                 return
-            # Check outbox
-            pending = self.db.get_pending_outbox()
-            if pending:
-                self.mail_view.enable_send_outbox(True)
-                if self.stack.currentIndex() in (self.VIEW_TERMINAL,
-                                                 self.VIEW_DEBUG):
-                    # Terminal/Debug — show yellow notice
-                    connected_bbs = self._get_active_bbs_entry().get(
-                        "callsign", "").upper()
-                    sendable = [r for r in pending
-                                if bool(r.get("send_now", 1))
-                                or not r.get("at_bbs", "")
-                                or r.get("at_bbs","").upper().startswith(
-                                    connected_bbs)]
-                    if sendable:
-                        self._pending_outbox = True
-                        notice = (f"\n[MAIL] {len(sendable)} message(s) ready "
-                                  f"to send — switch to Mail View to send.\n")
-                        self.terminal.append(notice, "#ffff00")
-                        self.debug_view.append(notice, "#ffff00")
-                        self._set_status(
-                            f"{len(sendable)} message(s) ready — "
-                            f"switch to Mail View to send.",
-                            connected=True)
-                else:
-                    # Mail View — prompt to send now
-                    r = QMessageBox.question(
-                        self, "Outbox",
-                        f"{len(pending)} message(s) waiting in outbox — send now?",
-                        QMessageBox.StandardButton.Yes |
-                        QMessageBox.StandardButton.No)
-                    if r == QMessageBox.StandardButton.Yes:
-                        self._on_send_outbox()
+            # Route through _prompt_outbox — handles outbox and Telnet auto-disconnect
+            self._prompt_outbox()
 
     def _on_download_done(self, count: int):
         self._set_status(
@@ -3221,7 +3219,7 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(200, lambda: self.worker.do_check_bulletins(subs))
             return   # outbox prompt will happen after bulletin check
 
-        # Prompt about outbox
+        # Prompt about outbox / auto-disconnect
         pending = self.db.get_pending_outbox()
         if pending:
             self.mail_view.enable_send_outbox(True)
@@ -3231,6 +3229,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if r == QMessageBox.StandardButton.Yes:
                 self._on_send_outbox()
+                return
+        self._prompt_outbox()
 
     def _on_bulletin_check(self, bulletins_by_cat: dict):
         """Called when bulletin check completes — show selection dialog."""
@@ -3251,17 +3251,33 @@ class MainWindow(QMainWindow):
         # Get current link speed from last seen BITRATE for estimate
         link_bps = getattr(self, "_last_link_bps", 0)
 
+        bbs_id = (f"{self.config.get('user',{}).get('callsign','NOCALL').upper()}"
+                  f"@{self._get_active_bbs_entry().get('callsign','')}")
+
         dlg = BulletinSelectDialog(bulletins_by_cat,
                                    link_bps=link_bps, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             selected = dlg.get_selected()
+
+            # Tombstone anything the user unchecked — never show again
+            for cat, msgs in bulletins_by_cat.items():
+                selected_nums = {m.msg_number
+                                 for m in selected.get(cat, [])}
+                skipped = [m for m in msgs
+                           if m.msg_number not in selected_nums]
+                if skipped:
+                    self.db.add_bulletin_tombstones_batch(skipped, bbs_id)
+
             if selected:
                 total_sel = sum(len(v) for v in selected.values())
                 self._set_status(
                     f"Downloading {total_sel} bulletin(s)…", connected=True)
                 self.worker.do_download_bulletins(selected)
                 return
-        # User skipped or selected none
+
+        # User skipped entire dialog or selected none — tombstone everything
+        for cat, msgs in bulletins_by_cat.items():
+            self.db.add_bulletin_tombstones_batch(msgs, bbs_id)
         self._set_status("Bulletins skipped.", connected=True)
         self._prompt_outbox()
 

@@ -1,4 +1,4 @@
-# QtC v0.9.8-beta — database.py  (built 2026-03-22)
+# QtC v0.9.9-beta — database.py  (built 2026-03-23)
 # VARA BBS Client — A modern BBS client for LinBPQ/BPQ32 nodes
 # via VARA HF, VARA FM, and Telnet.
 #
@@ -450,3 +450,20 @@ class MessageDatabase:
                 "WHERE msg_number=? AND bbs_id=?",
                 (msg_number, bbs_id)).fetchone()
             return row is not None
+
+    def add_bulletin_tombstone(self, msg_number: int, bbs_id: str):
+        """Add a tombstone directly — used when skipping bulletins in the
+        selection dialog or auto-tombstoning old backlog on first connect."""
+        with self._conn() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO bulletin_tombstones (msg_number, bbs_id)
+                VALUES (?,?)
+            """, (msg_number, bbs_id))
+
+    def add_bulletin_tombstones_batch(self, items: list, bbs_id: str):
+        """Tombstone a list of BBSMessage objects in one transaction."""
+        with self._conn() as conn:
+            conn.executemany("""
+                INSERT OR IGNORE INTO bulletin_tombstones (msg_number, bbs_id)
+                VALUES (?,?)
+            """, [(m.msg_number, bbs_id) for m in items])
