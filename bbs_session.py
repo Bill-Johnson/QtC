@@ -1,4 +1,4 @@
-# QtC v0.9.10-beta — bbs_session.py  (built 2026-03-24)
+# QtC v0.9.11-beta — bbs_session.py  (built 2026-03-25)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -244,16 +244,46 @@ class BBSSession:
         # Step 4: send bbs directly
         self._send("bbs")
 
-        # Step 5: wait for BBS ready prompt ">"
+        # Step 5: wait for BBS ready prompt
+        # Some nodes send status lines containing '>' before the actual BBS
+        # prompt arrives (e.g. circuit status lines like "Circuit<-->").
+        # We keep reading until we see a line ending in '>' that looks like
+        # a real BBS prompt, with a generous timeout for multi-hop nodes.
         bbs_response = self._expect(self.PROMPT_BBS, timeout=15)
+
+        # Drain any additional lines that arrive after the first '>'
+        # (node status, BBS banner, etc.) — keep reading until quiet
+        import time as _time
+        deadline = _time.time() + 5.0
+        while _time.time() < deadline:
+            extra = self.transport.read_all_pending(settle_time=0.5)
+            if extra.strip():
+                bbs_response += extra
+                deadline = _time.time() + 2.0  # reset timer on new data
+            else:
+                break
+
         self._log("SYS", f"BBS response: {bbs_response!r}")
 
-        if ">" in bbs_response:
-            self._log("SYS", "BBS login successful")
-            return True
-        else:
-            self._log("SYS", f"WARNING: Unexpected response: {bbs_response!r}")
+        if ">" not in bbs_response:
+            self._log("SYS", f"WARNING: No BBS prompt received: {bbs_response!r}")
             return False
+
+        # Detect exact BBS prompt style — same as VARA login
+        m = re.search(r"(de\s+\S+>)", bbs_response, re.IGNORECASE)
+        if m:
+            self.PROMPT_BBS = m.group(1)
+        elif "\r>" in bbs_response or "\n>" in bbs_response:
+            self.PROMPT_BBS = "\r>"
+        self._log("SYS", f"BBS prompt detected as: {self.PROMPT_BBS!r}")
+        self._log("SYS", "BBS login successful")
+
+        # Handle new user registration if needed
+        if self._handle_registration(bbs_response):
+            bbs_response = self._expect(self.PROMPT_BBS, timeout=30)
+            self._log("SYS", f"Post-registration BBS response: {bbs_response!r}")
+
+        return True
 
     def _vara_login(self) -> bool:
         """
