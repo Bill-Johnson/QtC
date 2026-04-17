@@ -1,5 +1,5 @@
 # QtC — BBS Client for Amateur Radio  
-**v0.9.7-beta** · Linux · Windows 11 · Raspberry Pi
+**Beta** · Linux · Windows 11 · Raspberry Pi
 
 > *QTC — Q-code for "I have messages for you."*
 
@@ -71,8 +71,8 @@ Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 
 ```bash
 sudo apt install python3-pyqt6 python3-pyserial
-tar -xzf QtC-0.9.7-beta.tar.gz
-cd QtC-0.9.7-beta
+tar -xzf QtC-<version>-beta.tar.gz
+cd QtC-<version>-beta
 ./install.sh
 ```
 
@@ -89,8 +89,8 @@ Once installed, launch QtC from your applications menu or type `qtc` in a termin
 ### Linux (Fedora / Ubuntu / Debian)
 
 ```bash
-tar -xzf QtC-0.9.7-beta.tar.gz
-cd QtC-0.9.7-beta
+tar -xzf QtC-<version>-beta.tar.gz
+cd QtC-<version>-beta
 ./install.sh
 ```
 
@@ -115,44 +115,35 @@ sudo apt install python3-pyqt6 python3-pyserial
 
 ### Windows 11
 
-QtC installs itself — you just need Python on your computer first, then run the installer script once. After that a **QtC shortcut appears on your Desktop**.
+QtC ships as a standalone exe — **no Python required**.
 
-#### Step 1 — Install Python (one time only)
+#### Step 1 — Download
 
-1. Go to: **https://www.python.org/downloads/**
-2. Click the big **"Download Python 3.x.x"** button
-3. Run the installer — **check "Add Python to PATH"** before clicking Install Now
-4. Click **Install Now** and let it finish
+From the [Releases page](https://github.com/Bill-Johnson/QtC/releases), download
+`QtC-<version>-beta-windows.zip`.
 
-To verify: press **Win+R**, type `cmd`, press Enter, type `python --version`.
+#### Step 2 — Extract
 
-#### Step 2 — Extract the QtC files
+Right-click `QtC-<version>-beta-windows.zip` → **Extract All**.
+Result: a `QtC\` folder containing `QtC.exe` and supporting files.
 
-1. Right-click `QtC-0.9.7-beta.tar.gz` → **Extract All**
-2. You may need to extract twice — `.tar.gz` → `.tar` → folder
-3. Result: a folder called `QtC-0.9.7-beta` containing `.py` files
+#### Step 3 — Run
 
-**Or use 7-Zip** (free): https://www.7-zip.org/
+Double-click **`QtC.exe`** inside the extracted folder.
 
-#### Step 3 — Run the installer
-
-1. Open the `QtC-0.9.7-beta` folder
-2. Hold **Shift** + right-click **`install.ps1`** → **"Run with PowerShell"**
-3. If Windows shows *"Windows protected your PC"* — click **"Run anyway"**
-4. If you see *"scripts is disabled"* — open PowerShell as administrator and run:
-   ```
-   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-   ```
-5. When it says **"QtC installed successfully!"** press Enter to close
-
-#### Step 4 — Run QtC
-
-Double-click the **QtC** shortcut on your Desktop.
+If Windows shows *"Windows protected your PC"* — click **More info** → **Run anyway**.
+This is expected for unsigned executables and only appears once.
 
 **Windows notes:**
 - VARA HF must be running before you click Connect in QtC
 - Windows Firewall may ask to allow QtC on ports 8300/8301 — click **Allow access**
 - PTT serial ports show as `COM3`, `COM4`, etc. — select yours in **Settings → PTT**
+- Config and messages are stored in `%APPDATA%\qtc\` and preserved across updates
+
+#### Running from source (advanced)
+
+If you prefer to run from Python directly, `install.ps1` is still included in the
+Linux/Mac `.tar.gz` release. Requires Python 3.10+, PyQt6, and pyserial.
 
 ---
 
@@ -213,11 +204,71 @@ sqlite3 ~/.local/share/qtc/data/messages.db "DELETE FROM bulletin_tombstones; DE
 - No rig control yet — set frequency manually on your radio
 - VARA FM support in code but not yet field tested
 - Direwolf and Soundmodem transports planned for a future release
-- Windows NSIS clickable installer planned — currently uses PowerShell script
+- Windows exe available as a separate release asset — no Python required (see releases page)
+- `install.ps1` remains available for users who prefer running from source
 
 ---
 
 ## Changelog
+
+### 0.10.10-beta (2026-04-14)
+- Fixed: messages lost between sessions when running as exe — `data_dir` relative path resolved against working directory instead of `%APPDATA%\qtc`; now always anchored to `_APP_DIR`
+
+### 0.10.9-beta (2026-04-14)
+- Windows exe release — PyInstaller one-folder build; no Python required on target machine
+- Fixed: app icon not found when running as frozen exe — `sys.frozen` guard replaces `__file__`-based icon path lookup
+
+### 0.10.8-beta (2026-03-28)
+- Fixed: outbox send cancelled immediately — LinBPQ splits `Enter Title (only):` across two TCP packets (`Enter` arrives first, `Title (only):` arrives in the next packet); the previous fix matched on `"nter "` which fired on the first packet before `"Title"` arrived, hit the failure branch, and sent a bare Enter cancelling the message; fixed by waiting for `"itle"` which only matches once the second packet with the full title prompt has arrived; simplified `send_message` to always expect title-then-body (LinBPQ always follows this sequence for `SP CALL`)
+
+### 0.10.7-beta (2026-03-28)
+- Fixed: outbox send failed silently — terminal monitor thread was consuming BBS prompts (`Enter Title (only):`, `Enter Message Text...`) before `send_message` could read them; fixed by pausing the monitor in `_run_send` before calling `send_message`, matching the pattern used by all other BBS I/O paths
+- Fixed: second queued message sent into wrong BBS state when first send failed mid-compose — `send_message` now sends a bare Enter (cancels at title prompt) before returning False, restoring the BBS to the `>` prompt
+- Fixed: `send_message` now handles both LinBPQ prompt styles: `Enter Title (only):` (BBS knows recipient home BBS) and `Enter Message Text...` (no home BBS); both are caught by waiting for `"nter "` and branching on content
+
+### 0.10.6-beta (2026-03-28)
+- Fixed: outbox send hung at "Enter Title (only):" — `send_message` was waiting for bare `":"` which matched too early on the `Address @HOMEBBS added from HomeBBS` line LinBPQ emits before the title prompt; now waits for `"itle"` (matches both `"Title"` and `"Enter Title"`) to ensure the correct prompt is consumed before sending the subject
+- Fixed: `_expect("Enter Message")` was case-sensitive; LinBPQ sends lowercase `"Enter message"`; changed to match `"nter message"` (case-insensitive substring)
+
+### 0.10.5-beta (2026-03-28)
+- Fixed: bulletin dialog never appeared on first connect — `_process_ll_bulletins` called `self.sig_log.emit()` but `sig_log` lives on the worker, not the main window; the silent `AttributeError` aborted the function before the dialog could show; fixed by using `self.worker.sig_log.emit()`
+- Fixed: spurious `[BULL] No new bulletins.` on returning connects when no mail was found — the bulletin check was firing regardless of whether `check_on_connect` was enabled or subscriptions were configured
+- First connect via Telnet now uses `LL 50` (was `LL 20`); VARA remains `LL 20`
+
+### 0.10.4-beta (2026-03-28)
+- Bulletin check on connect no longer sends `L> CATEGORY` for each subscription — bulletins are now extracted directly from the `LL N` / `L watermark-` scan already performed on connect; `sig_ll_ready` now carries the filtered bulletin list alongside the personal mail lists; `_process_ll_bulletins()` applies tombstone/exists filtering and feeds the existing selection dialog; `L>` is still used for the manual mid-session Refresh path where the scan data is stale
+
+### 0.10.3-beta (2026-03-28)
+- Fixed: message download hang/scramble when downloading via the new LL/L watermark path — `_run_download` was not pausing the terminal monitor thread before calling `download_message`, causing a race condition where both threads read from the same socket simultaneously; fixed by adding `set_terminal_mode(False)` / `flush_input()` guard around the download loop in `_run_download`, matching the pattern used by `_run_check_bulletins` and `_run_mail_check`
+- Reverted: spurious post-read flush added in 0.10.2 — it treated the symptom rather than the root cause
+
+### 0.10.2-beta (2026-03-28)
+- Fixed: message download hang on messages with quoted/forwarded content — LinBPQ delivers trailing buffered data after `[End of Message]` and the BBS prompt in the same TCP burst; `read_until` returned on the prompt match but left that data in the buffer, poisoning the next `_expect`; fixed by flushing the buffer after each message download
+
+### 0.10.1-beta (2026-03-28)
+- Fixed: "No new personal mail" shown incorrectly when choosing PN+PY on first connect — personal mail lists were set on the worker thread object but read from the main window object; replaced shared attributes with `sig_ll_ready` signal for safe cross-thread delivery
+- Fixed: Telnet auto-disconnect not firing after mail check — "no new mail" paths in `_on_first_visit` were not calling `_prompt_outbox()`
+- Fixed: Bulletins not checked on returning connect with no new personal mail — returning-visit "no mail" branch now triggers bulletin check before `_prompt_outbox()`, mirroring `_on_mail_summary` logic
+
+### 0.10.0-beta (2026-03-28)
+- Watermark-based mail check — replaces `LM` with `LL N` on first connect and `L watermark-` on subsequent connects; only personal mail addressed to mycall (type P, status N) is auto-downloaded; skips `PF`, `PY`, `TO=SYSOP`, `FROM=SYSTEM`
+- `bbs_watermarks` table added to database; tracks highest seen message number per callsign/BBS pair; migrates automatically on first run
+- Bulletin filter updated to accept `BN` (status N) and `B$` (forwarded, status $) — was previously limited to status N only
+
+### 0.9.11-beta (2026-03-25)
+- Fixed: Telnet login on non-standard LinBPQ nodes — QtC now drains all trailing node status lines after sending the `bbs` command before declaring login complete, and properly detects both `de N0CALL>` and plain `>` BBS prompt styles; resolves mail retrieval failure on multi-hop nodes where circuit status lines arrive after the initial prompt
+
+### 0.9.10-beta (2026-03-24)
+- Fixed: Windows `install.ps1` version header check failing on machines where PowerShell reads UTF-8 files with em-dash characters as mojibake — header check now uses Python to read the first line, bypassing PowerShell encoding issues
+
+### 0.9.9-beta (2026-03-24)
+- Bulletin first-connect backlog management — on first visit to a BBS, all but the 2 newest bulletins per category are auto-tombstoned; no more giant download backlog on a new install
+- Bulletins skipped in the selection dialog are tombstoned immediately and will not reappear on future connects
+- My Station → Home BBS hint updated to hierarchical address format (e.g. `K5DAT.#NEWI.WI.USA.NOAM`)
+- README header changed from versioned to **Beta** — version is now tracked on the GitHub Releases page only
+
+### 0.9.8-beta (2026-03-22)
+- Fixed: Windows installer fails to detect Python when installed via the Python Launcher (`py.exe`) — `install.ps1` now tries `py` first, then falls back to `python`; fixes Python 3.11+ installs that do not add `python` to PATH
 
 ### 0.9.7-beta (2026-03-22)
 - Multi-select delete — Ctrl+click or Shift+click to select multiple messages or bulletins; Delete button shows count; confirm dialog names quantity and type

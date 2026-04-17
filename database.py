@@ -1,4 +1,4 @@
-# QtC v0.9.11-beta — database.py  (built 2026-03-25)
+# QtC v0.10.10-beta — database.py  (built 2026-04-14)
 # VARA BBS Client — A modern BBS client for LinBPQ/BPQ32 nodes
 # via VARA HF, VARA FM, and Telnet.
 #
@@ -121,6 +121,11 @@ def init_db(db_file=None):
             bbs_id      TEXT,
             deleted_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(msg_number, bbs_id)
+        );
+        CREATE TABLE IF NOT EXISTS bbs_watermarks (
+            mycall_bbs  TEXT PRIMARY KEY,
+            msg_number  INTEGER NOT NULL,
+            updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP
         );
     """)
     conn.commit()
@@ -467,3 +472,24 @@ class MessageDatabase:
                 INSERT OR IGNORE INTO bulletin_tombstones (msg_number, bbs_id)
                 VALUES (?,?)
             """, [(m.msg_number, bbs_id) for m in items])
+
+    # ── Watermarks ─────────────────────────────────────────────────
+
+    def get_watermark(self, mycall_bbs: str):
+        """Return the highest seen message number for mycall_bbs, or None."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT msg_number FROM bbs_watermarks WHERE mycall_bbs=?",
+                (mycall_bbs,)).fetchone()
+            return row[0] if row else None
+
+    def set_watermark(self, mycall_bbs: str, msg_number: int):
+        """Store (or update) the watermark for mycall_bbs."""
+        with self._conn() as conn:
+            conn.execute("""
+                INSERT INTO bbs_watermarks (mycall_bbs, msg_number, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(mycall_bbs) DO UPDATE SET
+                    msg_number = excluded.msg_number,
+                    updated_at = excluded.updated_at
+            """, (mycall_bbs, msg_number))

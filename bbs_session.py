@@ -1,4 +1,4 @@
-# QtC v0.9.11-beta — bbs_session.py  (built 2026-03-25)
+# QtC v0.10.10-beta — bbs_session.py  (built 2026-04-14)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -556,24 +556,36 @@ class BBSSession:
             cmd = f"sb {to_call}"
 
         # 1. Send the SP/SB command.
-        # The data monitor will display the BBS prompts as they arrive.
-        # We use _expect to consume them before sending our responses,
-        # but we do NOT re-log them (monitor already showed them).
         self._send(cmd)
 
-        # Wait for Subject/Title prompt — monitor displays it, we just consume
-        subj_response = self._expect(":", timeout=30)
+        # LinBPQ sequence after SP CALL (always):
+        #   (optional) "Address @HOMEBBS added from HomeBBS"
+        #   "Enter Title (only):"       ← always present
+        #   [we send title]
+        #   "Enter Message Text ..."    ← always present
+        #   [we send body + /EX]
+        #
+        # NOTE: LinBPQ sometimes splits "Enter Title (only):" across two TCP
+        # packets — "Enter\r\n" arrives first, "Title (only):" arrives next.
+        # Waiting for "itle" (substring of "Title") catches the second packet
+        # and ensures we have the complete prompt before sending the title.
+        title_response = self._expect("itle", timeout=30)
 
-        if not any(p in subj_response.lower() for p in ["subject", "title", ":"]):
-            self._log("SYS", f"Send FAILED: no Subject prompt — got {subj_response!r}")
+        if "itle" not in title_response.lower():
+            # Timed out — send bare Enter to cancel at title prompt and recover
+            self._log("SYS",
+                f"Send FAILED: no title prompt received — got {title_response!r}")
+            self.transport.send("")
+            time.sleep(0.5)
             return False
 
-        # 2. Send subject — blank subject cancels the message on LinBPQ,
-        # so substitute .... (traditional BBS convention) if empty.
+        # 2. Send title/subject
         if not subject or not subject.strip():
             subject = "...."
         self._send(subject)
-        self._expect("Enter Message", timeout=30)
+
+        # 3. Wait for body prompt
+        self._expect("essage", timeout=30)
 
         # 3. Send body lines then /EX — log TX lines for terminal display
         for line in (body.splitlines() or [""]):
@@ -645,9 +657,10 @@ class BBSSession:
             self._send(f"l> {cat}")
             raw = self._expect(self.PROMPT_BBS, timeout=30)
             messages = parse_message_list(raw)
-            # Only new bulletins (BN) — filter out any PN that appear in L> results
+            # Accept BN (status N) and B$ (forwarded/status $) — skip PN and everything else
             new_bulls = [m for m in messages
-                         if m.is_new and not m.is_personal]
+                         if m.msg_type == "B"
+                         and m.status in ("N", "$")]
             if new_bulls:
                 results[cat] = new_bulls
                 self._log("SYS",
@@ -655,6 +668,32 @@ class BBSSession:
             else:
                 self._log("SYS", f"Bulletins: none new in {cat}")
         return results
+
+    def list_last(self, n: int) -> list:
+        """
+        Send 'LL N' and return the parsed list of BBSMessage objects.
+        LL N returns the N most recent messages on the BBS (all types).
+        Used on first connect to discover the current high-water message number
+        and to find any personal mail addressed to mycall.
+        """
+        self._send(f"ll {n}")
+        raw = self._expect(self.PROMPT_BBS, timeout=60)
+        messages = parse_message_list(raw)
+        self._log("SYS", f"LL {n}: {len(messages)} messages parsed")
+        return messages
+
+    def list_since(self, watermark: int) -> list:
+        """
+        Send 'L watermark-' and return parsed BBSMessage objects.
+        Returns all messages with number > watermark.
+        Used on subsequent connects to fetch only messages newer than
+        the last known high-water mark.
+        """
+        self._send(f"l {watermark}-")
+        raw = self._expect(self.PROMPT_BBS, timeout=60)
+        messages = parse_message_list(raw)
+        self._log("SYS", f"L {watermark}-: {len(messages)} messages parsed")
+        return messages
 
     def logout(self, skip_bye: bool = False):
         """Send BYE and disconnect cleanly.

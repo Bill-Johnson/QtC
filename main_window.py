@@ -1,4 +1,4 @@
-# QtC v0.9.11-beta — main_window.py  (built 2026-03-25)
+# QtC v0.10.10-beta — main_window.py  (built 2026-04-14)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
-APP_VERSION = "0.9.11-beta"  # keep in sync with header comment
+APP_VERSION = "0.10.10-beta"  # keep in sync with header comment
 """
 QtC — Main Window (PyQt6)
 v0.2 — Quick-connect bar, auto-download, terminal swap button
@@ -113,6 +113,7 @@ class SessionWorker(QThread):
     sig_send_result   = pyqtSignal(bool, str)
     sig_error         = pyqtSignal(str)
     sig_first_visit   = pyqtSignal(str)   # emits bbs callsign — GUI shows dialog
+    sig_ll_ready      = pyqtSignal(str, object, object, object)  # bbs_call, new_only, all_personal, bulletins
     sig_progress      = pyqtSignal(str, int, int, str)  # op, current, total, detail
     sig_bulletin_check = pyqtSignal(object)   # {category: [BBSMessage]} — show dialog
     sig_bulletin_done  = pyqtSignal(int)       # count of bulletins downloaded
@@ -263,12 +264,92 @@ class SessionWorker(QThread):
             self.sig_error.emit("Login failed — check callsign and BBS address.")
             return
         self.sig_connected.emit()
-        # Always emit first_visit — whether new user or returning.
-        # Registration is handled automatically in connect_and_login.
-        # The download choice (All/New/Skip) is always the user's decision.
+
         if self.session.new_user:
             self.sig_log.emit("[SYS] New user registration completed.")
-        self.sig_first_visit.emit(self.bbs_entry.get("callsign", ""))
+
+        mycall    = self.config.get("user", {}).get("callsign", "NOCALL").upper()
+        bbs_call  = self.bbs_entry.get("callsign", "").upper()
+        mycall_bbs = f"{mycall}@{bbs_call}"
+
+        # Pause terminal monitor for LL / L list commands
+        if hasattr(self.session.transport, "set_terminal_mode"):
+            self.session.transport.set_terminal_mode(False)
+        self.session.transport.flush_input()
+
+        watermark = self.db.get_watermark(mycall_bbs)
+
+        if watermark is None:
+            # ── First connect: no watermark yet ─────────────────────
+            # Use LL 30 (VARA HF) or LL 20 (Telnet/VARA FM) to get a
+            # manageable slice of recent messages and set the watermark.
+            from transport import VaraTransport
+            n = 20 if isinstance(self.session.transport, VaraTransport) else 50
+            self.sig_log.emit(f"[SYS] First connect — sending LL {n}")
+            messages = self.session.list_last(n)
+
+            # Derive watermark from highest msg_number seen
+            if messages:
+                new_watermark = max(m.msg_number for m in messages)
+                self.db.set_watermark(mycall_bbs, new_watermark)
+                self.sig_log.emit(
+                    f"[SYS] Watermark set to {new_watermark} "
+                    f"({len(messages)} msgs scanned)")
+            else:
+                self.sig_log.emit("[SYS] LL returned no messages — watermark not set")
+                messages = []
+
+        else:
+            # ── Subsequent connect: watermark exists ─────────────────
+            self.sig_log.emit(
+                f"[SYS] Returning connect — sending L {watermark}-")
+            messages = self.session.list_since(watermark)
+
+            # Update watermark to highest number seen (even if no personal mail)
+            if messages:
+                new_watermark = max(m.msg_number for m in messages)
+                if new_watermark > watermark:
+                    self.db.set_watermark(mycall_bbs, new_watermark)
+                    self.sig_log.emit(
+                        f"[SYS] Watermark updated {watermark} → {new_watermark}")
+
+        if hasattr(self.session.transport, "set_terminal_mode"):
+            self.session.transport.set_terminal_mode(True)
+
+        # Build personal mail lists from the full message scan.
+        # LL N and L N- return every message on the BBS with no filtering —
+        # all types and statuses are present, so we can build both lists here.
+        # Skip TO=SYSOP and FROM=SYSTEM regardless of status.
+        def _is_my_personal(m):
+            return (m.msg_type == "P"
+                    and m.to_call == mycall
+                    and m.to_call != "SYSOP"
+                    and m.from_call != "SYSTEM")
+
+        # PN only — new unread personal mail (normal auto-download)
+        new_only = [
+            m for m in messages if _is_my_personal(m) and m.status == "N"
+        ]
+        # PN + PY — all personal mail including already-read (first-visit "All" choice)
+        all_personal = [
+            m for m in messages if _is_my_personal(m)
+        ]
+        # Bulletin candidates — BN and B$ from the scan
+        # Tombstone/exists filtering happens in _process_ll_bulletins on the GUI thread
+        bull_cfg = self.config.get("bulletins", {})
+        subs     = [s.upper().strip() for s in bull_cfg.get("subscriptions", [])]
+        if bull_cfg.get("check_on_connect", False) and subs:
+            bulletins = [
+                m for m in messages
+                if m.msg_type == "B"
+                and m.status in ("N", "$")
+                and m.to_call.upper() in subs
+            ]
+        else:
+            bulletins = []
+
+        # Emit all three lists via signal — safe cross-thread delivery
+        self.sig_ll_ready.emit(bbs_call, new_only, all_personal, bulletins)
 
     def _run_mail_check(self, new_only: bool):
         # Disable data streaming while _expect handles the LM response
@@ -301,26 +382,40 @@ class SessionWorker(QThread):
         bbs_id = f"{mycall}@{self.bbs_entry['callsign']}"
         count = 0
         total = len(messages)
-        for i, msg in enumerate(messages, 1):
-            if not self.db.message_exists(msg.msg_number, bbs_id):
-                detail = f"msg #{msg.msg_number} · ~{msg.size} bytes"
-                # Emit i-1 before download so bar shows progress correctly
-                # e.g. 1 of 3 shows 0% before starting, 33% after first done
-                self.sig_progress.emit("downloading", i - 1, total, detail)
-                self.sig_log.emit(
-                    f"[SYS] Downloading message {i} of {total} "
-                    f"(#{msg.msg_number}, ~{msg.size} bytes)")
-                msg.body = self.session.download_message(
-                    msg.msg_number, size_hint=msg.size)
-                msg.downloaded = True
-                self.db.save_to_inbox(msg, bbs_id)
-                count += 1
+        # Pause the terminal monitor for the entire download sequence.
+        # Without this the monitor thread races _expect on the same socket,
+        # consuming bytes that download_message needs and causing hangs.
+        if hasattr(self.session.transport, "set_terminal_mode"):
+            self.session.transport.set_terminal_mode(False)
+        self.session.transport.flush_input()
+        try:
+            for i, msg in enumerate(messages, 1):
+                if not self.db.message_exists(msg.msg_number, bbs_id):
+                    detail = f"msg #{msg.msg_number} · ~{msg.size} bytes"
+                    self.sig_progress.emit("downloading", i - 1, total, detail)
+                    self.sig_log.emit(
+                        f"[SYS] Downloading message {i} of {total} "
+                        f"(#{msg.msg_number}, ~{msg.size} bytes)")
+                    msg.body = self.session.download_message(
+                        msg.msg_number, size_hint=msg.size)
+                    msg.downloaded = True
+                    self.db.save_to_inbox(msg, bbs_id)
+                    count += 1
+        finally:
+            if hasattr(self.session.transport, "set_terminal_mode"):
+                self.session.transport.set_terminal_mode(True)
         self.sig_progress.emit("done", 0, 0, "")
         self.sig_download_done.emit(count)
 
     def _run_send(self, to_call, subject, body, msg_type, at_bbs):
-        # Progress emitted by caller (_on_send_outbox) before queuing
-        ok = self.session.send_message(to_call, subject, body, msg_type, at_bbs)
+        if hasattr(self.session.transport, "set_terminal_mode"):
+            self.session.transport.set_terminal_mode(False)
+        self.session.transport.flush_input()
+        try:
+            ok = self.session.send_message(to_call, subject, body, msg_type, at_bbs)
+        finally:
+            if hasattr(self.session.transport, "set_terminal_mode"):
+                self.session.transport.set_terminal_mode(True)
         self.sig_send_result.emit(ok, to_call)
 
     def _run_disconnect(self):
@@ -2297,8 +2392,15 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.config  = load_config()
         _default_data = os.path.join(_APP_DIR, "data")
-        self.db      = MessageDatabase(
-            data_dir=self.config["app"].get("data_dir") or _default_data)
+        _data_dir_cfg = self.config["app"].get("data_dir") or ""
+        # Treat relative or empty data_dir as relative to _APP_DIR, not cwd.
+        # This ensures the database is always found regardless of where the
+        # exe or script is launched from.
+        if not _data_dir_cfg or not os.path.isabs(_data_dir_cfg):
+            _data_dir = _default_data
+        else:
+            _data_dir = _data_dir_cfg
+        self.db      = MessageDatabase(data_dir=_data_dir)
         self.cdb     = ContactsDB(self.db._db_file)
         self.worker  = None
         self._current_folder = "inbox"
@@ -2773,6 +2875,7 @@ class MainWindow(QMainWindow):
         self.worker.sig_send_result.connect(self._on_send_result)
         self.worker.sig_error.connect(self._on_error)
         self.worker.sig_first_visit.connect(self._on_first_visit)
+        self.worker.sig_ll_ready.connect(self._on_ll_ready)
         self.worker.sig_progress.connect(self._on_progress)
         self.worker.sig_bulletin_check.connect(self._on_bulletin_check)
         self.worker.sig_bulletin_done.connect(self._on_bulletin_done)
@@ -2878,22 +2981,38 @@ class MainWindow(QMainWindow):
                 f"switch to Mail View to send.",
                 connected=True)
 
+    def _on_ll_ready(self, bbs_call: str, new_only: list, all_personal: list,
+                     bulletins: list):
+        """
+        Receives filtered mail and bulletin lists from _run_connect_and_check
+        via sig_ll_ready — safe GUI-thread delivery, no shared worker attributes.
+        Stores all three lists on self then dispatches to _on_first_visit.
+        """
+        self._ll_new_only     = new_only       # PN — status N, to mycall
+        self._ll_all_personal = all_personal   # PN + PY — all personal to mycall
+        self._ll_bulletins    = bulletins      # BN / B$ matching subscriptions
+        self._on_first_visit(bbs_call)
+
     def _on_first_visit(self, bbs_callsign: str):
         """
-        Called after login. Behaviour depends on current view:
+        Called by _on_ll_ready after login and LL/L scan.
+        Both mail lists are on self._ll_new_only and self._ll_all_personal,
+        delivered safely on the GUI thread by _on_ll_ready.
 
         Mail View:
           - First visit: ask All / New only → marks BBS visited
-          - Return visit: auto LM, new PN only
+          - Return visit: auto-download PN new only
 
         Terminal / Debug View:
           - First visit: ask Skip / New only / All → Skip does NOT mark visited
-          - Return visit: pure dumb terminal, no LM, no download at all
+          - Return visit: pure dumb terminal, no download at all
         """
-        mycall    = self.config.get("user", {}).get("callsign", "NOCALL").upper()
-        visit_key = f"{mycall}@{bbs_callsign}"
-        visited   = self.config.get("visited_bbs", {})
-        view      = self.stack.currentIndex()
+        mycall       = self.config.get("user", {}).get("callsign", "NOCALL").upper()
+        visit_key    = f"{mycall}@{bbs_callsign}"
+        visited      = self.config.get("visited_bbs", {})
+        view         = self.stack.currentIndex()
+        new_only     = getattr(self, "_ll_new_only",     [])
+        all_personal = getattr(self, "_ll_all_personal", [])
 
         # Migrate old-style keys (just "BBS_CALL") to new "MYCALL@BBS_CALL" format
         if bbs_callsign in visited and visit_key not in visited:
@@ -2903,7 +3022,6 @@ class MainWindow(QMainWindow):
 
         # ── Terminal / Debug view ──────────────────────────────────
         if view in (self.VIEW_TERMINAL, self.VIEW_DEBUG):
-            # Check BBS-level setting — if set, always pure dumb terminal
             no_prompt = self._get_active_bbs_entry().get("no_terminal_prompt", False)
             if no_prompt:
                 self._set_status("Terminal mode — type commands manually.",
@@ -2911,7 +3029,6 @@ class MainWindow(QMainWindow):
                 self._set_transport_terminal_mode(True)
                 self._check_outbox_for_terminal()
                 return
-            # Return visit — pure dumb terminal, outbox check only
             if visit_key in visited:
                 self._set_status("Terminal mode — type commands manually.",
                                  connected=True)
@@ -2936,13 +3053,12 @@ class MainWindow(QMainWindow):
                 "⏭  Skip — pure terminal", QMessageBox.ButtonRole.RejectRole)
             btn_new  = msg.addButton(
                 "⚡  New messages only (PN)", QMessageBox.ButtonRole.NoRole)
-            btn_all  = msg.addButton(
+            btn_all  = msg.addButton(  # noqa: F841
                 "📥  All personal messages (PN + PY)", QMessageBox.ButtonRole.YesRole)
             msg.exec()
 
             clicked = msg.clickedButton()
             if clicked == btn_skip:
-                # Don't mark visited — pure terminal session
                 self._set_status("Terminal mode — type commands manually.",
                                  connected=True)
                 self._set_transport_terminal_mode(True)
@@ -2951,11 +3067,19 @@ class MainWindow(QMainWindow):
             elif clicked == btn_new:
                 self.config.setdefault("visited_bbs", {})[visit_key] = True
                 save_config(self.config)
-                QTimer.singleShot(50, lambda: self.worker.do_mail_check(new_only=True))
+                if new_only:
+                    QTimer.singleShot(50, lambda p=new_only: self.worker.do_download(p))
+                else:
+                    self._set_status("No new personal mail.", connected=True)
+                    self._prompt_outbox()
             else:  # All
                 self.config.setdefault("visited_bbs", {})[visit_key] = True
                 save_config(self.config)
-                QTimer.singleShot(50, lambda: self.worker.do_mail_check(new_only=False))
+                if all_personal:
+                    QTimer.singleShot(50, lambda p=all_personal: self.worker.do_download(p))
+                else:
+                    self._set_status("No personal mail.", connected=True)
+                    self._prompt_outbox()
             return
 
         # ── Mail View ─────────────────────────────────────────────
@@ -2980,16 +3104,39 @@ class MainWindow(QMainWindow):
             msg.addButton("⚡  New messages only (PN)", QMessageBox.ButtonRole.NoRole)
             msg.exec()
 
-            full_lm = (msg.clickedButton().text().startswith("📥"))
+            full = (msg.clickedButton().text().startswith("📥"))
 
-            # Mark this user+BBS combo as visited so we never ask again
             self.config.setdefault("visited_bbs", {})[visit_key] = True
             save_config(self.config)
 
-            QTimer.singleShot(50, lambda nf=not full_lm: self.worker.do_mail_check(new_only=nf))
+            if full:
+                if all_personal:
+                    QTimer.singleShot(50, lambda p=all_personal: self.worker.do_download(p))
+                else:
+                    self._set_status("No personal mail.", connected=True)
+                    self._prompt_outbox()
+            else:
+                if new_only:
+                    QTimer.singleShot(50, lambda p=new_only: self.worker.do_download(p))
+                else:
+                    self._set_status("No new personal mail.", connected=True)
+                    self._prompt_outbox()
         else:
-            # Returning visit — LM, new PN only
-            QTimer.singleShot(50, lambda: self.worker.do_mail_check(new_only=True))
+            # Returning visit — auto-download PN new only
+            if new_only:
+                n = len(new_only)
+                self._set_status(f"Downloading {n} new message(s)…", connected=True)
+                QTimer.singleShot(50, lambda p=new_only: self.worker.do_download(p))
+            else:
+                self._set_status("No new personal mail.", connected=True)
+                # Check bulletins from LL/L scan — no extra L> commands needed
+                bull_cfg = self.config.get("bulletins", {})
+                subs = bull_cfg.get("subscriptions", [])
+                if (bull_cfg.get("check_on_connect", False)
+                        and subs and self._is_home_bbs()):
+                    QTimer.singleShot(200, self._process_ll_bulletins)
+                    return
+                self._prompt_outbox()
 
     def _on_progress(self, op: str, current: int, total: int, detail: str):
         """Update toolbar pill and status bar progress during operations."""
@@ -3211,13 +3358,14 @@ class MainWindow(QMainWindow):
         self.terminal.append(dl_line, "#aaffff")
         self.debug_view.append(dl_line, "#aaffff")
 
-        # Trigger bulletin check if enabled, subscriptions exist, and on home BBS
-        bull_cfg = self.config.get("bulletins", {})
-        subs = bull_cfg.get("subscriptions", [])
-        if bull_cfg.get("check_on_connect", False) and subs and self._is_home_bbs():
-            self._set_status("Checking bulletins…", connected=True)
-            QTimer.singleShot(200, lambda: self.worker.do_check_bulletins(subs))
-            return   # outbox prompt will happen after bulletin check
+        # Check bulletins from LL/L scan — no extra L> commands needed
+        if self._is_home_bbs():
+            bull_cfg = self.config.get("bulletins", {})
+            subs = bull_cfg.get("subscriptions", [])
+            if bull_cfg.get("check_on_connect", False) and subs:
+                self._set_status("Checking bulletins…", connected=True)
+                QTimer.singleShot(200, self._process_ll_bulletins)
+                return   # outbox prompt will happen after bulletin check
 
         # Prompt about outbox / auto-disconnect
         pending = self.db.get_pending_outbox()
@@ -3231,6 +3379,54 @@ class MainWindow(QMainWindow):
                 self._on_send_outbox()
                 return
         self._prompt_outbox()
+
+    def _process_ll_bulletins(self):
+        """
+        Filter _ll_bulletins through tombstone/exists checks and feed the
+        result to _on_bulletin_check — same dialog path as before, without
+        any extra L> commands on the wire.
+        Called instead of do_check_bulletins() on auto-connect paths.
+        """
+        raw = getattr(self, "_ll_bulletins", [])
+        if not raw:
+            self._on_bulletin_check({})
+            return
+
+        bbs_id = (f"{self.config.get('user',{}).get('callsign','NOCALL').upper()}"
+                  f"@{self._get_active_bbs_entry().get('callsign','')}")
+
+        # ── First bulletin connect — auto-tombstone all but 2 newest ──────
+        mycall   = self.config.get("user", {}).get("callsign", "NOCALL").upper()
+        bull_key = f"bulletins_seen@{self._get_active_bbs_entry().get('callsign','')}"
+        visited  = self.config.get("visited_bbs", {})
+
+        if bull_key not in visited:
+            # Group by category to tombstone all but 2 newest per category
+            from collections import defaultdict
+            by_cat = defaultdict(list)
+            for m in raw:
+                by_cat[m.to_call.upper()].append(m)
+            for cat, msgs in by_cat.items():
+                msgs_sorted = sorted(msgs, key=lambda m: m.msg_number, reverse=True)
+                to_tombstone = msgs_sorted[2:]
+                if to_tombstone:
+                    self.db.add_bulletin_tombstones_batch(to_tombstone, bbs_id)
+                    self.worker.sig_log.emit(
+                        f"[SYS] First bulletin connect — tombstoned "
+                        f"{len(to_tombstone)} old {cat} bulletins, "
+                        f"keeping {len(msgs_sorted[:2])} newest")
+            self.config.setdefault("visited_bbs", {})[bull_key] = True
+            save_config(self.config)
+
+        # Filter out already downloaded and tombstoned
+        filtered = {}
+        for m in raw:
+            cat = m.to_call.upper()
+            if (not self.db.bulletin_exists(m.msg_number, bbs_id)
+                    and not self.db.bulletin_tombstone_exists(m.msg_number, bbs_id)):
+                filtered.setdefault(cat, []).append(m)
+
+        self._on_bulletin_check(filtered)
 
     def _on_bulletin_check(self, bulletins_by_cat: dict):
         """Called when bulletin check completes — show selection dialog."""
@@ -3706,8 +3902,12 @@ def main():
     except Exception:
         pass   # if config can't be read yet, default light mode is fine
 
-    # Set application icon from qtc_icon.svg if present alongside the script
-    _icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qtc_icon.svg")
+    # Set application icon — works both as a script and as a PyInstaller exe
+    if getattr(sys, 'frozen', False):
+        _base = os.path.dirname(sys.executable)
+    else:
+        _base = os.path.dirname(os.path.abspath(__file__))
+    _icon_path = os.path.join(_base, "qtc_icon.svg")
     if os.path.exists(_icon_path):
         from PyQt6.QtGui import QIcon
         app.setWindowIcon(QIcon(_icon_path))
