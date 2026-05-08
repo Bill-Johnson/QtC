@@ -1,4 +1,4 @@
-# QtC v0.10.10-beta — bbs_session.py  (built 2026-04-14)
+# QtC v0.12.0-beta — bbs_session.py  (built 2026-05-07)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -20,8 +20,307 @@ Tuned for KC9MTP-7 LinBPQ node output format.
 
 import re
 import time
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional
+
+
+# ─────────────────────────────────────────────
+# YAPP file transfer protocol
+# ─────────────────────────────────────────────
+#
+# BBS commands (LinBPQ):
+#   files            — list available files
+#   yapp <filename>  — download a file via YAPP
+#   read <filename>  — display file as plain text (no protocol)
+#
+# Note: LinBPQ YAPP does not support filenames that contain spaces.
+#
+# YAPP wire format:
+#   Header : SOH + length(1) + filename\x00 + filesize_decimal\x00
+#   Data   : STX + length(1) + data bytes   (length 0 = 256 bytes)
+#   End    : EOT
+#   ACK/NAK: single byte from receiver after each frame
+#
+# Telnet caveat: data bytes of 0xFF are mangled by Telnet IAC stripping.
+#   VaraHF/FM transports are unaffected.  In practice BBS files are text
+#   and rarely contain 0xFF, but it is a known limitation.
+
+_YAPP_SOH = 0x01   # Start of header
+_YAPP_STX = 0x02   # Start of data block
+_YAPP_ETX = 0x03   # End of text — LinBPQ uses this as end-of-transfer (same as EOT)
+_YAPP_EOT = 0x04   # End of transmission (standard YAPP)
+_YAPP_ENQ = 0x05   # Enquiry — BBS sends this to signal "I am ready to send"
+_YAPP_ACK = 0x06   # Acknowledge
+_YAPP_NAK = 0x15   # Negative acknowledge
+_YAPP_CAN = 0x18   # Cancel
+
+
+class YappReceiver:
+    """
+    Receives a file via YAPP after the BBS has been sent 'yapp <filename>'.
+
+    Full YAPP handshake (per WA7MBL spec and yapp.c by Jonathan Naylor G4KLX):
+
+      BBS  → Client  [ENQ][subcode]          "I am ready to send"
+      Client → BBS   [ACK][0x01]  (RR)       "Receiver Ready"
+      BBS  → Client  [SOH][len][name\\0][size\\0]  YAPP header
+      Client → BBS   [ACK][0x02]  (RF)       "Ready for File data"
+      BBS  → Client  [STX][len][data]        data block(s), repeat
+      Client → BBS   [ACK][0x01]  (RR)       ack each data block
+      BBS  → Client  [EOT]                   end of file
+      Client → BBS   [ACK][0x01]  (RR)       final ack
+
+    All ACKs are 2 bytes.  Single-byte 0x06 is NOT sufficient — LinBPQ
+    waits for the 2-byte RR/RF response before proceeding.
+    """
+
+    TIMEOUT = 60   # seconds to wait for any single frame
+
+    def __init__(self, transport, progress_cb=None, log_cb=None):
+        self.transport   = transport
+        self.progress_cb = progress_cb   # callable(bytes_done: int, total: int)
+        self.log_cb      = log_cb        # callable(msg: str)
+
+    def _log(self, msg: str):
+        if self.log_cb:
+            self.log_cb(msg)
+
+    # ── Receiver-side packets per WA7MBL YAPP RFC v1.1 (1986) ──────────
+    # See ../memory/reference_yapp_rfc.md for the full state tables.
+
+    def _send_rr(self):
+        """RR (Rcv_Rdy): [ACK][0x01] — generic positive ack."""
+        self.transport.send_raw(bytes([_YAPP_ACK, 0x01]))
+
+    def _send_rf(self):
+        """RF (Rcv_File): [ACK][0x02] — accept the file offered by HD."""
+        self.transport.send_raw(bytes([_YAPP_ACK, 0x02]))
+
+    def _send_af(self):
+        """AF (Ack_EOF): [ACK][0x03] — required ack for EF (Send_EOF)."""
+        self.transport.send_raw(bytes([_YAPP_ACK, 0x03]))
+
+    def _send_at(self):
+        """AT (Ack_EOT): [ACK][0x04] — required ack for ET (Send_EOT)."""
+        self.transport.send_raw(bytes([_YAPP_ACK, 0x04]))
+
+    def _send_nr(self, reason: bytes = b""):
+        """NR (Not_Rdy): [NAK][len][optional reason ASCII] per RFC v1.1."""
+        self.transport.send_raw(bytes([_YAPP_NAK, len(reason)]) + reason)
+
+    # Legacy alias — kept so the in-block error path at the data-block
+    # short-read site keeps working unchanged. Sends a zero-reason NR.
+    def _send_nak(self):
+        self._send_nr()
+
+    def _hex(self, data: bytes, label: str = ""):
+        """Log up to 32 bytes as hex for debugging."""
+        if data:
+            h = " ".join(f"{b:02x}" for b in data[:32])
+            suffix = "…" if len(data) > 32 else ""
+            self._log(f"YAPP hex {label}: [{h}{suffix}]  ({len(data)} bytes)")
+        else:
+            self._log(f"YAPP hex {label}: [empty]")
+
+    def receive(self) -> tuple:
+        """
+        Execute the full YAPP receive handshake.
+        Returns (filename: str, data: bytes).
+        Raises IOError on protocol error or timeout.
+        """
+        # ── Step 1: Wait for ENQ from BBS ────────────────────────────
+        # LinBPQ sends [ENQ=05][subcode=01] to signal it is ready to send.
+        # The subcode 0x01 coincidentally equals SOH but is NOT the header
+        # frame — it is LinBPQ's YAPP version/type byte.
+        # Any text before ENQ (BBS echo, status lines) is skipped.
+        self._log("YAPP: waiting for ENQ signal from BBS...")
+        deadline = time.time() + self.TIMEOUT
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise IOError(
+                    "YAPP: timed out waiting for ENQ — "
+                    "BBS may not support YAPP or filename was not found")
+            b = self.transport.read_raw_bytes(1, timeout=min(2.0, remaining))
+            if not b:
+                continue
+            if b[0] == _YAPP_ENQ:
+                sub_b = self.transport.read_raw_bytes(1, timeout=5.0)
+                subcode = sub_b[0] if sub_b else 0
+                self._log(f"YAPP: ENQ received (subcode=0x{subcode:02x})")
+                self._hex(bytes([_YAPP_ENQ, subcode]), "ENQ+subcode")
+                break
+
+        # ── Step 2: Send RR — Receiver Ready ─────────────────────────
+        self._send_rr()
+        self._log("YAPP: sent RR — scanning for SOH header frame...")
+
+        # ── Step 3: Scan for SOH, then read header ────────────────────
+        # After RR the BBS sends [SOH=01][len][filename\0][filesize\0].
+        # We always scan for a fresh SOH regardless of the ENQ subcode.
+        deadline = time.time() + self.TIMEOUT
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise IOError("YAPP: timed out waiting for SOH header after RR")
+            b = self.transport.read_raw_bytes(1, timeout=min(2.0, remaining))
+            if not b:
+                continue
+            if b[0] == _YAPP_SOH:
+                self._log("YAPP: SOH found — reading header")
+                break
+
+        len_b = self.transport.read_raw_bytes(1, timeout=10)
+        self._hex(len_b, "header-len-byte")
+        if not len_b:
+            raise IOError("YAPP: timeout reading header length byte")
+        hlen = len_b[0] or 256
+
+        hdata = self.transport.read_raw_bytes(hlen, timeout=15)
+        parts = hdata.split(b'\x00')
+        filename = parts[0].decode('ascii', errors='replace').strip()
+        try:
+            filesize = int(parts[1].decode('ascii').strip()) \
+                       if len(parts) > 1 and parts[1] else 0
+        except ValueError:
+            filesize = 0
+        self._log(f"YAPP: header — file='{filename}'  size={filesize} bytes")
+
+        # ── Step 4: Send RF — Ready for File data ─────────────────────
+        self._send_rf()
+        self._log("YAPP: sent RF — receiving data blocks...")
+
+        # ── Step 5: Receive data blocks ───────────────────────────────
+        received = bytearray()
+        block_num = 0
+        etx_cycles = 0   # safety: bail out if ETX path loops more than once
+
+        while True:
+            ft_b = self.transport.read_raw_bytes(1, timeout=self.TIMEOUT)
+            if not ft_b:
+                raise IOError("YAPP: timeout waiting for data block or EOT")
+            ft = ft_b[0]
+
+            if ft in (_YAPP_EOT, _YAPP_ETX):
+                if ft == _YAPP_ETX:
+                    # Close handshake per WA7MBL YAPP RFC v1.1 (1986):
+                    #   sender sends EF (ETX + sub=0x01)   = end-of-file
+                    #   receiver MUST reply AF (ACK + 0x03) = Ack_EOF
+                    #   sender then sends either:
+                    #     ET (EOT + sub) → end-of-transmission, we reply AT
+                    #     HD (SOH + hdr) → next file in batch, we reply RF
+                    #
+                    # LinBPQ32 over VARA quirk (captured 2026-05-07):
+                    # even on a single-file download it tends to send a
+                    # sentinel HD with the same filename and size=0 in
+                    # place of ET. We treat that as "no more real files"
+                    # and reply NR (proper [NAK][len][reason]), which
+                    # closes the session even if LinBPQ logs it as
+                    # "File Rejected" on its side. The download_file()
+                    # finally block strips that artifact from the
+                    # user-visible terminal output.
+                    etx_cycles += 1
+                    if etx_cycles > 2:
+                        self._log("YAPP: EF path looped >2 times — aborting")
+                        self._send_nr()
+                        break
+
+                    sub_b = self.transport.read_raw_bytes(1, timeout=5.0)
+                    sub = sub_b[0] if sub_b else 0
+                    self._log(f"YAPP: EF (ETX, sub=0x{sub:02x}) — sending AF")
+                    self._send_af()
+
+                    nxt_b = self.transport.read_raw_bytes(1, timeout=20.0)
+                    if not nxt_b:
+                        self._log("YAPP: no follow-up after AF — exiting")
+                    else:
+                        nxt = nxt_b[0]
+                        self._log(f"YAPP: post-AF byte = 0x{nxt:02x}")
+
+                        if nxt == _YAPP_EOT:
+                            sub2_b = self.transport.read_raw_bytes(1, timeout=5.0)
+                            sub2 = sub2_b[0] if sub2_b else 0
+                            self._log(
+                                f"YAPP: ET (EOT, sub=0x{sub2:02x}) — "
+                                "sending AT (clean RFC close)")
+                            self._send_at()
+                        elif nxt == _YAPP_SOH:
+                            hlen_b = self.transport.read_raw_bytes(1, timeout=10)
+                            hlen = (hlen_b[0] if hlen_b else 0) or 256
+                            hdata = self.transport.read_raw_bytes(hlen, timeout=15)
+                            self._hex(bytes([_YAPP_SOH, hlen]) + hdata,
+                                      "post-AF HD")
+                            parts = hdata.split(b'\x00')
+                            bf_name = parts[0].decode('ascii', errors='replace').strip()
+                            try:
+                                bf_size = int(parts[1].decode('ascii').strip()) \
+                                    if len(parts) > 1 and parts[1] else 0
+                            except ValueError:
+                                bf_size = 0
+                            self._log(
+                                f"YAPP: HD file='{bf_name}' size={bf_size}")
+                            if bf_size == 0:
+                                self._send_nr()
+                                self._log(
+                                    "YAPP: sent NR for size=0 sentinel HD "
+                                    "(LinBPQ end-of-batch quirk)")
+                            else:
+                                self._send_rf()
+                                self._log(
+                                    "YAPP: sent RF for batch HD — "
+                                    "looping for next file")
+                                continue
+                        else:
+                            self._log(f"YAPP: unexpected post-AF byte 0x{nxt:02x}")
+                else:
+                    # Standard ET (EOT) from non-LinBPQ senders that follow
+                    # the RFC strictly without the size=0 HD quirk.
+                    self._send_at()
+                self._log(
+                    f"YAPP: transfer complete "
+                    f"({'EF/HD' if ft == _YAPP_ETX else 'ET'}) — "
+                    f"{len(received)} bytes received")
+                break
+
+            elif ft == _YAPP_STX:
+                blen_b = self.transport.read_raw_bytes(1, timeout=10)
+                if not blen_b:
+                    raise IOError("YAPP: timeout reading block length")
+                blen = blen_b[0] or 256
+
+                block = self.transport.read_raw_bytes(blen, timeout=20)
+                if len(block) < blen:
+                    self._send_nak()
+                    raise IOError(
+                        f"YAPP: short block (expected {blen}, got {len(block)})")
+
+                received.extend(block)
+                block_num += 1
+                self._send_rr()
+
+                if self.progress_cb:
+                    self.progress_cb(len(received), filesize)
+                total_str = str(filesize) if filesize else "?"
+                self._log(
+                    f"YAPP: block {block_num} — "
+                    f"{len(received)}/{total_str} bytes")
+
+            elif ft == _YAPP_CAN:
+                raise IOError("YAPP: transfer cancelled by remote station")
+
+            elif ft == _YAPP_ENQ:
+                # Re-ENQ mid-transfer — consume the companion byte and re-send RR
+                self.transport.read_raw_bytes(1, timeout=2.0)
+                self._send_rr()
+
+            else:
+                self._log(f"YAPP: unexpected frame type 0x{ft:02x} — ignored")
+
+        return filename, bytes(received)
+
+
+
 
 
 # ─────────────────────────────────────────────
@@ -708,3 +1007,109 @@ class BBSSession:
             pass
         self.transport.disconnect()
         self._log("SYS", "Disconnected")
+
+    def list_files(self) -> str:
+        """
+        Send 'files' to list files available on the BBS.
+        Returns the raw text listing.
+        Note: also works as a manual terminal command — this method is
+        provided for any future automated file-browsing feature.
+        """
+        self._send("files")
+        return self._expect(self.PROMPT_BBS, timeout=30)
+
+    def download_file(self, filename: str, save_dir: str,
+                      progress_cb=None) -> tuple:
+        """
+        Download a file from the BBS using YAPP protocol.
+
+        Sends 'yapp <filename>', waits for the YAPP transfer, saves the
+        received file to save_dir.  Returns (save_path: str, bytes_received: int).
+
+        Filenames with spaces are not supported by LinBPQ YAPP — the caller
+        should validate this before calling.
+
+        Pauses the terminal monitor for the duration of the transfer and
+        re-enables it on completion or error.
+        """
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Flush stale data BEFORE stopping the monitor, then stop the monitor.
+        # Order matters: flush_input() must run while the monitor is still live
+        # so it drains the socket cleanly; stopping the monitor afterwards
+        # guarantees the YAPP frame bytes won't be consumed by the monitor thread
+        # after we send the command.
+        self.transport.flush_input()
+        if hasattr(self.transport, "set_terminal_mode"):
+            self.transport.set_terminal_mode(False)
+
+        try:
+            self._send(f"yapp {filename}")
+
+            receiver = YappReceiver(
+                self.transport,
+                progress_cb=progress_cb,
+                log_cb=lambda msg: self._log("SYS", msg),
+            )
+            rcvd_name, data = receiver.receive()
+
+            # Prefer the filename the BBS sent in the YAPP header;
+            # fall back to the requested name if the header was empty.
+            save_name = rcvd_name.strip() if rcvd_name.strip() \
+                        else os.path.basename(filename)
+
+            # Sanitize — keep alphanumeric, dots, dashes, underscores only
+            safe = set("abcdefghijklmnopqrstuvwxyz"
+                       "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                       "0123456789._-")
+            save_name = "".join(c for c in save_name if c in safe) \
+                        or "yapp_download"
+
+            save_path = os.path.join(save_dir, save_name)
+            # Avoid silently overwriting an existing file
+            if os.path.exists(save_path):
+                base, ext = os.path.splitext(save_name)
+                i = 1
+                while os.path.exists(save_path):
+                    save_path = os.path.join(save_dir, f"{base}_{i}{ext}")
+                    i += 1
+
+            with open(save_path, "wb") as f:
+                f.write(data)
+
+            self._log("SYS", f"File saved: {save_path}")
+            return save_path, len(data)
+
+        finally:
+            # After YAPP, LinBPQ sends "de KC9MTP>" before returning to the
+            # BBS prompt. Read until the prompt, then re-emit whatever we
+            # captured as an [RX] line so the terminal view shows the prompt
+            # the same way it does for any other command — without this the
+            # user sees the download succeed but no prompt afterwards and
+            # can't tell whether the BBS is hung or idle.
+            try:
+                tail = self.transport.read_until(">", timeout=20)
+            except Exception:
+                tail = ""
+            if tail:
+                # The terminal monitor is paused during YAPP, so anything
+                # in this post-YAPP read is by definition cleanup noise
+                # from LinBPQ — "File Rejected" log text from our NR for
+                # the size=0 sentinel, stray control/punctuation bytes
+                # (e.g. ',\x02' observed after multi-block transfers),
+                # etc. Real BBS output arrives only AFTER terminal mode
+                # is re-enabled. Find the BBS prompt and emit only from
+                # there onwards so the user sees a clean prompt.
+                m = re.search(r'(de\s+\S+>)', tail)
+                if m:
+                    self._log("RX", m.group(1))
+                elif tail.strip():
+                    # Fallback: no prompt found. Strip control bytes and
+                    # emit whatever's left so we don't lose unexpected text.
+                    cleaned = re.sub(
+                        r'[\x00-\x08\x0b\x0c\x0e-\x1f]', '', tail)
+                    if cleaned.strip():
+                        self._log("RX", cleaned)
+            self.transport.flush_input()
+            if hasattr(self.transport, "set_terminal_mode"):
+                self.transport.set_terminal_mode(True)

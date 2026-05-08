@@ -72,6 +72,22 @@ install_app_files() {
     if [ -f "$SCRIPT_DIR/qtc_icon.svg" ]; then
         cp "$SCRIPT_DIR/qtc_icon.svg" "$INSTALL_DIR/"
     fi
+    # Copy splash generator and (re)generate qtc_splash.png so it always
+    # reflects the installed APP_VERSION. Pillow is required — install via
+    # pip if not present. If generation fails, the splash is silently
+    # skipped at runtime (main_window.py guards the file existence).
+    if [ -f "$SCRIPT_DIR/make_splash.py" ]; then
+        cp "$SCRIPT_DIR/make_splash.py" "$INSTALL_DIR/"
+        if ! python3 -c "import PIL" &>/dev/null 2>&1; then
+            echo "  Installing Pillow for splash generation..."
+            pip3 install --user pillow >/dev/null 2>&1 || true
+        fi
+        if python3 -c "import PIL" &>/dev/null 2>&1; then
+            (cd "$INSTALL_DIR" && python3 make_splash.py >/dev/null 2>&1) \
+                && echo "  Generated qtc_splash.png" \
+                || echo "  WARNING: splash generation failed (non-fatal)"
+        fi
+    fi
     # Don't overwrite existing config — preserve user settings
     # Check for existing config, then backup from previous uninstall, then default
     if [ -f "$INSTALL_DIR/config.json" ]; then

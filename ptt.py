@@ -1,4 +1,4 @@
-# QtC v0.10.10-beta — ptt.py  (built 2026-04-14)
+# QtC v0.12.0-beta — ptt.py  (built 2026-05-07)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify

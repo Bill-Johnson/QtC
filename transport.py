@@ -1,4 +1,4 @@
-# QtC v0.10.10-beta — transport.py  (built 2026-04-14)
+# QtC v0.12.0-beta — transport.py  (built 2026-05-07)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -220,6 +220,30 @@ class TelnetTransport:
             chunk = self.read_eager()
         return result
 
+    def read_raw_bytes(self, n: int, timeout: float = 10.0) -> bytes:
+        """
+        Read exactly n raw bytes from the transport.
+        Used by YappReceiver for binary frame reading.
+        Returns fewer than n bytes only if timeout expires.
+        """
+        deadline = time.time() + timeout
+        while len(self._buf) < n:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            chunk = self._recv_chunk(timeout=min(remaining, 1.0))
+            if chunk:
+                self._buf += chunk
+        result = self._buf[:n]
+        self._buf = self._buf[n:]
+        return result
+
+    def send_raw(self, data: bytes):
+        """Send raw bytes without appending \\r\\n. Used for YAPP ACK/NAK bytes."""
+        if not self.connected:
+            raise ConnectionError("Not connected")
+        self.sock.sendall(data)
+
 
 class VaraTransport:
     """
@@ -411,6 +435,15 @@ class VaraTransport:
                     # Flush partial buffer on mode switch
                     self._log("RX", line_buf.strip())
                     line_buf = ""
+                # Reset the dedup cache whenever we go idle. The cache is
+                # meant to suppress short-timescale VARA frame duplication
+                # within an active session; it must NOT span pause/resume
+                # boundaries, or e.g. running `files` twice (once before a
+                # YAPP transfer, once after) silently drops the second
+                # listing because every line matches an entry left over
+                # from the first invocation.
+                if recent:
+                    recent.clear()
                 self._monitor_idle.set()   # signal that monitor is idle
                 time.sleep(0.1)
                 continue
@@ -655,12 +688,14 @@ class VaraTransport:
         Enable/disable background data streaming for terminal view.
         When True: data port is read continuously and emitted as [RX] log lines.
         When False: data port is only read via explicit _expect() calls (mail mode).
+
+        flush_input() is NOT called here — callers (download_file, etc.) manage
+        flushing explicitly so YAPP frame bytes are not discarded mid-transfer.
         """
         self._terminal_mode = enabled
         if not enabled:
             # Wait up to 1s for monitor to finish its current recv() and go idle
             self._monitor_idle.wait(timeout=1.0)
-            self.flush_input()   # discard anything buffered during transition
         else:
             self.flush_input()
 
@@ -699,10 +734,11 @@ class VaraTransport:
             self._log("SYS",
                 f"flush_input: discarding {len(self._data_buf)} stale bytes")
         self._data_buf = b""
-        # Drain anything sitting on the socket with a very short timeout
+        # Drain anything sitting on the socket — use 0.5s to catch bytes
+        # that arrive slightly late over RF (PTT turnaround latency)
         if self._data_sock:
             old_to = self._data_sock.gettimeout()
-            self._data_sock.settimeout(0.1)
+            self._data_sock.settimeout(0.5)
             try:
                 while True:
                     chunk = self._data_sock.recv(4096)
@@ -760,6 +796,30 @@ class VaraTransport:
             time.sleep(0.2)
             chunk = self.read_eager()
         return result
+
+    def read_raw_bytes(self, n: int, timeout: float = 10.0) -> bytes:
+        """
+        Read exactly n raw bytes from the VARA data port.
+        Used by YappReceiver for binary frame reading.
+        Returns fewer than n bytes only if timeout expires.
+        """
+        deadline = time.time() + timeout
+        while len(self._data_buf) < n:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            chunk = self._recv_data_chunk(timeout=min(remaining, 1.0))
+            if chunk:
+                self._data_buf += chunk
+        result = self._data_buf[:n]
+        self._data_buf = self._data_buf[n:]
+        return result
+
+    def send_raw(self, data: bytes):
+        """Send raw bytes without appending \\r\\n. Used for YAPP ACK/NAK bytes."""
+        if not self.connected:
+            raise ConnectionError("VARA not connected")
+        self._data_sock.sendall(data)
 
 
 class VaraControl:

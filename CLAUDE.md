@@ -1,0 +1,382 @@
+# CLAUDE.md — QtC BBS Client
+# Bill Johnson, KC9MTP — Valparaiso, Indiana
+# This file is read by Claude Code at the start of every session.
+
+---
+
+## PROJECT OVERVIEW
+
+QtC is a desktop BBS client for amateur radio. It connects to LinBPQ/BPQ32
+nodes via VARA HF, VARA FM, and Telnet. It handles mail download, bulletin
+subscriptions, compose/send, address book, terminal view, and YAPP file
+download over RF.
+
+**Current version:** 0.11.0-beta  
+**License:** GPL-3  
+**Copyright:** (C) 2025-2026 Bill Johnson, KC9MTP  
+**GitHub:** https://github.com/Bill-Johnson/QtC  
+**Local working tree:** ~/vara_bbs_client/QtC/
+
+---
+
+## SOURCE FILES
+
+| File | Purpose |
+|---|---|
+| `main_window.py` | PyQt6 GUI — main window, toolbar, mail view, terminal, dialogs |
+| `bbs_session.py` | BBS login, mail check, message download/send, YAPP file transfer |
+| `transport.py` | VARA HF, VARA FM, and Telnet transports |
+| `ptt.py` | PTT control via serial RTS/DTR |
+| `database.py` | SQLite — inbox, outbox, sent, bulletins, contacts, watermarks |
+| `make_splash.py` | Pillow generator for `qtc_splash.png` (build/install asset) |
+
+All 6 files must have matching version headers before any release.
+
+---
+
+## CODE STANDARDS
+
+### Version header (line 1 of every .py file)
+```
+# QtC vX.Y.Z-beta — filename.py  (built YYYY-MM-DD)
+```
+
+### GPL-3 copyright header (lines 2–15 of every .py file)
+```python
+# Copyright (C) 2025-2026 Bill Johnson, KC9MTP
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+```
+Update copyright year range at the start of each new calendar year.
+
+### APP_VERSION in main_window.py
+```python
+APP_VERSION = "X.Y.Z-beta"  # keep in sync with header comment
+```
+
+### Versioning rules
+- Bug fix → increment patch: 0.9.0 → 0.9.1
+- New feature complete → increment minor: 0.9.x → 0.10.0
+
+---
+
+## RELEASE WORKFLOW
+
+Before any tarball, show a numbered summary of all changes and ask:
+**"Ready to pack, or anything to add/fix first?"** — wait for explicit approval.
+
+### Pre-pack checklist (verify all before packing)
+- [ ] Syntax-check all 6 Python files (`python3 -m py_compile`)
+- [ ] All 6 Python file headers match the version
+- [ ] APP_VERSION in main_window.py matches
+- [ ] README.md changelog updated with new version entry
+- [ ] README.txt changelog updated with new version entry
+- [ ] qtc_icon.svg present in ~/vara_bbs_client/QtC/
+- [ ] qtc_splash.png regenerated (`python3 make_splash.py`) so version matches
+- [ ] qtc_splash_v3_accurate.svg (mockup) deleted — pack already excludes it but tidy first
+- [ ] install.ps1 $VERSION matches release version
+- [ ] `chmod +x install.sh uninstall.sh`
+
+Claude never builds the tarball. Bill always packs locally.
+
+### Bill's local pack commands
+```bash
+cd ~/vara_bbs_client
+
+# Pack from QtC/ using --transform to rename inside tarball
+tar -czf releases/QtC-X.Y.Z-beta.tar.gz \
+  --owner=0 --group=0 --mode="go+rX,u+rwX" \
+  --transform='s|^QtC|QtC-X.Y.Z-beta|' \
+  --exclude='QtC/CLAUDE.md' \
+  --exclude='QtC/__pycache__' \
+  --exclude='*.pyc' \
+  --exclude='QtC/qtc_splash_v3_accurate.svg' \
+  --exclude='QtC/.git' \
+  --exclude='QtC/.gitignore' \
+  QtC/
+
+# Git commit, tag, push
+git -C QtC add -A
+git -C QtC commit -m "Release QtC vX.Y.Z-beta"
+git -C QtC tag -a vX.Y.Z-beta -m "QtC vX.Y.Z-beta"
+git -C QtC push origin main
+git -C QtC push origin vX.Y.Z-beta
+```
+
+Then upload `~/vara_bbs_client/releases/QtC-X.Y.Z-beta.tar.gz` to GitHub Releases.
+
+### Git / GitHub rules
+- Tag format: `v0.9.0-beta` (always prefix with v)
+- ~/vara_bbs_client/QtC/ is never packed directly — always use --transform
+- ~/vara_bbs_client/releases/ keeps official tarballs separate from working tree
+- After pack: re-upload updated .py files + README.md + README.txt + config.json
+  to the Claude.ai project knowledge base
+
+---
+
+## REQUIRED FILES IN ~/vara_bbs_client/QtC/
+
+| File | Notes |
+|---|---|
+| main_window.py | Version header required |
+| bbs_session.py | Version header required |
+| transport.py | Version header required |
+| database.py | Version header required |
+| ptt.py | Version header required |
+| make_splash.py | Pillow generator for qtc_splash.png — version header required |
+| install.sh | Must be chmod +x |
+| uninstall.sh | Must be chmod +x |
+| install.ps1 | Windows installer — $VERSION must match release |
+| uninstall.ps1 | Windows uninstaller |
+| config.json | Default config |
+| requirements.txt | Pip dependencies (Pillow used at install time for splash) |
+| LICENSE | GPL-3 |
+| README.md | Updated changelog required |
+| README.txt | Updated changelog required |
+| BUILD_WINDOWS.md | Windows build notes |
+| qtc_icon.svg | Linux/app icon — required |
+| qtc_icon.ico | Windows icon |
+| qtc_splash.png | Splash image — regenerated by make_splash.py at install/build |
+| QtC.spec | PyInstaller spec (windows branch only) |
+| screenshots/ | Screenshot directory |
+| CLAUDE.md | This file |
+
+---
+
+## WINDOWS EXE BUILD
+
+Run on the HP Win11 machine after the Linux tarball is pushed.
+Produces QtC-X.Y.Z-beta-windows.zip — upload as second asset to the same
+GitHub Release. Do NOT create a separate release.
+
+### Prerequisites (one-time)
+```
+pip install pyinstaller pillow
+```
+
+### Required files in build folder
+All 5 .py files, QtC.spec, qtc_icon.svg, qtc_icon.ico.
+QtC.spec and BUILD_WINDOWS.md live on the windows branch only.
+
+### Build
+```
+pyinstaller QtC.spec
+```
+Output: `dist\QtC\QtC.exe`
+
+### Package
+```
+cd dist
+powershell Compress-Archive -Path QtC -DestinationPath QtC-X.Y.Z-beta-windows.zip
+```
+
+Upload `dist\QtC-X.Y.Z-beta-windows.zip` to the existing GitHub Release page.
+
+### Windows branch workflow
+```bash
+git -C QtC checkout windows
+git -C QtC merge main
+git -C QtC push origin windows
+git -C QtC checkout main
+```
+
+### Key regressions to never break
+- `sys.frozen` guard in main_window.py — icon path uses `sys.executable`
+  when frozen, `__file__` when running as script
+- `data_dir` always anchored to `_APP_DIR` — messages persist between sessions
+  when exe is launched from any working directory
+- `install.ps1 $VERSION` must match release version — verify in pre-pack checklist
+
+---
+
+## ARCHITECTURE NOTES
+
+### Transport layer (transport.py)
+- `TelnetTransport` — TCP socket with IAC stripping, terminal monitor thread
+- `VaraTransport` — two TCP ports: cmd (8300) and data (8301); cmd monitored
+  in background thread; data port is the RF byte stream
+- Both transports implement identical public interface:
+  `connect()`, `disconnect()`, `send()`, `read_until()`, `flush_input()`,
+  `set_terminal_mode()`, `read_raw_bytes()`, `send_raw()`
+- `set_terminal_mode(False)` pauses background monitor — required before any
+  binary protocol (YAPP) or structured expect sequence (mail download)
+- `flush_input()` must be called BEFORE `set_terminal_mode(False)`, not after —
+  calling it after discards bytes already received from the BBS
+
+### BBS session (bbs_session.py)
+- `BBSSession` handles all BBS I/O: login, mail check, download, send, YAPP
+- LinBPQ prompt: `de KC9MTP>` — matched as `PROMPT_BBS = ">"`
+- Watermark-based mail: `LL N` on first connect, `L watermark-` on return
+- Mail download always pauses terminal monitor for entire sequence
+
+### GUI (main_window.py)
+- `SessionWorker(QThread)` — all BBS I/O runs here, never on GUI thread
+- Signals carry data back to GUI: `sig_log`, `sig_mail`, `sig_progress`, etc.
+- `TerminalWidget` — raw terminal view with quick-command buttons
+- `set_terminal_mode()` wired to connect/disconnect events
+
+### Database (database.py)
+- SQLite at `~/.local/share/qtc/data/messages.db` (Linux)
+           or `%APPDATA%\qtc\data\messages.db` (Windows)
+- Tables: messages, outbox, sent, bulletins, bulletin_tombstones,
+          bbs_watermarks, contacts
+- `_APP_DIR` is always the anchor — never use relative paths
+
+---
+
+## YAPP FILE TRANSFER PROTOCOL
+
+YAPP is used to download files from the BBS files area over RF.
+
+### BBS commands (LinBPQ)
+- `files` — list available files (flat list, no subdirectories)
+- `yapp <filename>` — initiate YAPP download
+- `read <filename>` — display file as plain text (no protocol)
+- Filenames with spaces NOT supported by LinBPQ YAPP — warn user if attempted
+
+### YAPP wire protocol — per WA7MBL RFC v1.1 (1986) and LinBPQ quirks
+
+**Authoritative spec:** Jeff Jacobsen, WA7MBL — YAPP(tm) protocol for Packet
+Radio binary file transfer, Revision 1.1, 1986-06-23. Full text saved at
+`memory/reference_yapp_rfc.md`. State tables there are the source of truth.
+
+```
+RFC packet types used by QtC's receiver path:
+  ENQ + 0x01           SI  Send_Init     "ready to send"
+  ACK + 0x01           RR  Rcv_Rdy       generic ack
+  ACK + 0x02           RF  Rcv_File      accept the offered file
+  ACK + 0x03           AF  Ack_EOF       acknowledge EF (per-file end)
+  ACK + 0x04           AT  Ack_EOT       acknowledge ET (session end)
+  SOH + len + hdr      HD  Send_Hdr      file header: name\0 size\0 [opt]
+  STX + len + data     DT  Send_Data     data block (len=0 → 256 bytes)
+  ETX + 0x01           EF  Send_EOF      end of current file
+  EOT + 0x01           ET  Send_EOT      end of transmission
+  NAK + len + reason   NR  Not_Rdy       "no, abort" (NOT a bare NAK byte)
+  CAN + len + reason   CN  Cancel
+  ACK + 0x05           CA  Can_Ack
+```
+
+Verified close path on LinBPQ32 v6.0.25.16 over VARA (2026-05-07):
+
+```
+BBS  → Client   ENQ + 01           SI
+Client → BBS    ACK + 01           RR
+BBS  → Client   SOH + len + ...    HD (name + size)
+Client → BBS    ACK + 02           RF
+BBS  → Client   STX + len + data   DT  (repeat per block)
+Client → BBS    ACK + 01           RR  (after each DT)
+BBS  → Client   ETX + 01           EF
+Client → BBS    ACK + 03           AF  ← MUST be AF, not RR
+BBS  → Client   …                  one of:
+                EOT + 01           ET  → reply ACK+04 (AT). Clean.
+                SOH + len + size=0 HD  ← LinBPQ quirk: end-of-batch sentinel
+Client → BBS    NAK + 00           NR  (for the size=0 sentinel)
+BBS  → Client   "File Rejected - <byte>" + "de KC9MTP>" prompt
+                The "File Rejected" message refers to the size=0 SENTINEL,
+                NOT the real file (which was already received). The
+                download_file() finally block strips this artifact from
+                the user-visible [RX] line.
+```
+
+Key facts (do not re-derive — these are tested on real RF):
+
+- ENQ subcode is 0x01 — looks like SOH but is NOT the header frame.
+- EF (ETX) is a 2-byte frame `[03][01]` — read BOTH bytes.
+- **After EF, the receiver MUST send AF, not RR.** RR after EF leaves the
+  sender's state machine in ambiguous "more files?" territory and on
+  LinBPQ produces the size=0 HD sentinel. Per the RFC state table
+  (SE → on AF → SH or ST), AF is the only valid response.
+- **NR is `[NAK][len][reason]`, never a bare `[NAK]` byte.** Sending one
+  byte makes LinBPQ display garbled glyphs (e.g. "File Rejected - ␆")
+  because it tries to display the missing length byte as ASCII.
+- LinBPQ32 still emits a size=0 HD sentinel even after a proper AF on a
+  single-file download — quirk, not RFC. Reply with NR (zero-length).
+  LinBPQ logs "File Rejected - <byte>" but DOES exit transfer state cleanly.
+- `YappReceiver` class in bbs_session.py: `_send_af()`, `_send_at()`, and
+  `_send_nr(reason=b"")` implement the close packets.
+- `read_raw_bytes()` and `send_raw()` in both transports support binary I/O.
+- Downloads saved to `~/.local/share/qtc/downloads/` (Linux)
+                  or `%APPDATA%\qtc\downloads\` (Windows).
+- Over Telnet: ENQ+SOH arrive but YAPP does not complete — Telnet YAPP
+  is a known limitation, deferred for future investigation.
+
+### Common YAPP pitfalls already solved — do not regress
+- `flush_input()` must run BEFORE `set_terminal_mode(False)` in download_file()
+- `set_terminal_mode(False)` must NOT call `flush_input()` internally —
+  callers own flushing; internal flush discards incoming YAPP bytes
+- After EF: read subcode byte, send **AF** (not RR), then read next byte:
+  ET → AT (clean RFC close); HD → RF (real next file) or NR (size=0 sentinel)
+- The `download_file()` finally block must re-emit `read_until(">")` output
+  as an `[RX]` log line so the user sees the BBS prompt after a successful
+  transfer (terminal monitor is paused during YAPP), and must strip
+  "File Rejected - <byte>" so the user doesn't see a misleading rejection
+  message after a successful save
+
+---
+
+## BBS / LINBPQ QUIRKS
+
+- LinBPQ splits long responses across multiple TCP/RF frames — always use
+  `read_until()` with a known terminator, never fixed-length reads for text
+- `Enter Title (only):` can arrive split across two packets — wait for `"itle"`
+  not `"Title"` or `":"` to match reliably
+- Prompt is `de KC9MTP>` not bare `>` — but `">"` substring match works
+- `files` command returns flat list: `filename size` one per line
+- YAPP `yapp filename` — no quotes, no spaces in filename, exact match
+- LinBPQ sends `[BPQ-6.0.25.16-IHJM$]` banner on connect — used to detect
+  successful BBS login
+
+---
+
+## DATA STORAGE PATHS
+
+| Platform | Config | Database | Downloads |
+|---|---|---|---|
+| Linux/Pi | `~/.local/share/qtc/config.json` | `~/.local/share/qtc/data/messages.db` | `~/.local/share/qtc/downloads/` |
+| Windows | `%APPDATA%\qtc\config.json` | `%APPDATA%\qtc\data\messages.db` | `%APPDATA%\qtc\downloads\` |
+
+All paths derived from `_APP_DIR` — never hardcoded, never relative to cwd.
+
+---
+
+## TESTING APPROACH
+
+For YAPP and binary protocol work, write a local test harness that feeds the
+exact byte sequence from a SoundModem capture into the receiver — no radio
+needed. Example:
+
+```python
+# Simulate LinBPQ YAPP byte sequence for testfile1.txt (60 bytes)
+# Receiver should reply NAK (0x15) to the trailing batch-sentinel SOH.
+fake_stream = bytes([
+    0x05, 0x01,                    # ENQ + subcode
+    0x01, 0x11,                    # SOH + len=17
+    *b'testfile1.txt', 0x00,       # filename + null
+    *b'60', 0x00,                  # filesize "60\0"
+    0x02, 0x3c,                    # STX + len=60
+    *b'test test test test\nthis is just a test\ntest test test test\n',
+    0x03, 0x01,                    # ETX + subcode
+    0x01, 0x10,                    # batch-sentinel SOH + len=16
+    *b'testfile1.txt', 0x00,       # same filename + null
+    *b'0', 0x00,                   # filesize "0\0"  ← end-of-batch marker
+])
+```
+
+---
+
+## PUNCHLIST (known wanted, not yet built)
+
+- YAPP upload (U command) — receive only currently implemented
+- YAPP over Telnet — Telnet YAPP sessions terminate unexpectedly; deferred
+- Rig control — Hamlib or FlRig integration
+- Direwolf transport — AX.25 packet via Direwolf
+- Soundmodem transport — generic soundmodem TCP interface
+- VARA Tune button PTT — key radio without active RF connection
+- NSIS/Inno Setup Windows installer with shortcuts (exe zip works for now)
+
+---
+
+*73 de KC9MTP — Bill Johnson — Valparaiso, IN*
