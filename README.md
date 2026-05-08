@@ -211,6 +211,13 @@ sqlite3 ~/.local/share/qtc/data/messages.db "DELETE FROM bulletin_tombstones; DE
 
 ## Changelog
 
+### 0.12.0-beta (2026-05-07)
+- Added: **Splash screen** — shown both by the PyInstaller bootloader (visible immediately on Windows .exe launch, before Python loads) and by an in-Python `QSplashScreen` while `MainWindow` constructs. Together these cover the slow first-run launch on Windows. Splash image (`qtc_splash.png`) is generated from scratch by a new `make_splash.py` Pillow script that reads `APP_VERSION` so the version line always matches the installed release.
+- Added: **Save Log…** button in the Debug view — writes the verbose session monitor buffer to a plain-text `.log` file via a save dialog. Useful for capturing RF transfer traces.
+- Changed: terminal "Get File" button relabeled to **"📁 File Download - YAPP"** and widened to make the function obvious to both old-school and new amateur radio operators (YAPP has been the BBS file-transfer standard since Jeff Jacobsen WA7MBL published the RFC in 1986).
+- Fixed: YAPP file download left LinBPQ stuck in transfer mode — file saved correctly but the next user command was rejected with `Unexpected message during YAPP Transfer. Transfer cancelled`. Root cause: LinBPQ ends a YAPP session by sending a second SOH header with the same filename and `size=0` as a YAPP-C batch end-of-session sentinel, not `[EOT]` as the prior implementation expected. `YappReceiver` now parses that sentinel and replies with `NAK` (0x15), releasing the BBS cleanly so subsequent commands work.
+- Fixed: BBS prompt `de KC9MTP>` not shown in the terminal view after a successful YAPP download — `read_until(">")` in `download_file()`'s finally block consumed the prompt for protocol cleanup without re-emitting it; the prompt is now logged as `[RX]` so it appears in the terminal view the same way as after any other command.
+
 ### 0.10.10-beta (2026-04-14)
 - Fixed: messages lost between sessions when running as exe — `data_dir` relative path resolved against working directory instead of `%APPDATA%\qtc`; now always anchored to `_APP_DIR`
 

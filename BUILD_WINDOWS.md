@@ -34,9 +34,11 @@ bbs_session.py
 transport.py
 database.py
 ptt.py
+make_splash.py
 QtC.spec
 qtc_icon.svg
 qtc_icon.ico        ← generate this first (see below)
+qtc_splash.png      ← generate this second (see below)
 ```
 
 > **Generating qtc_icon.ico** — run this once from your build folder:
@@ -68,6 +70,15 @@ qtc_icon.ico        ← generate this first (see below)
 > print('qtc_icon.ico written OK')
 > "
 > ```
+
+> **Generating qtc_splash.png** — run from your build folder so the splash
+> picks up the current `APP_VERSION` from `main_window.py`:
+> ```
+> python make_splash.py
+> ```
+> Output: `qtc_splash.png` (600×400). Used by both PyInstaller's bootloader
+> splash (configured in `QtC.spec`) and the in-Python `QSplashScreen` shown
+> while `MainWindow` constructs.
 
 ### 2. Run PyInstaller
 

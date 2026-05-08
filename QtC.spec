@@ -17,8 +17,9 @@ a = Analysis(
     pathex=['.'],
     binaries=[],
     datas=[
-        # Bundle the SVG icon alongside the exe
+        # Bundle the SVG icon and splash PNG alongside the exe
         ('qtc_icon.svg', '.'),
+        ('qtc_splash.png', '.'),
     ],
     hiddenimports=[
         # pyserial is imported lazily inside ptt.py functions — must be explicit
@@ -64,9 +65,25 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
+# Bootloader splash — shown by the PyInstaller bootloader BEFORE Python
+# starts loading. This is what fixes the "first run takes a bit" feel on
+# Windows; the in-Python QSplashScreen takes over once Qt is up.
+# main_window.py calls pyi_splash.close() once Qt is ready.
+splash = Splash(
+    'qtc_splash.png',
+    binaries=a.binaries,
+    datas=a.datas,
+    text_pos=None,           # version is baked into the PNG, no text overlay
+    text_size=12,
+    minify_script=True,
+    always_on_top=True,
+)
+
 exe = EXE(
     pyz,
     a.scripts,
+    splash,                  # boot splash front-loads on startup
+    splash.binaries,
     [],
     exclude_binaries=True,
     name='QtC',

@@ -4,7 +4,7 @@
 #   or:  powershell -ExecutionPolicy Bypass -File install.ps1
 
 $ErrorActionPreference = "Stop"
-$VERSION = "0.10.10-beta"
+$VERSION = "0.12.0-beta"
 $INSTALL_DIR = "$env:APPDATA\qtc"
 $BACKUP_CONFIG = "$env:USERPROFILE\qtc_config_backup.json"
 $BACKUP_DB     = "$env:USERPROFILE\qtc_messages_backup.db"
@@ -115,6 +115,25 @@ if (Test-Path "qtc_icon.svg") {
 }
 if (Test-Path "qtc_icon.ico") {
     Copy-Item "qtc_icon.ico" "$INSTALL_DIR\qtc_icon.ico" -Force
+}
+if (Test-Path "make_splash.py") {
+    Copy-Item "make_splash.py" "$INSTALL_DIR\make_splash.py" -Force
+    # (Re)generate qtc_splash.png so the version always matches the
+    # installed APP_VERSION. Pillow is required (already a build-time
+    # dep — see BUILD_WINDOWS.md). Pip-install it if missing.
+    & $pyCmd -c "import PIL" 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  Installing Pillow for splash generation..."
+        & $pyCmd -m pip install --user pillow 2>&1 | Out-Null
+    }
+    Push-Location $INSTALL_DIR
+    & $pyCmd make_splash.py 2>&1 | Out-Null
+    Pop-Location
+    if (Test-Path "$INSTALL_DIR\qtc_splash.png") {
+        Write-Host "  Generated qtc_splash.png" -ForegroundColor Green
+    } else {
+        Write-Host "  WARNING: splash generation failed (non-fatal)" -ForegroundColor Yellow
+    }
 }
 if (Test-Path "README.txt") {
     Copy-Item "README.txt" "$INSTALL_DIR\README.txt" -Force

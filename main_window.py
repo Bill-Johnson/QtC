@@ -1,4 +1,4 @@
-# QtC v0.10.10-beta — main_window.py  (built 2026-04-14)
+# QtC v0.12.0-beta — main_window.py  (built 2026-05-07)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,12 +13,12 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
-APP_VERSION = "0.10.10-beta"  # keep in sync with header comment
+APP_VERSION = "0.12.0-beta"  # keep in sync with header comment
 """
 QtC — Main Window (PyQt6)
 v0.2 — Quick-connect bar, auto-download, terminal swap button
 """
-import sys, json, os, copy
+import sys, json, os, copy, time
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
@@ -30,10 +30,10 @@ from PyQt6.QtWidgets import (
     QFrame, QHeaderView, QAbstractItemView, QCheckBox,
     QStackedWidget, QInputDialog, QSpacerItem, QSizePolicy,
     QTabWidget, QListWidget, QListWidgetItem, QCompleter,
-    QProgressBar, QSpinBox
+    QProgressBar, QSpinBox, QFileDialog, QSplashScreen
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
-from PyQt6.QtGui import QFont, QColor, QTextCursor, QPalette, QAction
+from PyQt6.QtGui import QFont, QColor, QTextCursor, QPalette, QAction, QPixmap
 
 from transport import TelnetTransport
 from bbs_session import BBSSession, BBSMailSummary
@@ -117,6 +117,9 @@ class SessionWorker(QThread):
     sig_progress      = pyqtSignal(str, int, int, str)  # op, current, total, detail
     sig_bulletin_check = pyqtSignal(object)   # {category: [BBSMessage]} — show dialog
     sig_bulletin_done  = pyqtSignal(int)       # count of bulletins downloaded
+    sig_yapp_progress  = pyqtSignal(int, int, str)  # bytes_done, total, filename
+    sig_yapp_done      = pyqtSignal(str, str)        # save_path, display_name
+    sig_yapp_error     = pyqtSignal(str)
 
     def __init__(self, config, bbs_entry, db):
         super().__init__()
@@ -161,6 +164,10 @@ class SessionWorker(QThread):
         self._task = ("check_bulletins", subscriptions)
         if not self.isRunning(): self.start()
 
+    def do_yapp_download(self, filename: str, save_dir: str):
+        self._task = ("yapp_download", filename, save_dir)
+        if not self.isRunning(): self.start()
+
     def do_download_bulletins(self, messages_by_cat: dict):
         """messages_by_cat = {category: [BBSMessage, ...]}"""
         self._task = ("download_bulletins", messages_by_cat)
@@ -180,6 +187,7 @@ class SessionWorker(QThread):
             elif t[0] == "send":          self._run_send(*t[1:])
             elif t[0] == "check_bulletins":    self._run_check_bulletins(t[1])
             elif t[0] == "download_bulletins": self._run_download_bulletins(t[1])
+            elif t[0] == "yapp_download":      self._run_yapp_download(t[1], t[2])
             # Drain any queued send tasks
             import queue as _queue
             while True:
@@ -509,6 +517,27 @@ class SessionWorker(QThread):
             self.session.transport.set_terminal_mode(True)
         self.sig_progress.emit("done", 0, 0, "")
         self.sig_bulletin_done.emit(count)
+
+    def _run_yapp_download(self, filename: str, save_dir: str):
+        """
+        Download a file from the BBS using YAPP protocol.
+        Sends 'yapp <filename>', receives the binary transfer, saves to save_dir.
+        Emits sig_yapp_progress during transfer, sig_yapp_done on success,
+        or sig_yapp_error on failure.
+        """
+        if not self.session:
+            self.sig_yapp_error.emit("Not connected to BBS.")
+            return
+        try:
+            def _progress(done: int, total: int):
+                self.sig_yapp_progress.emit(done, total, filename)
+
+            save_path, _nbytes = self.session.download_file(
+                filename, save_dir, progress_cb=_progress)
+            import os as _os
+            self.sig_yapp_done.emit(save_path, _os.path.basename(save_path))
+        except Exception as e:
+            self.sig_yapp_error.emit(str(e))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -898,6 +927,8 @@ class TerminalWidget(QWidget):
     """
     # Signal to send a command — will be connected to worker in Phase 2
     sig_send_cmd = pyqtSignal(str)
+    # Signal emitted when user clicks the Get File button
+    sig_get_file = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -908,11 +939,19 @@ class TerminalWidget(QWidget):
         hdr = QHBoxLayout()
         hdr_label = QLabel("📟  Terminal — Raw BBS Session")
         hdr_label.setStyleSheet("font-weight:bold; font-size:13px;")
+        self.get_file_btn = QPushButton("📁 File Download - YAPP")
+        self.get_file_btn.setFixedWidth(190)
+        self.get_file_btn.setToolTip(
+            "Download a file from the BBS using YAPP.\n"
+            "Type 'files' first to see what's available.")
+        self.get_file_btn.setEnabled(False)   # enabled on connect
+        self.get_file_btn.clicked.connect(self.sig_get_file.emit)
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.setFixedWidth(60)
         self.clear_btn.clicked.connect(self._clear)
         hdr.addWidget(hdr_label)
         hdr.addStretch()
+        hdr.addWidget(self.get_file_btn)
         hdr.addWidget(self.clear_btn)
         layout.addLayout(hdr)
 
@@ -952,22 +991,33 @@ class TerminalWidget(QWidget):
         ql = QHBoxLayout()
         ql.addWidget(QLabel("Quick:"))
         for label, cmd in [
-            ("L",     "L"),
-            ("LM",    "LM"),
-            ("LL 20", "LL 20"),
-            ("RM",    "RM"),
-            ("KM",    "KM"),
-            ("I",     "I"),
-            ("?",     "?"),
-            ("B",     "B"),
+            ("L",      "L"),
+            ("LM",     "LM"),
+            ("LL 20",  "LL 20"),
+            ("RM",     "RM"),
+            ("KM",     "KM"),
+            ("I",      "I"),
+            ("?",      "?"),
+            ("B",      "B"),
+            ("Files",  "files"),
+            ("Read",   "read "),
         ]:
             b = QPushButton(label)
             b.setFixedHeight(26)
             b.setFixedWidth(54)
-            b.clicked.connect(lambda _, c=cmd: self._quick(c))
+            if cmd.endswith(" "):
+                # Commands that need a filename: put them in the input box
+                # so the user can complete the name before sending
+                b.clicked.connect(lambda _, c=cmd: self._prefill(c))
+            else:
+                b.clicked.connect(lambda _, c=cmd: self._quick(c))
             ql.addWidget(b)
         ql.addStretch()
         layout.addLayout(ql)
+
+    def set_connected(self, connected: bool):
+        """Enable or disable the Get File button based on connection state."""
+        self.get_file_btn.setEnabled(connected)
 
     def append(self, text: str, color: str = "#00ff00"):
         self.output.moveCursor(QTextCursor.MoveOperation.End)
@@ -994,6 +1044,11 @@ class TerminalWidget(QWidget):
         self.input_line.setText(cmd)
         self._send()
 
+    def _prefill(self, cmd: str):
+        """Put cmd in the input box and focus it — user adds filename then sends."""
+        self.input_line.setText(cmd)
+        self.input_line.setFocus()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Debug Widget  — verbose monitoring output (PTT, BITRATE, SYS, etc.)
@@ -1013,11 +1068,15 @@ class DebugWidget(QWidget):
         hdr = QHBoxLayout()
         hdr_label = QLabel("🔬  Debug — Verbose Session Monitor")
         hdr_label.setStyleSheet("font-weight:bold; font-size:13px;")
+        self.save_btn = QPushButton("Save Log…")
+        self.save_btn.setFixedWidth(90)
+        self.save_btn.clicked.connect(self._save)
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.setFixedWidth(60)
         self.clear_btn.clicked.connect(self._clear)
         hdr.addWidget(hdr_label)
         hdr.addStretch()
+        hdr.addWidget(self.save_btn)
         hdr.addWidget(self.clear_btn)
         layout.addLayout(hdr)
 
@@ -1042,6 +1101,20 @@ class DebugWidget(QWidget):
 
     def _clear(self):
         self.output.clear()
+
+    def _save(self):
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        default = os.path.join(
+            os.path.expanduser("~"), f"qtc-debug-{ts}.log")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Debug Log", default, "Log files (*.log *.txt);;All files (*)")
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.output.toPlainText())
+        except OSError as e:
+            QMessageBox.warning(self, "Save Log", f"Could not write log:\n{e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2654,6 +2727,7 @@ class MainWindow(QMainWindow):
         # Page 1 — Terminal view (clean readable text only)
         self.terminal = TerminalWidget()
         self.terminal.sig_send_cmd.connect(self._on_terminal_cmd)
+        self.terminal.sig_get_file.connect(self._on_get_file_clicked)
         self.stack.addWidget(self.terminal)    # index 1
 
         # Page 2 — Debug view (all verbose output)
@@ -2879,6 +2953,9 @@ class MainWindow(QMainWindow):
         self.worker.sig_progress.connect(self._on_progress)
         self.worker.sig_bulletin_check.connect(self._on_bulletin_check)
         self.worker.sig_bulletin_done.connect(self._on_bulletin_done)
+        self.worker.sig_yapp_progress.connect(self._on_yapp_progress)
+        self.worker.sig_yapp_done.connect(self._on_yapp_done)
+        self.worker.sig_yapp_error.connect(self._on_yapp_error)
 
         # Release the pre-session VaraControl socket so VaraTransport
         # can open its own connection to port 8300.
@@ -2957,6 +3034,7 @@ class MainWindow(QMainWindow):
             f"Connected  ·  {entry['callsign']}  ({detail})",
             connected=True)
         self.btn_refresh.setEnabled(True)
+        self.terminal.set_connected(True)
 
     def _check_outbox_for_terminal(self):
         """In Terminal/Debug view with no mail check running, still notify
@@ -3170,6 +3248,7 @@ class MainWindow(QMainWindow):
         self._set_status("Disconnected", connected=False)
         self.terminal.append("\n=== Disconnected ===\n", "#ff8844")
         self.debug_view.append("\n=== Disconnected ===\n", "#ff8844")
+        self.terminal.set_connected(False)
         self._rx_buf = ""
         self._pending_summary = None
         self._pending_outbox  = False
@@ -3185,6 +3264,117 @@ class MainWindow(QMainWindow):
         self._last_disconnect_time = __import__("time").time()
         # Reclaim the VaraControl socket for pre-session BW commands
         self._vara_ctrl.open()
+
+    # ── YAPP file download ────────────────────────────────────────
+
+    @property
+    def _downloads_dir(self) -> str:
+        """Return (and create) the QtC downloads directory."""
+        d = os.path.join(_APP_DIR, "downloads")
+        os.makedirs(d, exist_ok=True)
+        return d
+
+    def _on_get_file_clicked(self):
+        """
+        Show the YAPP download dialog.
+        User types 'files' in the terminal first to see what's available,
+        then clicks Get File and enters the filename.
+        """
+        if not self.worker or not self.worker.session:
+            QMessageBox.warning(self, "Not Connected",
+                "Connect to a BBS first, then type 'files' to see available files.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Get File via YAPP")
+        dlg.setMinimumWidth(420)
+        layout = QVBoxLayout(dlg)
+
+        form = QFormLayout()
+
+        filename_edit = QLineEdit()
+        filename_edit.setPlaceholderText("e.g. testfile1.txt")
+        filename_edit.setToolTip(
+            "Enter the filename exactly as shown by the 'files' command.\n"
+            "Filenames with spaces are not supported by LinBPQ YAPP.")
+        form.addRow("Filename:", filename_edit)
+
+        savedir_row = QHBoxLayout()
+        savedir_edit = QLineEdit(self._downloads_dir)
+        savedir_edit.setToolTip("Local directory where the file will be saved.")
+        browse_btn = QPushButton("Browse…")
+        browse_btn.setFixedWidth(72)
+        savedir_row.addWidget(savedir_edit)
+        savedir_row.addWidget(browse_btn)
+        form.addRow("Save to:", savedir_row)
+
+        layout.addLayout(form)
+
+        note = QLabel(
+            "<i>Note: filenames with spaces cannot be downloaded via YAPP on LinBPQ.</i>")
+        note.setStyleSheet("color: #888; font-size: 11px;")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addWidget(btns)
+
+        def _browse():
+            from PyQt6.QtWidgets import QFileDialog
+            d = QFileDialog.getExistingDirectory(
+                dlg, "Choose Download Folder", savedir_edit.text())
+            if d:
+                savedir_edit.setText(d)
+
+        browse_btn.clicked.connect(_browse)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        filename = filename_edit.text().strip()
+        save_dir = savedir_edit.text().strip() or self._downloads_dir
+
+        if not filename:
+            QMessageBox.warning(self, "No Filename", "Enter a filename to download.")
+            return
+
+        if " " in filename:
+            QMessageBox.warning(
+                self, "Filename Contains Spaces",
+                "LinBPQ YAPP does not support filenames with spaces.\n"
+                "The BBS will report 'File not found'.\n\n"
+                "Please rename the file on the BBS or use 'read <filename>' "
+                "to display it as plain text.")
+            return
+
+        self.terminal.append(
+            f"\n[YAPP] Requesting '{filename}'…\n", "#00ccff")
+        self.worker.do_yapp_download(filename, save_dir)
+
+    def _on_yapp_progress(self, done: int, total: int, filename: str):
+        """Update terminal with YAPP transfer progress."""
+        if total > 0:
+            pct = int(done / total * 100)
+            self.terminal.append(
+                f"[YAPP] {done}/{total} bytes  ({pct}%)\n", "#00ccff")
+        else:
+            self.terminal.append(
+                f"[YAPP] {done} bytes received…\n", "#00ccff")
+
+    def _on_yapp_done(self, save_path: str, display_name: str):
+        """Show completion notice in terminal."""
+        self.terminal.append(
+            f"[YAPP] ✓ Saved: {save_path}\n", "#00ff88")
+        self._set_status(f"File saved: {display_name}", connected=True)
+
+    def _on_yapp_error(self, msg: str):
+        """Show YAPP error in terminal."""
+        self.terminal.append(f"[YAPP] Error: {msg}\n", "#ff4444")
+        self._set_status("YAPP transfer failed", connected=True)
 
     def _on_error(self, msg: str):
         self.btn_connect.setEnabled(False)   # briefly disabled while VARA recovers
@@ -3889,6 +4079,16 @@ def _apply_dark_palette(app):
 
 
 def main():
+    # Dismiss PyInstaller's bootloader splash (no-op when running from
+    # source — pyi_splash only exists inside a frozen exe built with the
+    # Splash() block in QtC.spec). Closing it now lets our in-Python
+    # QSplashScreen take over without a visible flash.
+    try:
+        import pyi_splash   # type: ignore
+        pyi_splash.close()
+    except ImportError:
+        pass
+
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.wayland*=false")
     app = QApplication(sys.argv)
     app.setApplicationName("QtC")
@@ -3902,18 +4102,46 @@ def main():
     except Exception:
         pass   # if config can't be read yet, default light mode is fine
 
-    # Set application icon — works both as a script and as a PyInstaller exe
+    # Resolve resource paths — works both as a script and as a frozen exe
     if getattr(sys, 'frozen', False):
         _base = os.path.dirname(sys.executable)
     else:
         _base = os.path.dirname(os.path.abspath(__file__))
+
+    # Set application icon
     _icon_path = os.path.join(_base, "qtc_icon.svg")
     if os.path.exists(_icon_path):
         from PyQt6.QtGui import QIcon
         app.setWindowIcon(QIcon(_icon_path))
 
+    # Splash screen — shown while MainWindow constructs. The PNG is
+    # generated by make_splash.py at install time. We don't gate this
+    # behind sys.platform since a quick splash on Linux source-runs is
+    # nice polish; if the file's missing we just skip silently.
+    SPLASH_MIN_SECONDS = 3.0   # tune to taste; minimum visible time
+    splash = None
+    splash_shown_at = None
+    _splash_path = os.path.join(_base, "qtc_splash.png")
+    if os.path.exists(_splash_path):
+        pm = QPixmap(_splash_path)
+        if not pm.isNull():
+            splash = QSplashScreen(pm, Qt.WindowType.WindowStaysOnTopHint)
+            splash.show()
+            app.processEvents()
+            splash_shown_at = time.monotonic()
+
     win = MainWindow()
     win.show()
+    if splash is not None:
+        # Hold splash for at least SPLASH_MIN_SECONDS so it doesn't flash
+        # by on fast machines. processEvents() keeps Qt repainting while
+        # we wait — without it the splash freezes mid-paint.
+        if splash_shown_at is not None:
+            deadline = splash_shown_at + SPLASH_MIN_SECONDS
+            while time.monotonic() < deadline:
+                app.processEvents()
+                time.sleep(0.03)
+        splash.finish(win)
 
     # First-run check — if no real callsign set, open settings immediately
     callsign = win.config.get("user", {}).get("callsign", "").strip().upper()
