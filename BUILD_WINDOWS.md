@@ -1,177 +1,233 @@
 # BUILD_WINDOWS.md — Building the QtC Windows exe
 <!-- Copyright (C) 2025-2026 Bill Johnson, KC9MTP -->
 
-This document covers building `QtC.exe` on your Windows machine using PyInstaller.
-Run these steps whenever you cut a new Windows release.
+Builds `QtC.exe` on Windows using PyInstaller.
+
+**Throughout this doc, "build folder" means exactly `C:\build\QtC\`** — never
+`C:\build\`. Every command below shows the cwd you must be in before running it.
 
 ---
 
 ## Prerequisites (one-time setup)
 
-1. **Python 3.10+** with PyQt6 and pyserial already installed (you have this).
-
-2. **Install PyInstaller:**
-   ```
-   pip install pyinstaller
-   ```
-
-3. **Pillow** (for icon generation — already used by install.ps1):
-   ```
-   pip install pillow
-   ```
+Open PowerShell and run:
+```
+pip install pyinstaller pillow
+```
+(PyQt6 and pyserial should already be installed.)
 
 ---
 
-## Build Steps
+## Step 1 — Populate the build folder
 
-### 1. Assemble your build folder
-
-Create a clean working folder, e.g. `C:\build\QtC\`, and copy in:
+**Be at:** `C:\` (or anywhere — this step creates the folder)
 
 ```
-main_window.py
-bbs_session.py
-transport.py
-database.py
-ptt.py
-make_splash.py
-QtC.spec
-qtc_icon.svg
-qtc_icon.ico        ← generate this first (see below)
-qtc_splash.png      ← generate this second (see below)
+mkdir C:\build\QtC
+cd C:\build\QtC
 ```
 
-> **Generating qtc_icon.ico** — run this once from your build folder:
-> ```
-> python -c "
-> from PIL import Image, ImageDraw, ImageFont
-> import io
-> def make(size):
->     img = Image.new('RGBA',(size,size),(0,0,0,0))
->     d = ImageDraw.Draw(img)
->     m = max(1,int(size*0.03))
->     d.ellipse([m,m,size-m-1,size-m-1],fill=(26,42,26,255),outline=(58,90,58,255),width=max(1,size//64))
->     cx,cy=int(size*0.67),int(size*0.50)
->     g,gm,gd=(0,255,136,255),(0,255,136,165),(0,255,136,89)
->     for r,col,w in [(int(size*0.12),g,max(2,size//20)),(int(size*0.20),gm,max(1,size//28)),(int(size*0.29),gd,max(1,size//40))]:
->         d.arc([cx-r,cy-r,cx+r,cy+r],start=-60,end=60,fill=col,width=w)
->     fs=max(6,int(size*0.28))
->     try: font=ImageFont.truetype('arialbd.ttf',fs)
->     except:
->         try: font=ImageFont.truetype('arial.ttf',fs)
->         except: font=ImageFont.load_default()
->     bb=d.textbbox((0,0),'QtC',font=font)
->     d.text((int(size*0.10),(size-(bb[3]-bb[1]))//2-bb[1]),'QtC',fill=g,font=font)
->     return img
-> imgs=[make(s) for s in [256,128,64,48,32,16]]
-> import io; buf=io.BytesIO()
-> imgs[0].save(buf,format='ICO',append_images=imgs[1:])
-> open('qtc_icon.ico','wb').write(buf.getvalue())
-> print('qtc_icon.ico written OK')
-> "
-> ```
+**Copy these files into `C:\build\QtC\`:**
 
-> **Generating qtc_splash.png** — run from your build folder so the splash
-> picks up the current `APP_VERSION` from `main_window.py`:
-> ```
-> python make_splash.py
-> ```
-> Output: `qtc_splash.png` (600×400). Used by both PyInstaller's bootloader
-> splash (configured in `QtC.spec`) and the in-Python `QSplashScreen` shown
-> while `MainWindow` constructs.
+| File | Source |
+|---|---|
+| `main_window.py`  | from repo |
+| `bbs_session.py`  | from repo |
+| `transport.py`    | from repo |
+| `database.py`     | from repo |
+| `ptt.py`          | from repo |
+| `make_splash.py`  | from repo |
+| `QtC.spec`        | from repo (windows branch) |
+| `qtc_icon.svg`    | from repo |
+| `qtc_icon.ico`    | from repo (or generate — see Appendix A) |
 
-### 2. Run PyInstaller
+That's **6 .py files + spec + 2 icons = 9 files**. Do NOT skip `make_splash.py`.
 
-From your build folder:
+---
+
+## Step 2 — Generate the splash PNG
+
+**Be at:** `C:\build\QtC\`
+
+```
+python make_splash.py
+```
+
+**Result:** `C:\build\QtC\qtc_splash.png` is created.
+This pulls the current `APP_VERSION` out of `main_window.py`, so re-run it
+every time you change versions.
+
+After this step, your build folder contains **10 files**.
+
+---
+
+## Step 3 — Run PyInstaller
+
+**Be at:** `C:\build\QtC\`
 
 ```
 pyinstaller QtC.spec
 ```
 
-PyInstaller creates:
+**Result:** PyInstaller writes two new subfolders:
 ```
-build\     ← intermediate files, ignore
-dist\
-  QtC\     ← this is your distributable folder
-    QtC.exe
-    ... (supporting DLLs and data)
+C:\build\QtC\build\          ← intermediate junk, ignore
+C:\build\QtC\dist\QtC\       ← the distributable folder
+C:\build\QtC\dist\QtC\QtC.exe
 ```
 
-### 3. Test the exe
+If PyInstaller errors with "Unable to find QtC.spec", you are NOT in
+`C:\build\QtC\`. Run `cd C:\build\QtC` and retry.
 
-**Before zipping**, run `dist\QtC\QtC.exe` directly and verify:
+---
 
+## Step 4 — Test the exe
+
+**Be at:** `C:\build\QtC\`
+
+```
+dist\QtC\QtC.exe
+```
+
+Verify:
 - [ ] App launches (no console window)
 - [ ] Icon appears in title bar and taskbar
+- [ ] Splash shows briefly while loading
 - [ ] Settings dialog opens — enter your callsign
 - [ ] BBS list works — add/edit/remove an entry
-- [ ] PTT tab shows serial ports (COM ports listed)
-- [ ] Telnet connect works (if you have a local node)
-- [ ] VARA connect works (if VARA HF is running)
-- [ ] Config persists after closing and reopening (`%APPDATA%\qtc\config.json`)
-- [ ] SmartScreen popup appears — click "More info" → "Run anyway" to confirm behavior
+- [ ] PTT tab shows COM ports
+- [ ] Telnet connect works (if local node available)
+- [ ] VARA connect works (if VARA HF running)
+- [ ] Config persists at `%APPDATA%\qtc\config.json`
+- [ ] SmartScreen popup — click "More info" → "Run anyway"
 
-### 4. Package the release
+---
+
+## Step 5 — Zip the distributable
+
+**Be at:** `C:\build\QtC\dist\`
 
 ```
-cd dist
-powershell Compress-Archive -Path QtC -DestinationPath QtC-0.10.9-beta-windows.zip
+cd C:\build\QtC\dist
+powershell Compress-Archive -Path QtC -DestinationPath QtC-0.11.0-beta-windows.zip
 ```
 
-This produces `dist\QtC-0.10.9-beta-windows.zip`.
+**Result:** `C:\build\QtC\dist\QtC-0.11.0-beta-windows.zip`
 
-### 5. Upload to GitHub Releases
+> The `-Path QtC` argument refers to the **folder** `C:\build\QtC\dist\QtC\`,
+> not the exe. The zip will contain a top-level `QtC\` folder with the exe
+> and all bundled files inside.
 
-Upload `QtC-0.10.9-beta-windows.zip` to the same GitHub Release as the Linux tarball at:
+---
+
+## Step 6 — Upload to GitHub Releases
+
+Upload `C:\build\QtC\dist\QtC-0.11.0-beta-windows.zip` as a **second asset**
+on the existing Linux release at:
 `https://github.com/Bill-Johnson/QtC/releases`
+
+Do NOT create a separate Windows-only release.
 
 ---
 
 ## Troubleshooting
 
+**"Unable to find QtC.spec"**
+You are not in `C:\build\QtC\`. Run `cd C:\build\QtC` and retry Step 3.
+
+**"Cannot find qtc_splash.png" or "qtc_icon.svg"**
+You skipped Step 2 or didn't copy the icon in Step 1. Confirm with
+`dir C:\build\QtC\` — you should see all 10 files before running pyinstaller.
+
+**App icon or splash missing at runtime (exe runs but plain window)**
+Data files landed inside `dist\QtC\_internal\` instead of next to the exe.
+This is a PyInstaller 6 layout issue — tell Claude and we'll patch the spec
+or the runtime `sys._MEIPASS` lookup.
+
 **App crashes immediately on launch**
-Run from a command prompt to see the traceback:
+Open a console and run the exe so you can see the traceback:
 ```
-dist\QtC\QtC.exe
+cd C:\build\QtC\dist\QtC
+QtC.exe
 ```
-(without `--noconsole` it will print to the terminal even though it's a windowed app)
 
 **"Failed to execute script" error**
-Usually a missing hidden import. Check the traceback, add the module to
-`hiddenimports` in `QtC.spec`, and rebuild.
+Missing hidden import. Add the module to `hiddenimports` in `QtC.spec`,
+delete `C:\build\QtC\dist\` and `C:\build\QtC\build\`, rebuild.
 
-**PyQt6 platform plugin error: "Could not find or load the Qt platform plugin windows"**
-This is rare with PyInstaller 6+. If it happens:
+**PyQt6 platform plugin error**
 ```
 pip install pyinstaller --upgrade
 ```
 Then rebuild.
 
-**Serial ports not listed in PTT settings**
-Add to `hiddenimports` in QtC.spec if missing:
-```
-'serial.tools.list_ports_windows',
-```
-Already included by default.
-
 **Antivirus flags the exe**
-Expected for unsigned executables. Add an exclusion in Windows Security or
-submit the file for analysis to Microsoft at:
-https://www.microsoft.com/en-us/wdsi/filesubmission
+Expected for unsigned executables. Add a Windows Security exclusion or
+submit to Microsoft at https://www.microsoft.com/en-us/wdsi/filesubmission
+
+---
+
+## Starting over with a clean build
+
+If folders get out of whack, nuke and restart:
+
+**Be at:** `C:\`
+```
+rmdir /s /q C:\build\QtC
+mkdir C:\build\QtC
+cd C:\build\QtC
+```
+Then re-copy the 9 source files from the USB stick / repo and go back to Step 2.
 
 ---
 
 ## Branch Notes
 
-This file lives on the `windows` branch only.
-`QtC.spec` lives on the `windows` branch only.
+`BUILD_WINDOWS.md` and `QtC.spec` live on the `windows` branch only.
 All `.py` source files are identical to `main`.
 To update after a new `main` release:
 ```
 git checkout windows
 git merge main
 ```
-Then rebuild.
+Then rebuild from Step 2 (regenerate splash for the new version).
+
+---
+
+## Appendix A — Regenerating qtc_icon.ico (one-time)
+
+The repo already contains `qtc_icon.ico`. Only do this if it's missing.
+
+**Be at:** `C:\build\QtC\`
+
+```
+python -c "
+from PIL import Image, ImageDraw, ImageFont
+import io
+def make(size):
+    img = Image.new('RGBA',(size,size),(0,0,0,0))
+    d = ImageDraw.Draw(img)
+    m = max(1,int(size*0.03))
+    d.ellipse([m,m,size-m-1,size-m-1],fill=(26,42,26,255),outline=(58,90,58,255),width=max(1,size//64))
+    cx,cy=int(size*0.67),int(size*0.50)
+    g,gm,gd=(0,255,136,255),(0,255,136,165),(0,255,136,89)
+    for r,col,w in [(int(size*0.12),g,max(2,size//20)),(int(size*0.20),gm,max(1,size//28)),(int(size*0.29),gd,max(1,size//40))]:
+        d.arc([cx-r,cy-r,cx+r,cy+r],start=-60,end=60,fill=col,width=w)
+    fs=max(6,int(size*0.28))
+    try: font=ImageFont.truetype('arialbd.ttf',fs)
+    except:
+        try: font=ImageFont.truetype('arial.ttf',fs)
+        except: font=ImageFont.load_default()
+    bb=d.textbbox((0,0),'QtC',font=font)
+    d.text((int(size*0.10),(size-(bb[3]-bb[1]))//2-bb[1]),'QtC',fill=g,font=font)
+    return img
+imgs=[make(s) for s in [256,128,64,48,32,16]]
+buf=io.BytesIO()
+imgs[0].save(buf,format='ICO',append_images=imgs[1:])
+open('qtc_icon.ico','wb').write(buf.getvalue())
+print('qtc_icon.ico written OK')
+"
+```
 
 ---
 
