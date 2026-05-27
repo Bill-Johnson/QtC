@@ -1,4 +1,4 @@
-# QtC v0.12.0-beta — ptt.py  (built 2026-05-07)
+# QtC v0.13.2-beta — ptt.py  (built 2026-05-24)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -117,8 +117,14 @@ class PTTController:
         self._ser  = None
         self._lock = threading.Lock()
         self._log  = None          # optional callable(direction, text)
+        self.last_error = ""       # populated by open() on failure; "" on success
 
     # ── Lifecycle ─────────────────────────────────────────────────
+
+    @property
+    def is_open(self) -> bool:
+        """True iff the serial port is currently open."""
+        return self._ser is not None and getattr(self._ser, "is_open", False)
 
     def open(self):
         """Open the serial port.  No-op if mode is 'none' or port is empty."""
@@ -134,16 +140,23 @@ class PTTController:
 
         with self._lock:
             try:
+                # Disable hardware/software flow control so pyserial doesn't
+                # auto-manage RTS/DTR for us — we drive those lines for PTT.
                 self._ser = serial.Serial(
                     port     = self.port,
                     baudrate = 9600,       # baudrate irrelevant for RTS/DTR
                     timeout  = 0,
+                    rtscts   = False,
+                    dsrdtr   = False,
+                    xonxoff  = False,
                 )
                 # Start in RX (lines low)
                 self._set_lines(False)
+                self.last_error = ""
                 self._emit("PTT", f"PTT port open: {self.port}  mode={self.mode}")
             except Exception as e:
                 self._ser = None
+                self.last_error = str(e)
                 self._emit("PTT", f"Cannot open PTT port {self.port}: {e}")
 
     def close(self):

@@ -1,4 +1,4 @@
-# QtC v0.12.0-beta — transport.py  (built 2026-05-07)
+# QtC v0.13.2-beta — transport.py  (built 2026-05-24)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -42,58 +42,60 @@ class TelnetTransport:
         self.sock    = None
         self.connected = False
         self._buf  = b""
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()      # protects self._buf
+        # _terminal_mode controls whether the reader emits [RX] lines.
+        # Reader thread itself is always running while the socket is open
+        # (single-reader pattern — see _reader() docstring).
         self._terminal_mode   = False
-        self._stop_monitor    = threading.Event()
-        self._monitor_thread  = None
+        self._stop_reader     = threading.Event()
+        self._reader_thread   = None
         self._log = None   # set by SessionWorker to emit [RX] log lines
 
     def set_terminal_mode(self, enabled: bool):
-        """Enable/disable background streaming of BBS responses to terminal."""
+        """Toggle [RX] line streaming. Reader thread runs either way."""
         self._terminal_mode = enabled
-        if enabled:
-            self.flush_input()
-            self._stop_monitor.clear()
-            if self._monitor_thread is None or not self._monitor_thread.is_alive():
-                self._monitor_thread = threading.Thread(
-                    target=self._terminal_monitor, daemon=True,
-                    name="telnet-terminal-monitor")
-                self._monitor_thread.start()
-        else:
-            self._stop_monitor.set()
-            if self._monitor_thread:
-                self._monitor_thread.join(timeout=2.0)
-                self._monitor_thread = None
 
-    def _terminal_monitor(self):
-        """Background thread — reads Telnet socket and emits [RX] log lines."""
-        import time as _time
+    def _reader(self):
+        """
+        Single-reader thread — the ONLY caller of recv() on self.sock.
+
+        Buffers every incoming byte into self._buf under self._lock so
+        read_until() / read_raw_bytes() can consume it without ever
+        touching the socket directly. Eliminates the race where a
+        background streamer and a foreground _expect() both call recv()
+        on the same socket and end up with fragmented or duplicated lines.
+
+        When _terminal_mode is True, also emits complete lines as [RX]
+        log entries. Lines are flushed on real terminators only —
+        \\r, \\n, >, :, ? — never on socket timeout, so a BBS line split
+        across two recv() calls is reassembled, not printed in pieces.
+        """
         line_buf = ""
-        while not self._stop_monitor.is_set():
-            # Wait for connection
+        while not self._stop_reader.is_set():
             if not self.connected or self.sock is None:
-                _time.sleep(0.1)
+                time.sleep(0.1)
                 continue
-            # Drain leftover _buf first (from login _expect calls), then socket
-            if self._buf:
-                chunk = self._buf
-                self._buf = b""
-            else:
-                chunk = self._recv_chunk(timeout=0.5)
+            chunk = self._recv_chunk(timeout=0.5)
             if not chunk:
+                continue
+            with self._lock:
+                self._buf += chunk
+            if not self._terminal_mode:
+                line_buf = ""
                 continue
             text = chunk.decode("utf-8", errors="replace")
             for ch in text:
                 if ch in ("\r", "\n"):
-                    if line_buf.strip():
-                        if self._log:
-                            self._log("RX", line_buf.strip())
+                    if line_buf.strip() and self._log:
+                        self._log("RX", line_buf.strip())
+                    line_buf = ""
+                elif ch in (">", ":", "?"):
+                    line_buf += ch
+                    if line_buf.strip() and self._log:
+                        self._log("RX", line_buf.strip())
                     line_buf = ""
                 else:
                     line_buf += ch
-        # Flush any remaining partial line
-        if line_buf.strip() and self._log:
-            self._log("RX", line_buf.strip())
 
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -104,10 +106,17 @@ class TelnetTransport:
         except (ConnectionRefusedError, OSError) as e:
             raise ConnectionError(
                 f"Could not connect to {self.host}:{self.port} — {e}")
+        # Start the single reader — owns recv() for the rest of the session
+        self._stop_reader.clear()
+        self._reader_thread = threading.Thread(
+            target=self._reader, daemon=True, name="telnet-reader")
+        self._reader_thread.start()
 
     def disconnect(self):
-        if self._monitor_thread and self._monitor_thread.is_alive():
-            self._stop_monitor.set()
+        self._stop_reader.set()
+        if self._reader_thread:
+            self._reader_thread.join(timeout=2.0)
+            self._reader_thread = None
         if self.sock:
             try:
                 self.sock.close()
@@ -159,22 +168,21 @@ class TelnetTransport:
         return cleaned
 
     def flush_input(self):
-        """Discard any unread bytes on the telnet socket."""
-        if not self.sock:
-            return
-        old_to = self.sock.gettimeout()
-        self.sock.settimeout(0.1)
-        try:
-            while True:
-                chunk = self.sock.recv(4096)
-                if not chunk:
-                    break
-        except (socket.timeout, OSError):
-            pass
-        self.sock.settimeout(old_to)
+        """Discard any unread bytes in the buffer.
+
+        Under single-reader, the reader thread is the only one that calls
+        recv() — flush_input just empties the shared buffer. Any bytes
+        still en route from the wire will be picked up by the reader
+        and end up in the next read_until() result.
+        """
+        with self._lock:
+            self._buf = b""
 
     def read_until(self, expected: str, timeout: int = 15) -> str:
-        """Read until expected string appears in the buffer."""
+        """Read from _buf until expected string appears.
+
+        Consumes from _buf only — never calls recv() (the reader does).
+        """
         if isinstance(expected, str):
             expected_b = expected.encode("utf-8")
         else:
@@ -182,35 +190,28 @@ class TelnetTransport:
 
         deadline = time.time() + timeout
         while True:
-            if expected_b.lower() in self._buf.lower():
-                # Return everything up to and including the match
+            with self._lock:
                 idx = self._buf.lower().find(expected_b.lower())
-                result = self._buf[:idx + len(expected_b)]
-                self._buf = self._buf[idx + len(expected_b):]
-                return result.decode("utf-8", errors="replace")
-
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                # Return whatever we have even if no match
-                result = self._buf
-                self._buf = b""
-                return result.decode("utf-8", errors="replace")
-
-            chunk = self._recv_chunk(timeout=min(remaining, 2.0))
-            if chunk:
-                self._buf += chunk
+                if idx >= 0:
+                    end = idx + len(expected_b)
+                    result = self._buf[:end]
+                    self._buf = self._buf[end:]
+                    return result.decode("utf-8", errors="replace")
+                if time.time() >= deadline:
+                    result = self._buf
+                    self._buf = b""
+                    return result.decode("utf-8", errors="replace")
+            time.sleep(0.05)
 
     def read_eager(self) -> str:
-        """Non-blocking read of whatever is immediately available."""
-        chunk = self._recv_chunk(timeout=0.1)
-        if chunk:
-            self._buf += chunk
-        result = self._buf
-        self._buf = b""
-        return result.decode("utf-8", errors="replace")
+        """Return and drain whatever is immediately in the buffer."""
+        with self._lock:
+            result = self._buf
+            self._buf = b""
+            return result.decode("utf-8", errors="replace")
 
     def read_all_pending(self, settle_time: float = 0.5) -> str:
-        """Read all pending data, waiting briefly for more."""
+        """Read all pending data, waiting briefly for the reader to drain new bytes."""
         time.sleep(settle_time)
         result = ""
         chunk = self.read_eager()
@@ -222,21 +223,22 @@ class TelnetTransport:
 
     def read_raw_bytes(self, n: int, timeout: float = 10.0) -> bytes:
         """
-        Read exactly n raw bytes from the transport.
+        Read exactly n raw bytes from _buf (populated by the reader).
         Used by YappReceiver for binary frame reading.
         Returns fewer than n bytes only if timeout expires.
         """
         deadline = time.time() + timeout
-        while len(self._buf) < n:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            chunk = self._recv_chunk(timeout=min(remaining, 1.0))
-            if chunk:
-                self._buf += chunk
-        result = self._buf[:n]
-        self._buf = self._buf[n:]
-        return result
+        while True:
+            with self._lock:
+                if len(self._buf) >= n:
+                    result = self._buf[:n]
+                    self._buf = self._buf[n:]
+                    return result
+                if time.time() >= deadline:
+                    result = self._buf
+                    self._buf = b""
+                    return result
+            time.sleep(0.02)
 
     def send_raw(self, data: bytes):
         """Send raw bytes without appending \\r\\n. Used for YAPP ACK/NAK bytes."""
@@ -280,14 +282,17 @@ class VaraTransport:
     RESP_WRONG        = "WRONG"
 
     def __init__(self, vara_host, cmd_port, data_port, mycall, target_call,
-                 timeout=60, bandwidth="2300"):
+                 timeout=60, bandwidth="2300", vara_type="hf"):
         self.vara_host   = vara_host
         self.cmd_port    = cmd_port
         self.data_port   = data_port
         self.mycall      = mycall.upper()
         self.target_call = target_call.upper()
         self.timeout     = timeout
-        self.bandwidth   = str(bandwidth)   # "500" or "2300"
+        # HF: "500" / "2300" (sent on the wire as BW500 / BW2300).
+        # FM: "NARROW" / "WIDE" (sent as bare keyword — no BW prefix).
+        self.bandwidth   = str(bandwidth)
+        self.vara_type   = (vara_type or "hf").lower()
 
         self._cmd_sock  = None
         self._data_sock = None
@@ -301,12 +306,15 @@ class VaraTransport:
         self._data_buf  = b""           # Unprocessed bytes from data port
 
         self._cmd_lock  = threading.Lock()
+        self._data_lock = threading.Lock()  # protects _data_buf
         self._stop_evt  = threading.Event()
         self._cmd_thread = None
         self._data_thread = None
-        self._terminal_mode = False  # when True, data monitor streams to log
-        self._monitor_idle  = threading.Event()
-        self._monitor_idle.set()   # starts idle
+        # _terminal_mode controls whether the data reader emits [RX] lines
+        # for the terminal view. The reader thread runs the whole time the
+        # data socket is open, regardless of this flag — single-reader
+        # pattern, the only caller of recv() on the data socket.
+        self._terminal_mode = False
 
         # Callback for log messages — set by _make_session same as Telnet
         self._log = None
@@ -420,86 +428,87 @@ class VaraTransport:
                     if self.ptt:
                         self.ptt.rx()
 
-    def _data_monitor(self):
+    def _data_reader(self):
         """
-        Background thread — reads data port continuously in terminal mode
-        and emits complete lines as [RX] log entries. Buffers partial lines
-        across recv() calls so VARA frame splits never cut mid-line.
-        Pauses automatically when terminal_mode is False.
+        Single-reader thread — the ONLY caller of recv() on _data_sock.
+
+        Runs the whole time the socket is open, regardless of terminal_mode.
+        Every byte recv()'d goes into self._data_buf under self._data_lock,
+        which is what read_until() / read_raw_bytes() / read_eager() /
+        flush_input() consume from. Having only one recv() caller is what
+        prevents the ghost/fragment/duplicate issues — there is no race
+        between background streaming and a foreground _expect().
+
+        When _terminal_mode is True, the reader ALSO emits complete lines
+        as [RX] log entries for the terminal view. Lines are flushed only
+        on real terminators (\\r, \\n, >, :, ?) — no timeout-based partial
+        flush, so a line split across two RF frames is reassembled instead
+        of being printed in two pieces.
+
+        Defense in depth (unchanged from prior design):
+          * `recent[]` — suppresses identical lines repeated within a short
+            window. VARA occasionally double-delivers a line on retransmit.
+          * Half-line duplicate check — when a single emit comes through as
+            "Enter Title:Enter Title:" the second half is stripped.
         """
-        line_buf = ""       # accumulates chars until \r or \n
+        line_buf = ""       # accumulates chars until a terminator
         recent = []         # last N lines logged — suppress duplicates in window
+
+        def _emit_line(s: str):
+            """Apply dedup heuristics and emit one [RX] line."""
+            if not s or not self._log:
+                return
+            n = len(s)
+            half = n // 2
+            if half > 4 and n % 2 == 0 and s[:half] == s[half:]:
+                s = s[:half]
+            if s not in recent:
+                self._log("RX", s)
+            recent.append(s)
+            if len(recent) > 6:
+                recent.pop(0)
+
         while not self._stop_evt.is_set():
-            if not self._terminal_mode or not self._data_sock:
-                if line_buf and self._log:
-                    # Flush partial buffer on mode switch
-                    self._log("RX", line_buf.strip())
-                    line_buf = ""
-                # Reset the dedup cache whenever we go idle. The cache is
-                # meant to suppress short-timescale VARA frame duplication
-                # within an active session; it must NOT span pause/resume
-                # boundaries, or e.g. running `files` twice (once before a
-                # YAPP transfer, once after) silently drops the second
-                # listing because every line matches an entry left over
-                # from the first invocation.
-                if recent:
-                    recent.clear()
-                self._monitor_idle.set()   # signal that monitor is idle
+            if self._data_sock is None:
                 time.sleep(0.1)
                 continue
-            self._monitor_idle.clear()  # signal that monitor is active
             try:
                 self._data_sock.settimeout(0.5)
                 chunk = self._data_sock.recv(4096)
-                if chunk:
-                    self._data_buf += chunk
-                    text = chunk.decode("utf-8", errors="replace")
-                    # Feed char-by-char into line buffer
-                    # Emit a complete line on \r or \n
-                    for ch in text:
-                        if ch in ("\r", "\n"):
-                            stripped = line_buf.strip()
-                            if stripped and self._log:
-                                # Deduplicate: if two frames concatenated
-                                # e.g. "Enter Title:Enter Title:", emit only once
-                                n = len(stripped)
-                                half = n // 2
-                                if (half > 4 and n % 2 == 0
-                                        and stripped[:half] == stripped[half:]):
-                                    stripped = stripped[:half]
-                                # Suppress lines seen recently
-                                if stripped not in recent:
-                                    self._log("RX", stripped)
-                                recent.append(stripped)
-                                if len(recent) > 6:
-                                    recent.pop(0)
-                            line_buf = ""
-                        else:
-                            line_buf += ch
-                    # If buffer ends with BBS prompt, flush immediately
-                    if line_buf.endswith(">") and self._log:
-                        stripped = line_buf.strip()
-                        if stripped not in recent:
-                            self._log("RX", stripped)
-                        recent.append(stripped)
-                        if len(recent) > 6:
-                            recent.pop(0)
-                        line_buf = ""
             except socket.timeout:
-                # On timeout, flush any partial line — RF turnarounds can
-                # split a single BBS line across two recv() calls. Emitting
-                # on timeout prevents the partial from concatenating with
-                # the next frame and defeating the duplicate check.
-                if line_buf.strip() and self._log:
-                    stripped = line_buf.strip()
-                    if stripped not in recent:
-                        self._log("RX", stripped)
-                    recent.append(stripped)
-                    if len(recent) > 6:
-                        recent.pop(0)
-                    line_buf = ""
+                chunk = b""
             except OSError:
                 break
+
+            if not chunk:
+                continue
+
+            # Always buffer the bytes — read_until/read_raw_bytes consume from here
+            with self._data_lock:
+                self._data_buf += chunk
+
+            # Stream to [RX] only when the user is watching (Terminal/Debug view)
+            if not self._terminal_mode:
+                # Reset recent[] when we're not streaming so a later switch
+                # to terminal mode starts with a clean dedup window.
+                if recent:
+                    recent.clear()
+                line_buf = ""
+                continue
+
+            text = chunk.decode("utf-8", errors="replace")
+            for ch in text:
+                if ch in ("\r", "\n"):
+                    _emit_line(line_buf.strip())
+                    line_buf = ""
+                elif ch in (">", ":", "?"):
+                    # Prompt terminators — flush immediately so the user
+                    # sees the BBS waiting-for-input cue without delay.
+                    line_buf += ch
+                    _emit_line(line_buf.strip())
+                    line_buf = ""
+                else:
+                    line_buf += ch
 
     # ── Public interface (mirrors TelnetTransport) ────────────────
 
@@ -557,8 +566,12 @@ class VaraTransport:
         except socket.timeout:
             pass
 
-        # 4. Set bandwidth, then our callsign
-        self._send_cmd(f"BW{self.bandwidth}")
+        # 4. Set bandwidth, then our callsign.
+        # HF takes "BW500" / "BW2300"; FM takes a bare "NARROW" / "WIDE".
+        if self.vara_type == "fm":
+            self._send_cmd(self.bandwidth.upper())
+        else:
+            self._send_cmd(f"BW{self.bandwidth}")
         time.sleep(0.1)
         self._send_cmd(f"MYCALL {self.mycall}")
         time.sleep(0.2)
@@ -608,9 +621,11 @@ class VaraTransport:
         self._cmd_thread = threading.Thread(
             target=self._cmd_monitor, daemon=True, name="vara-cmd-monitor")
         self._cmd_thread.start()
-        # Start background data monitor for terminal mode streaming
+        # Start the single data-port reader. This owns recv() on _data_sock
+        # for the entire session — read_until / read_raw_bytes / etc.
+        # consume from _data_buf, never from the socket directly.
         self._data_thread = threading.Thread(
-            target=self._data_monitor, daemon=True, name="vara-data-monitor")
+            target=self._data_reader, daemon=True, name="vara-data-reader")
         self._data_thread.start()
 
     def disconnect(self):
@@ -685,19 +700,18 @@ class VaraTransport:
 
     def set_terminal_mode(self, enabled: bool):
         """
-        Enable/disable background data streaming for terminal view.
-        When True: data port is read continuously and emitted as [RX] log lines.
-        When False: data port is only read via explicit _expect() calls (mail mode).
+        Toggle whether the data reader emits [RX] log lines for terminal view.
 
-        flush_input() is NOT called here — callers (download_file, etc.) manage
-        flushing explicitly so YAPP frame bytes are not discarded mid-transfer.
+        Under the single-reader architecture the reader thread is always
+        running and always populates _data_buf — this flag only controls
+        whether it also streams complete lines to the log. read_until()
+        and friends work the same in either mode.
+
+        flush_input() is NOT called here. Callers (mail check, YAPP, etc.)
+        decide when to flush. See bbs_session.py docstrings for the
+        per-operation ordering rules.
         """
         self._terminal_mode = enabled
-        if not enabled:
-            # Wait up to 1s for monitor to finish its current recv() and go idle
-            self._monitor_idle.wait(timeout=1.0)
-        else:
-            self.flush_input()
 
     def send(self, text):
         """Send text over RF via VARA data port."""
@@ -707,50 +721,32 @@ class VaraTransport:
             text = (text + "\r\n").encode("utf-8", errors="replace")
         self._data_sock.sendall(text)
 
-    def _recv_data_chunk(self, timeout: float = 2.0) -> bytes:
-        """Read a chunk from the VARA data port.
-
-        NOTE: Do NOT set connected=False on empty recv — VARA's data socket
-        goes quiet during PTT turnarounds, which is normal.  Disconnection
-        is signalled by the COMMAND port ("DISCONNECTED"), not by the data
-        socket going empty.  Setting connected=False here caused read_until
-        to exit early mid-LM-list when VARA flipped PTT between RF frames.
-        """
-        if self._data_sock is None:
-            return b""
-        self._data_sock.settimeout(timeout)
-        try:
-            chunk = self._data_sock.recv(4096)
-            return chunk  # b"" (remote closed) is handled by caller
-        except socket.timeout:
-            return b""
-        except OSError:
-            return b""
-
     def flush_input(self):
-        """Discard any unread bytes in the data buffer and socket.
-        Call before sending a new command to avoid stale data bleed."""
-        if self._data_buf:
-            self._log("SYS",
-                f"flush_input: discarding {len(self._data_buf)} stale bytes")
-        self._data_buf = b""
-        # Drain anything sitting on the socket — use 0.5s to catch bytes
-        # that arrive slightly late over RF (PTT turnaround latency)
-        if self._data_sock:
-            old_to = self._data_sock.gettimeout()
-            self._data_sock.settimeout(0.5)
-            try:
-                while True:
-                    chunk = self._data_sock.recv(4096)
-                    if not chunk:
-                        break
-            except (socket.timeout, OSError):
-                pass
-            self._data_sock.settimeout(old_to)
+        """Discard any unread bytes in the data buffer.
+
+        Under single-reader, the background reader is the only thread that
+        recv()'s from the socket. flush_input simply empties the shared
+        buffer — bytes already on the wire will be picked up by the reader
+        and end up in the next caller's read_until() result.
+        """
+        with self._data_lock:
+            if self._data_buf:
+                self._log("SYS",
+                    f"flush_input: discarding {len(self._data_buf)} stale bytes")
+            self._data_buf = b""
+
+    def _buf_find(self, needle: bytes):
+        """Case-insensitive search in _data_buf under the lock."""
+        with self._data_lock:
+            i = self._data_buf.lower().find(needle.lower())
+            if i < 0:
+                return -1
+            return i
 
     def read_until(self, expected: str, timeout: int = 30) -> str:
         """
         Read from VARA data port until expected string appears.
+        Consumes from _data_buf — never calls recv() (the reader thread does).
         Same interface as TelnetTransport.read_until().
         """
         if isinstance(expected, str):
@@ -760,34 +756,29 @@ class VaraTransport:
 
         deadline = time.time() + timeout
         while True:
-            if expected_b.lower() in self._data_buf.lower():
-                idx    = self._data_buf.lower().find(expected_b.lower())
-                result = self._data_buf[:idx + len(expected_b)]
-                self._data_buf = self._data_buf[idx + len(expected_b):]
-                return result.decode("utf-8", errors="replace")
-
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                result = self._data_buf
-                self._data_buf = b""
-                return result.decode("utf-8", errors="replace")
-
-            chunk = self._recv_data_chunk(timeout=min(remaining, 2.0))
-            if chunk:
-                self._data_buf += chunk
-            # chunk == b"" means socket timeout (normal between RF frames) — keep waiting
+            with self._data_lock:
+                idx = self._data_buf.lower().find(expected_b.lower())
+                if idx >= 0:
+                    end = idx + len(expected_b)
+                    result = self._data_buf[:end]
+                    self._data_buf = self._data_buf[end:]
+                    return result.decode("utf-8", errors="replace")
+                if time.time() >= deadline:
+                    result = self._data_buf
+                    self._data_buf = b""
+                    return result.decode("utf-8", errors="replace")
+            # No match yet — give the reader a moment to add more bytes
+            time.sleep(0.05)
 
     def read_eager(self) -> str:
-        """Non-blocking read of whatever is immediately available."""
-        chunk = self._recv_data_chunk(timeout=0.1)
-        if chunk:
-            self._data_buf += chunk
-        result = self._data_buf
-        self._data_buf = b""
-        return result.decode("utf-8", errors="replace")
+        """Return and drain whatever is immediately in the buffer."""
+        with self._data_lock:
+            result = self._data_buf
+            self._data_buf = b""
+            return result.decode("utf-8", errors="replace")
 
     def read_all_pending(self, settle_time: float = 0.5) -> str:
-        """Read all pending data, waiting briefly for more."""
+        """Read all pending data, waiting briefly for the reader to drain new frames."""
         time.sleep(settle_time)
         result = ""
         chunk = self.read_eager()
@@ -799,21 +790,22 @@ class VaraTransport:
 
     def read_raw_bytes(self, n: int, timeout: float = 10.0) -> bytes:
         """
-        Read exactly n raw bytes from the VARA data port.
+        Read exactly n raw bytes from _data_buf (populated by the reader).
         Used by YappReceiver for binary frame reading.
         Returns fewer than n bytes only if timeout expires.
         """
         deadline = time.time() + timeout
-        while len(self._data_buf) < n:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            chunk = self._recv_data_chunk(timeout=min(remaining, 1.0))
-            if chunk:
-                self._data_buf += chunk
-        result = self._data_buf[:n]
-        self._data_buf = self._data_buf[n:]
-        return result
+        while True:
+            with self._data_lock:
+                if len(self._data_buf) >= n:
+                    result = self._data_buf[:n]
+                    self._data_buf = self._data_buf[n:]
+                    return result
+                if time.time() >= deadline:
+                    result = self._data_buf
+                    self._data_buf = b""
+                    return result
+            time.sleep(0.02)
 
     def send_raw(self, data: bytes):
         """Send raw bytes without appending \\r\\n. Used for YAPP ACK/NAK bytes."""
@@ -843,6 +835,16 @@ class VaraControl:
         self._data_sock = None   # data port 8301
         self._lock     = threading.Lock()
         self._log      = None
+        # Pre-session DCD/channel-busy tracking. VARA emits "BUSY ON" /
+        # "BUSY OFF" lines on the cmd port whenever channel activity is
+        # detected. A small reader thread keeps `_busy` current so
+        # Mail-Call can do a polite pre-flight check before transmitting.
+        # Default False = clear; VARA only emits on state change so a
+        # genuinely-quiet channel never sets this True.
+        self._busy = False
+        self._busy_last_update = 0.0
+        self._reader_thread = None
+        self._reader_stop = threading.Event()
 
     def _emit(self, direction: str, text: str):
         if self._log:
@@ -875,10 +877,23 @@ class VaraControl:
                 except OSError:
                     self._data_sock = None
 
-            return self._sock is not None
+        # Spin up the BUSY-state reader if the cmd port opened and the
+        # thread isn't already running. Daemon thread; dies with the app.
+        if self._sock and (self._reader_thread is None
+                           or not self._reader_thread.is_alive()):
+            self._reader_stop.clear()
+            self._reader_thread = threading.Thread(
+                target=self._reader_loop,
+                name="VaraIdleReader",
+                daemon=True,
+            )
+            self._reader_thread.start()
+
+        return self._sock is not None
 
     def close(self):
-        """Close both sockets."""
+        """Close both sockets and stop the busy-reader thread."""
+        self._reader_stop.set()
         with self._lock:
             for sock in (self._sock, self._data_sock):
                 if sock:
@@ -888,6 +903,66 @@ class VaraControl:
                         pass
             self._sock      = None
             self._data_sock = None
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=2.0)
+        self._reader_thread = None
+
+    def is_busy(self) -> bool:
+        """Return VARA's current BUSY state (DCD-equivalent).
+
+        False = clear OR unknown (no traffic since startup). VARA emits
+        BUSY ON / BUSY OFF only on state changes; a genuinely quiet
+        channel never flips this to True. Used by Mail-Call's pre-flight
+        check to avoid transmitting over an active QSO.
+        """
+        return self._busy
+
+    def _reader_loop(self):
+        """
+        Read lines from the cmd port and track BUSY state.
+
+        Stays silent (does not call self._emit) — the verbose [RX-CMD]
+        logging belongs to VaraTransport's monitor thread during an
+        active session. While idle, we just track _busy invisibly.
+        """
+        buf = b""
+        while not self._reader_stop.is_set():
+            sock = self._sock
+            if sock is None:
+                self._reader_stop.wait(1.0)
+                continue
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                self._reader_stop.wait(0.5)
+                continue
+            if not chunk:
+                # Socket closed by VARA — wait briefly and let open() reopen
+                self._reader_stop.wait(1.0)
+                continue
+            buf += chunk
+            while True:
+                # Find the earliest line terminator (\r or \n)
+                idx = -1
+                for ch in (b"\r", b"\n"):
+                    p = buf.find(ch)
+                    if p >= 0 and (idx < 0 or p < idx):
+                        idx = p
+                if idx < 0:
+                    break
+                line = buf[:idx].decode("utf-8", errors="replace").strip()
+                buf = buf[idx + 1:]
+                if not line:
+                    continue
+                upper = line.upper()
+                if upper.startswith("BUSY ON"):
+                    self._busy = True
+                    self._busy_last_update = time.time()
+                elif upper.startswith("BUSY OFF"):
+                    self._busy = False
+                    self._busy_last_update = time.time()
 
     def send(self, cmd: str) -> bool:
         """
@@ -913,8 +988,18 @@ class VaraControl:
         return False
 
     def set_bandwidth(self, bw: str) -> bool:
-        """Send BW500 or BW2300.  bw should be '500' or '2300'."""
-        return self.send(f"BW{bw}")
+        """Push a bandwidth selection to VARA.
+
+        HF takes BW500 / BW2300 (with the BW prefix); FM takes a bare
+        NARROW / WIDE keyword. Caller passes the raw user-facing value
+        — "500", "2300", "NARROW", or "WIDE" — and this picks the wire
+        form by looking at the value itself."""
+        if not bw:
+            return False
+        up = bw.upper().strip()
+        if up in ("NARROW", "WIDE"):
+            return self.send(up)
+        return self.send(f"BW{up}")
 
     def set_mycall(self, callsign: str) -> bool:
         """Send MYCALL <callsign>."""

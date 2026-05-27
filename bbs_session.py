@@ -1,4 +1,4 @@
-# QtC v0.12.0-beta — bbs_session.py  (built 2026-05-07)
+# QtC v0.13.2-beta — bbs_session.py  (built 2026-05-24)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -109,10 +109,85 @@ class YappReceiver:
         """NR (Not_Rdy): [NAK][len][optional reason ASCII] per RFC v1.1."""
         self.transport.send_raw(bytes([_YAPP_NAK, len(reason)]) + reason)
 
-    # Legacy alias — kept so the in-block error path at the data-block
-    # short-read site keeps working unchanged. Sends a zero-reason NR.
-    def _send_nak(self):
-        self._send_nr()
+    def _send_cn(self, reason: bytes = b""):
+        """CN (Cancel): [CAN][len][optional reason ASCII] per RFC v1.1.
+        Sent when the receiver is giving up on the transfer entirely —
+        tells the sender to stop transmitting so its bytes don't leak
+        into the terminal once YAPP exits."""
+        self.transport.send_raw(bytes([_YAPP_CAN, len(reason)]) + reason)
+
+    # ── Block read with stall-watchdog (slow-HF safe) ──────────────────
+    # Memory: project-yapp-short-block-todo. The original fixed 20s timeout
+    # was too short at 61 bps (234 bytes ≈ 30s pure transmit, before ARQ).
+    # Replaced with a watchdog that resets as long as bytes keep arriving.
+
+    BLOCK_STALL_TIMEOUT  = 30.0   # give up if no bytes arrive for this long
+    BLOCK_HARD_DEADLINE  = 300.0  # absolute ceiling per block (5 min)
+
+    def _read_block_with_watchdog(self, n: int) -> bytes:
+        """Read up to n bytes. Reset the deadline whenever bytes arrive;
+        give up only on a true stall (no bytes for BLOCK_STALL_TIMEOUT)
+        or on the hard ceiling. Returns whatever was actually received —
+        caller checks len(result) vs n."""
+        received = bytearray()
+        hard_end = time.time() + self.BLOCK_HARD_DEADLINE
+        last_progress = time.time()
+        while len(received) < n:
+            now = time.time()
+            if now > hard_end:
+                self._log(
+                    f"YAPP: block hard deadline ({self.BLOCK_HARD_DEADLINE}s) "
+                    f"hit at {len(received)}/{n}")
+                break
+            if now - last_progress > self.BLOCK_STALL_TIMEOUT:
+                self._log(
+                    f"YAPP: block stall — no bytes for "
+                    f"{self.BLOCK_STALL_TIMEOUT}s at {len(received)}/{n}")
+                break
+            want  = n - len(received)
+            chunk = self.transport.read_raw_bytes(want, timeout=2.0)
+            if chunk:
+                received.extend(chunk)
+                last_progress = time.time()
+        return bytes(received)
+
+    # ── Abort + wire drain ─────────────────────────────────────────────
+    # Memory: project-yapp-short-block-todo problem #2. Without this, after
+    # an in-flight abort the BBS keeps transmitting the rest of the file
+    # and those bytes leak into the terminal log when set_terminal_mode(True)
+    # re-engages in download_file()'s finally block.
+
+    DRAIN_QUIET_SECS    = 2.0   # consider the wire idle after this long
+    DRAIN_TOTAL_TIMEOUT = 30.0  # cap how long we wait for it to go quiet
+
+    def _abort_and_drain(self, reason: str):
+        """Send CN with a short reason, then drain the wire until quiet.
+        Always called BEFORE raising IOError on a mid-transfer abort —
+        leaves the link in a state where download_file()'s finally block
+        finds the BBS prompt quickly instead of swallowing file bytes."""
+        try:
+            reason_b = reason.encode("ascii", errors="replace")[:200]
+            self._send_cn(reason_b)
+            self._log(f"YAPP: sent CN — {reason}")
+        except Exception as e:
+            self._log(f"YAPP: failed to send CN ({e}) — draining anyway")
+
+        drained = 0
+        quiet_start = None
+        end = time.time() + self.DRAIN_TOTAL_TIMEOUT
+        while time.time() < end:
+            chunk = self.transport.read_raw_bytes(256, timeout=1.0)
+            if chunk:
+                drained += len(chunk)
+                quiet_start = None
+            else:
+                if quiet_start is None:
+                    quiet_start = time.time()
+                elif time.time() - quiet_start >= self.DRAIN_QUIET_SECS:
+                    break
+        self._log(
+            f"YAPP: drained {drained} bytes after abort "
+            f"(quiet={quiet_start is not None})")
 
     def _hex(self, data: bytes, label: str = ""):
         """Log up to 32 bytes as hex for debugging."""
@@ -199,6 +274,7 @@ class YappReceiver:
         while True:
             ft_b = self.transport.read_raw_bytes(1, timeout=self.TIMEOUT)
             if not ft_b:
+                self._abort_and_drain("inter-frame timeout — sender went silent")
                 raise IOError("YAPP: timeout waiting for data block or EOT")
             ft = ft_b[0]
 
@@ -286,12 +362,14 @@ class YappReceiver:
             elif ft == _YAPP_STX:
                 blen_b = self.transport.read_raw_bytes(1, timeout=10)
                 if not blen_b:
+                    self._abort_and_drain("timeout reading block length")
                     raise IOError("YAPP: timeout reading block length")
                 blen = blen_b[0] or 256
 
-                block = self.transport.read_raw_bytes(blen, timeout=20)
+                block = self._read_block_with_watchdog(blen)
                 if len(block) < blen:
-                    self._send_nak()
+                    self._abort_and_drain(
+                        f"short block ({len(block)}/{blen}) — link too slow")
                     raise IOError(
                         f"YAPP: short block (expected {blen}, got {len(block)})")
 
@@ -486,7 +564,11 @@ class BBSSession:
     def _expect(self, prompt: str, timeout: int = None) -> str:
         t = timeout or self.CMD_TIMEOUT
         data = self.transport.read_until(prompt, timeout=t)
-        self._log("RX", data)
+        # Skip [RX] log when the transport reader is already streaming
+        # complete lines to the terminal view — logging the full response
+        # here would duplicate everything the reader just emitted.
+        if not getattr(self.transport, "_terminal_mode", False):
+            self._log("RX", data)
         return data
 
     def _expect_silent(self, prompt: str, timeout: int = None) -> str:
@@ -499,7 +581,8 @@ class BBSSession:
         self._send(cmd)
         time.sleep(settle)
         response = self.transport.read_all_pending(settle_time=settle)
-        self._log("RX", response)
+        if not getattr(self.transport, "_terminal_mode", False):
+            self._log("RX", response)
         return response
 
     # ── public API ────────────────────────────────────────────────
@@ -577,9 +660,11 @@ class BBSSession:
         self._log("SYS", f"BBS prompt detected as: {self.PROMPT_BBS!r}")
         self._log("SYS", "BBS login successful")
 
-        # Handle new user registration if needed
-        if self._handle_registration(bbs_response):
-            bbs_response = self._expect(self.PROMPT_BBS, timeout=30)
+        # Handle new user registration if needed. _handle_registration
+        # returns the final BBS response itself — no need to _expect again
+        # (the inner loop already consumed the trailing prompt).
+        handled, bbs_response = self._handle_registration(bbs_response)
+        if handled:
             self._log("SYS", f"Post-registration BBS response: {bbs_response!r}")
 
         return True
@@ -613,9 +698,10 @@ class BBSSession:
         # Check for new user registration prompts in the banner.
         # LinBPQ asks for Name (and optionally QTH, Zip, Home BBS) before
         # showing the normal "de CALLSIGN>" prompt. We auto-fill from
-        # user_info settings to save RF time.
-        if self._handle_registration(bbs_response):
-            bbs_response = self._expect(self.PROMPT_BBS, timeout=30)
+        # user_info settings to save RF time. _handle_registration returns
+        # the final BBS response — no need to _expect again here.
+        handled, bbs_response = self._handle_registration(bbs_response)
+        if handled:
             self._log("SYS", f"Post-registration BBS response: {bbs_response!r}")
 
         # Detect exact BBS prompt style
@@ -637,6 +723,16 @@ class BBSSession:
                       "enter home", "enter your home bbs"]),
     ]
 
+    # BPQ user-database field commands. Bare value works for the name
+    # prompt; the others must be sent as `<CMD> <value>` because BPQ treats
+    # those field-names as dual-purpose commands (bare = query, with arg = set).
+    REGISTRATION_WIRE_PREFIX = {
+        "name":     "",
+        "qth":      "QTH ",
+        "zip":      "ZIP ",
+        "home_bbs": "HOME ",
+    }
+
     def _registration_field(self, text: str):
         """Return the field name if text contains a registration prompt, else None."""
         t = text.lower()
@@ -645,7 +741,7 @@ class BBSSession:
                 return field
         return None
 
-    def _handle_registration(self, banner: str) -> bool:
+    def _handle_registration(self, banner: str):
         """
         Detect and handle LinBPQ new user registration prompts.
 
@@ -654,8 +750,27 @@ class BBSSession:
         responding to prompts until the normal BBS prompt is received.
         Auto-fills values from user_info (My Station settings).
 
-        Returns True if any registration prompts were handled.
+        Returns (handled, last_response). last_response is the most recent
+        BBS response — either the input banner (if no registration ran) or
+        the response after the final field was submitted (already includes
+        the trailing BBS prompt, so callers do NOT need another _expect).
+
+        Distinguishing real prompts from informational hints:
+        A genuine registration prompt is the LAST thing in the banner —
+        the BBS is waiting for input. It may terminate with ':' (e.g.
+        'Enter your name:') or with '>' (e.g. 'Please enter your Name >'
+        as seen on K2ROG running BPQ 6.0.25.16).
+        Informational hints like 'You may also enter your QTH using qth
+        commands.' are shown to established users who are already at the
+        main BBS prompt — banner ends with 'de XXX>'. We bail early in
+        that case to avoid resubmitting QTH every login.
         """
+        # Only bail when the banner ends with the main BBS prompt 'de XXX>'.
+        # A bare trailing '>' is NOT enough — new-user prompts like
+        # 'Please enter your Name >' also end with '>' and must be handled.
+        if re.search(r'de\s+\S+>\s*$', banner, re.IGNORECASE):
+            return False, banner
+
         handled = False
         current = banner
 
@@ -665,6 +780,8 @@ class BBSSession:
                 break  # no more registration prompts — we're done
 
             value = self.user_info.get(field, "").strip()
+            prefix = self.REGISTRATION_WIRE_PREFIX.get(field, "")
+            wire = f"{prefix}{value}" if value else ""
             if value:
                 self._log("SYS",
                     f"New user registration: auto-sending {field} = {value!r}")
@@ -673,14 +790,14 @@ class BBSSession:
                     f"New user registration: {field} blank in My Station "
                     f"— sending empty response")
 
-            self._send(value)
+            self._send(wire)
             self.new_user = True
             handled = True
 
             # Wait for next prompt or final BBS prompt
             current = self._expect(self.PROMPT_BBS, timeout=15)
 
-        return handled
+        return handled, current
 
     def check_mail(self, new_only: bool = True) -> BBSMailSummary:
         """
@@ -910,8 +1027,8 @@ class BBSSession:
         else:
             self._log("RX", confirmation.strip())
 
-        # Re-enable monitor — duplicate frame suppression handled in transport
-        # via the recent-lines dedup window in _data_monitor
+        # Re-enable streaming — duplicate frame suppression handled in transport
+        # via the recent-lines dedup window in _data_reader
         if hasattr(self.transport, "set_terminal_mode"):
             self.transport.set_terminal_mode(True)
 

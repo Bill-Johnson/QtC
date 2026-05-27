@@ -28,5 +28,14 @@
         "max_message_size_kb": 50,
         "data_dir": "data"
     },
+    "mail_call": {
+        "enabled": false,
+        "time_zone": "local",
+        "schedule_mode": "twice",
+        "every_n_hours": 4,
+        "custom_times": [],
+        "bbs_key": null,
+        "responsibility_accepted_rf_version": 0
+    },
     "visited_bbs": {}
 }
