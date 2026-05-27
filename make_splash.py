@@ -1,4 +1,4 @@
-# QtC v0.12.0-beta — make_splash.py  (built 2026-05-07)
+# QtC v0.13.2-beta — make_splash.py  (built 2026-05-24)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify

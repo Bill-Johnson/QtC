@@ -1,4 +1,4 @@
-# QtC v0.12.0-beta — database.py  (built 2026-05-07)
+# QtC v0.13.2-beta — database.py  (built 2026-05-24)
 # VARA BBS Client — A modern BBS client for LinBPQ/BPQ32 nodes
 # via VARA HF, VARA FM, and Telnet.
 #

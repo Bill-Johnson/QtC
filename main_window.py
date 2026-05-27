@@ -1,4 +1,4 @@
-# QtC v0.12.0-beta — main_window.py  (built 2026-05-07)
+# QtC v0.13.2-beta — main_window.py  (built 2026-05-24)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,13 +13,13 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
-APP_VERSION = "0.12.0-beta"  # keep in sync with header comment
+APP_VERSION = "0.13.2-beta"  # keep in sync with header comment
 """
 QtC — Main Window (PyQt6)
 v0.2 — Quick-connect bar, auto-download, terminal swap button
 """
 import sys, json, os, copy, time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter,
@@ -30,9 +30,10 @@ from PyQt6.QtWidgets import (
     QFrame, QHeaderView, QAbstractItemView, QCheckBox,
     QStackedWidget, QInputDialog, QSpacerItem, QSizePolicy,
     QTabWidget, QListWidget, QListWidgetItem, QCompleter,
-    QProgressBar, QSpinBox, QFileDialog, QSplashScreen
+    QProgressBar, QSpinBox, QFileDialog, QSplashScreen,
+    QRadioButton, QButtonGroup, QGroupBox, QTimeEdit
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QTime, QObject
 from PyQt6.QtGui import QFont, QColor, QTextCursor, QPalette, QAction, QPixmap
 
 from transport import TelnetTransport
@@ -229,6 +230,9 @@ class SessionWorker(QThread):
             target_call   = e.get("callsign", "")
             if not target_call:
                 raise ValueError("No BBS callsign set for VARA connection.")
+            # Pick a sensible default BW per variant in case the entry
+            # lacks a saved value (legacy entries pre-FM-BW support).
+            default_bw = "500" if prefix == "hf" else "NARROW"
             t = VaraTransport(
                 vara_host=vara_host,
                 cmd_port=vara_cmd_port,
@@ -236,7 +240,8 @@ class SessionWorker(QThread):
                 mycall=mycall,
                 target_call=target_call,
                 timeout=90,
-                bandwidth=e.get("bw", "500"),
+                bandwidth=e.get("bw") or default_bw,
+                vara_type=prefix,
             )
             t._log = lambda d, txt: self.sig_log.emit(f"[{d}] {txt.strip()}")
 
@@ -253,6 +258,16 @@ class SessionWorker(QThread):
                 ptt = PTTController(port=ptt_port, mode=ptt_signal)
                 ptt._log = lambda d, txt: self.sig_log.emit(f"[{d}] {txt.strip()}")
                 ptt.open()
+                if not ptt.is_open:
+                    # Don't abort the connect — VOX users and "I'll fix it later"
+                    # users can still operate. But shout about it so the user
+                    # isn't watching the waterfall transmit with a silent radio.
+                    msg = (f"PTT port {ptt_port!r} did not open: "
+                           f"{ptt.last_error or 'unknown error'}. "
+                           f"This port may be open in Vara Terminal or another "
+                           f"app — close it and reconnect.")
+                    self.sig_log.emit(f"[PTT] *** {msg} ***")
+                    self.sig_error.emit(msg)
                 t.ptt = ptt
 
             user_info = {k: self.config["user"].get(k, "")
@@ -554,7 +569,10 @@ class AddressBookDialog(QDialog):
         self.cdb = contacts_db
         self.select_mode = select_mode   # True when opened from Compose
         self.setWindowTitle("Address Book")
-        self.setMinimumSize(560, 480)
+        # Sized to fit a full HA Home BBS address ("KC9MTP.#NWIN.IN.USA.NOAM")
+        # without horizontal scrolling, plus the Edit/Delete action cell.
+        self.setMinimumSize(880, 480)
+        self.resize(960, 560)
         layout = QVBoxLayout(self)
         layout.setSpacing(0)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -584,13 +602,16 @@ class AddressBookDialog(QDialog):
         self.table.setHorizontalHeaderLabels(
             ["Call", "Name", "City / State", "Home BBS", "Send Mode", ""])
         self.table.horizontalHeader().setStretchLastSection(False)
+        # City/State stretches to soak up extra width. Home BBS is sized
+        # to fit a typical HA address ("KC9MTP.#NWIN.IN.USA.NOAM") in
+        # full. Action column fits Edit + Delete buttons side-by-side.
         self.table.horizontalHeader().setSectionResizeMode(
             2, self.table.horizontalHeader().ResizeMode.Stretch)
-        self.table.setColumnWidth(0, 80)
-        self.table.setColumnWidth(1, 110)
-        self.table.setColumnWidth(3, 160)
-        self.table.setColumnWidth(4, 90)
-        self.table.setColumnWidth(5, 110)
+        self.table.setColumnWidth(0, 80)    # Call
+        self.table.setColumnWidth(1, 110)   # Name
+        self.table.setColumnWidth(3, 230)   # Home BBS — full HA address
+        self.table.setColumnWidth(4, 110)   # Send Mode
+        self.table.setColumnWidth(5, 140)   # Actions (Edit / Delete)
         self.table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(
@@ -1089,6 +1110,15 @@ class DebugWidget(QWidget):
         layout.addWidget(self.output)
 
     def append(self, text: str, color: str = "#8888ff"):
+        # Prepend a millisecond-precision timestamp to each call so debug
+        # logs are timing-analyzable (block stalls, BBS round-trips, etc.).
+        # Leading newlines are kept BEFORE the timestamp so visual separators
+        # like "\n=== Connected ===\n" still render with their blank line.
+        stripped = text.lstrip("\n")
+        leading_nl = text[:len(text) - len(stripped)]
+        ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]   # HH:MM:SS.mmm
+        text = f"{leading_nl}[{ts}] {stripped}"
+
         self.output.moveCursor(QTextCursor.MoveOperation.End)
         safe = (text
                 .replace("&", "&amp;")
@@ -1820,8 +1850,12 @@ class SettingsDialog(QDialog):
         self._note_color = "#aaaaaa" if self._dark else "#666666"
 
         self.setWindowTitle("QtC — Settings")
-        self.setMinimumSize(580, 520)
-        self.resize(620, 560)
+        # Sized so the BBS List table fits all 8 columns (Type/Name/
+        # Callsign/Freq/BW/Host/Port/Notes) at their default widths
+        # without horizontal scrolling, and Notes has room to show
+        # comment text — no need for the user to resize on each open.
+        self.setMinimumSize(820, 580)
+        self.resize(900, 720)
 
         layout = QVBoxLayout(self)
 
@@ -1830,6 +1864,7 @@ class SettingsDialog(QDialog):
         tabs.addTab(self._build_bbs_tab(),       "📡  BBS List")
         tabs.addTab(self._build_ptt_tab(),       "🎙️  PTT")
         tabs.addTab(self._build_bulletins_tab(), "📋  Bulletins")
+        tabs.addTab(self._build_mailcall_tab(),  "📬  Mail-Call !!!")
         tabs.addTab(self._build_app_tab(),       "⚙️  App")
         layout.addWidget(tabs)
 
@@ -1865,7 +1900,8 @@ class SettingsDialog(QDialog):
         self.e_name.setPlaceholderText("e.g. Bill  (sent on first BBS registration)")
         self.e_qth.setPlaceholderText("e.g. Valparaiso IN  (optional)")
         self.e_zip.setPlaceholderText("e.g. 46383  (optional)")
-        self.e_home_bbs.setPlaceholderText("e.g. KC9MTP-1  (important for mail routing)")
+        self.e_home_bbs.setPlaceholderText(
+            "e.g. KC9MTP.#NWIN.IN.USA.NOAM  (hierarchical routing address)")
         self.e_telnet_user.setPlaceholderText("e.g. kc9mtp  (lowercase, case-sensitive)")
         self.e_password.setPlaceholderText("Telnet sysop password (blank for radio)")
 
@@ -1899,22 +1935,46 @@ class SettingsDialog(QDialog):
 
     # ── Tab: BBS List ─────────────────────────────────────────────
 
+    # ── BBS List table: column layout ──────────────────────────────
+    # Type-grouped columns. VARA entries fill Freq/BW (Host/Port show em-
+    # dash); Telnet entries fill Host/Port (Freq/BW show em-dash). Makes
+    # the table self-documenting for new VARA users — no confusion about
+    # why a VARA row has an empty Host cell.
+    _BBS_COLS = ["Type", "Name", "Callsign", "Freq", "BW",
+                 "Host", "Port", "Notes"]
+    _BBS_TRANSPORT_LABEL = {
+        "vara_hf":    "VARA HF",
+        "vara_fm":    "VARA FM",
+        "telnet":     "Telnet",
+        "direwolf":   "Direwolf",
+        "soundmodem": "Soundmodem",
+    }
+    _BBS_NA = "—"   # em-dash placeholder for inapplicable cells
+
     def _build_bbs_tab(self) -> QWidget:
         w = QWidget()
         layout = QVBoxLayout(w)
         layout.setContentsMargins(10, 10, 10, 10)
 
         # Table
-        self.bbs_table = QTableWidget(0, 5)
-        self.bbs_table.setHorizontalHeaderLabels(
-            ["Name", "Callsign", "Host", "Port", "Transport"])
-        self.bbs_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch)
-        self.bbs_table.horizontalHeader().setSectionResizeMode(
-            2, QHeaderView.ResizeMode.Stretch)
-        self.bbs_table.setColumnWidth(1, 90)
-        self.bbs_table.setColumnWidth(3, 58)
-        self.bbs_table.setColumnWidth(4, 72)
+        self.bbs_table = QTableWidget(0, len(self._BBS_COLS))
+        self.bbs_table.setHorizontalHeaderLabels(self._BBS_COLS)
+        # Fixed-ish widths for type/callsign/freq/bw/port; Name and Host
+        # share whatever's left, Notes stretches. Widths picked so the
+        # widest plausible content fits without truncation: "VARA HF"
+        # in Type, "NARROW" in BW, "10.0.0.177" in Host, "8110" in Port.
+        hdr = self.bbs_table.horizontalHeader()
+        self.bbs_table.setColumnWidth(0, 85)    # Type
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.bbs_table.setColumnWidth(1, 140)   # Name
+        self.bbs_table.setColumnWidth(2, 95)    # Callsign
+        self.bbs_table.setColumnWidth(3, 90)    # Freq
+        self.bbs_table.setColumnWidth(4, 90)    # BW   (fits NARROW)
+        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
+        self.bbs_table.setColumnWidth(5, 130)   # Host (fits IPv4 dotted)
+        self.bbs_table.setColumnWidth(6, 75)    # Port (fits 5-digit)
+        hdr.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)  # Notes
+        self.bbs_table.setSortingEnabled(True)
         self.bbs_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows)
         self.bbs_table.setEditTriggers(
@@ -1943,18 +2003,50 @@ class SettingsDialog(QDialog):
         return w
 
     def _reload_bbs_table(self):
+        # Disable sorting while populating — Qt re-sorts on every setItem
+        # which would shuffle rows out from under us mid-fill.
+        self.bbs_table.setSortingEnabled(False)
         self.bbs_table.setRowCount(0)
-        for e in self._cfg.get("bbs_list", []):
-            r = self.bbs_table.rowCount()
-            self.bbs_table.insertRow(r)
-            for c, v in enumerate([
+        for idx, e in enumerate(self._cfg.get("bbs_list", [])):
+            transport = e.get("transport", "telnet")
+            is_vara   = transport in ("vara_hf", "vara_fm")
+            is_telnet = transport == "telnet"
+            type_lbl  = self._BBS_TRANSPORT_LABEL.get(transport, transport)
+            port_val  = e.get("telnet_port", "")
+            cells = [
+                type_lbl,
                 e.get("name", ""),
                 e.get("callsign", ""),
-                e.get("host", ""),
-                str(e.get("telnet_port", "")),
-                e.get("transport", "telnet"),
-            ]):
-                self.bbs_table.setItem(r, c, QTableWidgetItem(v))
+                e.get("freq", "") if is_vara else self._BBS_NA,
+                e.get("bw", "")   if is_vara else self._BBS_NA,
+                e.get("host", "") if is_telnet else self._BBS_NA,
+                str(port_val)     if is_telnet and port_val != "" else
+                                       (self._BBS_NA if not is_telnet else ""),
+                e.get("notes", ""),
+            ]
+            r = self.bbs_table.rowCount()
+            self.bbs_table.insertRow(r)
+            for c, v in enumerate(cells):
+                item = QTableWidgetItem(v)
+                # Stash the source bbs_list index on column 0 so sorting
+                # doesn't desync edit/delete from the underlying config.
+                if c == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, idx)
+                self.bbs_table.setItem(r, c, item)
+        self.bbs_table.setSortingEnabled(True)
+
+    def _bbs_selected_cfg_index(self) -> int:
+        """Map the currently selected table row back to its index in
+        self._cfg['bbs_list']. Returns -1 if no row selected. Needed
+        because the table is sortable — row N may not be config[N]."""
+        row = self.bbs_table.currentRow()
+        if row < 0:
+            return -1
+        item = self.bbs_table.item(row, 0)
+        if item is None:
+            return -1
+        idx = item.data(Qt.ItemDataRole.UserRole)
+        return int(idx) if idx is not None else -1
 
     def _bbs_row_changed(self, row, *_):
         has = row >= 0
@@ -1968,25 +2060,25 @@ class SettingsDialog(QDialog):
             self._reload_bbs_table()
 
     def _bbs_edit(self):
-        row = self.bbs_table.currentRow()
-        if row < 0:
+        idx = self._bbs_selected_cfg_index()
+        if idx < 0:
             return
-        entry = self._cfg["bbs_list"][row]
+        entry = self._cfg["bbs_list"][idx]
         dlg = _BBSEntryDialog(entry=entry, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._cfg["bbs_list"][row] = dlg.get_entry()
+            self._cfg["bbs_list"][idx] = dlg.get_entry()
             self._reload_bbs_table()
 
     def _bbs_del(self):
-        row = self.bbs_table.currentRow()
-        if row < 0:
+        idx = self._bbs_selected_cfg_index()
+        if idx < 0:
             return
-        name = self._cfg["bbs_list"][row].get("callsign", "?")
+        name = self._cfg["bbs_list"][idx].get("callsign", "?")
         r = QMessageBox.question(self, "Remove BBS",
             f"Remove {name} from your BBS list?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if r == QMessageBox.StandardButton.Yes:
-            del self._cfg["bbs_list"][row]
+            del self._cfg["bbs_list"][idx]
             self._reload_bbs_table()
 
     # ── Tab: PTT ──────────────────────────────────────────────────
@@ -2054,6 +2146,11 @@ class SettingsDialog(QDialog):
             "<i><b>Digirig Mobile:</b> select its ttyUSB port, signal = RTS.<br>"
             "VARA sends PTT ON / PTT OFF on its command port — this app keys<br>"
             "the radio accordingly.  Set VARA's own PTT setting to <b>None</b>.<br><br>"
+            "<b>Only one program can hold the serial port at a time.</b><br>"
+            "If <i>Vara Terminal</i> or another PTT-driving client is running,<br>"
+            "close it before testing here or before connecting.<br><br>"
+            "<b>CP2105 dual-port devices</b> (some Digirig models, etc.):<br>"
+            "PTT is typically on the <i>Standard</i> port, not the <i>Enhanced</i> port.<br><br>"
             "Test PTT keys the radio for 1 second without connecting to a station.</i>")
         note.setStyleSheet(f"color: {self._note_color}; font-size:11px;")
         note.setWordWrap(True)
@@ -2098,6 +2195,15 @@ class SettingsDialog(QDialog):
             try:
                 ptt = PTTController(port=port, mode=signal)
                 ptt.open()
+                if not ptt.is_open:
+                    QMessageBox.warning(
+                        self, "PTT Error",
+                        f"Could not open {port}:\n\n"
+                        f"{ptt.last_error or 'unknown error'}\n\n"
+                        f"This port may be open in Vara Terminal or another "
+                        f"PTT-driving app — only one program can hold the "
+                        f"COM port. Close it and try again.")
+                    return
                 ptt.test(duration=1.0)
                 ptt.close()
             except Exception as exc:
@@ -2154,6 +2260,569 @@ class SettingsDialog(QDialog):
 
         outer.addStretch()
         return w
+
+    # ── Tab: Mail-Call !!! ─────────────────────────────────────────
+    #
+    # Scheduled auto-connect to the user's Home BBS at preset clock times.
+    # Design contract (see CLAUDE.md → MAIL-CALL):
+    #   - 2-hour MINIMUM gap between any two scheduled fires (sysop politeness)
+    #   - Run-mode = app-open-only (no tray, no autostart in v0.13.0)
+    #   - Per-fire = same path as the Connect button (full mail+bulletin run)
+    #   - Collision (manual session active) = skip silently + log
+    #   - Missed slot on launch = skip to next slot, NEVER catch up
+    #     (users routinely open QtC to compose outbox before connecting —
+    #      auto-firing on launch would transmit before they're ready)
+
+    PRESET_TIMES = {
+        "once":   [QTime(8, 0)],
+        "twice":  [QTime(8, 0), QTime(20, 0)],
+        "thrice": [QTime(6, 0), QTime(14, 0), QTime(22, 0)],
+    }
+
+    # Bump this when the RF responsibility text below materially changes —
+    # users who accepted an older version will be re-prompted on next enable.
+    # Telnet connections do not require acceptance (no RF safety concerns).
+    MAILCALL_RESPONSIBILITY_VERSION = 1
+
+    MAILCALL_RESPONSIBILITY_HTML_RF = (
+        "<h3>⚠️&nbsp; Unattended Automatic Operation — Responsibility (RF)</h3>"
+        "<p>By enabling <b>Mail-Call !!!</b>, you are allowing QtC to key "
+        "your radio and transmit data on a schedule — with no one watching.</p>"
+        "<p>You remain the control operator. You are responsible for:</p>"
+        "<ul>"
+        "<li>Your station being in safe operating condition before you "
+        "walk away</li>"
+        "<li>Your antenna being tuned, or auto-tune being enabled and "
+        "reliable</li>"
+        "<li>Your RF output power being set sensibly, <b>not</b> at "
+        "maximum</li>"
+        "<li>Watching for failures the software <b>cannot</b> detect — "
+        "stuck PTT, bumped VFO knob, antenna falls, coax failure, radio "
+        "fault, software hang with PTT still asserted</li>"
+        "</ul>"
+        "<p>If any of these fail, QtC will not know, and the radio may "
+        "key anyway.</p>"
+        "<p>QtC is still <b>Beta</b>. Do not walk away from a radio on a "
+        "timer until you have built trust through supervised cycles first.</p>"
+    )
+
+    def _build_mailcall_tab(self) -> QWidget:
+        w = QWidget()
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(18, 18, 18, 12)
+        outer.setSpacing(10)
+
+        mc = self._cfg.get("mail_call", {})
+        u  = self._cfg.get("user", {})
+
+        # Enable checkbox at the very top — gates everything below.
+        # setChecked here does NOT fire the responsibility dialog because
+        # toggled.connect happens after this initial set.
+        self.chk_mc_enabled = QCheckBox("Enable scheduled Home BBS connections")
+        self.chk_mc_enabled.setChecked(bool(mc.get("enabled", False)))
+        self.chk_mc_enabled.setStyleSheet("font-weight: bold;")
+        outer.addWidget(self.chk_mc_enabled)
+
+        # Home BBS read-only display + time zone row
+        info_form = QFormLayout()
+        info_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        info_form.setHorizontalSpacing(10)
+        info_form.setVerticalSpacing(8)
+        info_form.setContentsMargins(0, 4, 0, 4)
+
+        home_bbs = u.get("home_bbs", "").strip()
+        home_bbs_display = home_bbs or "(not set — configure in My Station)"
+        self.lbl_mc_home = QLabel(home_bbs_display)
+        self.lbl_mc_home.setStyleSheet("font-family: 'Courier New'; font-weight: bold;")
+        info_form.addRow("Home BBS:", self.lbl_mc_home)
+
+        # Connection picker — every bbs_list entry whose callsign matches
+        # the Home BBS. Stored as a composite key so reorders/edits to
+        # bbs_list don't lose the user's choice.
+        self.combo_mc_connection = QComboBox()
+        self.combo_mc_connection.setMinimumWidth(280)
+        matching = self._mc_matching_entries()
+        for entry in matching:
+            self.combo_mc_connection.addItem(
+                self._mc_entry_label(entry), userData=entry)
+        # Restore saved selection by composite key, else default to first
+        saved_key = mc.get("bbs_key") or {}
+        for i, entry in enumerate(matching):
+            if self._mc_entry_key(entry) == saved_key:
+                self.combo_mc_connection.setCurrentIndex(i)
+                break
+        # If no matches, dropdown stays empty and gets disabled
+        # alongside the rest of the tab below.
+        info_form.addRow("Connection:", self.combo_mc_connection)
+
+        self.rb_mc_tz_local = QRadioButton("Local")
+        self.rb_mc_tz_utc   = QRadioButton("UTC")
+        tz_group = QButtonGroup(w)
+        tz_group.addButton(self.rb_mc_tz_local)
+        tz_group.addButton(self.rb_mc_tz_utc)
+        if mc.get("time_zone", "local") == "utc":
+            self.rb_mc_tz_utc.setChecked(True)
+        else:
+            self.rb_mc_tz_local.setChecked(True)
+        tz_row = QHBoxLayout()
+        tz_row.addWidget(self.rb_mc_tz_local)
+        tz_row.addWidget(self.rb_mc_tz_utc)
+        tz_row.addStretch()
+        tz_wrap = QWidget()
+        tz_wrap.setLayout(tz_row)
+        info_form.addRow("Time zone:", tz_wrap)
+
+        outer.addLayout(info_form)
+
+        # Schedule group box — 5 radio modes
+        sched_box = QGroupBox("Schedule")
+        sched_layout = QVBoxLayout(sched_box)
+        sched_layout.setContentsMargins(12, 8, 12, 8)
+        sched_layout.setSpacing(6)
+
+        self.rb_mc_once   = QRadioButton("Once daily       (08:00)")
+        self.rb_mc_twice  = QRadioButton("Twice daily      (08:00, 20:00)")
+        self.rb_mc_thrice = QRadioButton("Three times/day  (06:00, 14:00, 22:00)")
+
+        # "Every N hours: [ N ]"
+        self.rb_mc_every  = QRadioButton("Every")
+        self.spin_mc_every = QSpinBox()
+        self.spin_mc_every.setRange(2, 12)     # 2hr minimum enforced here
+        self.spin_mc_every.setValue(int(mc.get("every_n_hours", 4)))
+        self.spin_mc_every.setSuffix(" hours")
+        self.spin_mc_every.setFixedWidth(110)
+        every_row = QHBoxLayout()
+        every_row.setContentsMargins(0, 0, 0, 0)
+        every_row.addWidget(self.rb_mc_every)
+        every_row.addWidget(self.spin_mc_every)
+        every_row.addStretch()
+        every_wrap = QWidget()
+        every_wrap.setLayout(every_row)
+
+        # "Custom times" + inline list
+        self.rb_mc_custom = QRadioButton("Custom times:")
+
+        self.lst_mc_custom = QListWidget()
+        self.lst_mc_custom.setMaximumHeight(110)
+        self.lst_mc_custom.setStyleSheet("font-family: 'Courier New';")
+        for t_str in mc.get("custom_times", []):
+            self.lst_mc_custom.addItem(t_str)
+
+        # Time picker + Add/Remove buttons under the list
+        self.te_mc_custom = QTimeEdit(QTime(12, 0))
+        self.te_mc_custom.setDisplayFormat("HH:mm")
+        self.te_mc_custom.setFixedWidth(90)
+        self.btn_mc_add_time = QPushButton("➕ Add Time")
+        self.btn_mc_rm_time  = QPushButton("➖ Remove")
+        self.btn_mc_add_time.clicked.connect(self._mc_add_custom_time)
+        self.btn_mc_rm_time.clicked.connect(self._mc_remove_custom_time)
+
+        custom_btn_row = QHBoxLayout()
+        custom_btn_row.setContentsMargins(20, 0, 0, 0)   # indent to align under list
+        custom_btn_row.addWidget(self.te_mc_custom)
+        custom_btn_row.addWidget(self.btn_mc_add_time)
+        custom_btn_row.addWidget(self.btn_mc_rm_time)
+        custom_btn_row.addStretch()
+
+        # Indent the custom list to sit under the radio button
+        list_wrap = QHBoxLayout()
+        list_wrap.setContentsMargins(20, 0, 0, 0)
+        list_wrap.addWidget(self.lst_mc_custom)
+
+        # Schedule radio group
+        sched_group = QButtonGroup(w)
+        for rb in (self.rb_mc_once, self.rb_mc_twice, self.rb_mc_thrice,
+                   self.rb_mc_every, self.rb_mc_custom):
+            sched_group.addButton(rb)
+        mode = mc.get("schedule_mode", "twice")
+        {"once":   self.rb_mc_once,
+         "twice":  self.rb_mc_twice,
+         "thrice": self.rb_mc_thrice,
+         "every":  self.rb_mc_every,
+         "custom": self.rb_mc_custom}.get(mode, self.rb_mc_twice).setChecked(True)
+
+        sched_layout.addWidget(self.rb_mc_once)
+        sched_layout.addWidget(self.rb_mc_twice)
+        sched_layout.addWidget(self.rb_mc_thrice)
+        sched_layout.addWidget(every_wrap)
+        sched_layout.addWidget(self.rb_mc_custom)
+        sched_layout.addLayout(list_wrap)
+        sched_layout.addLayout(custom_btn_row)
+
+        outer.addWidget(sched_box)
+
+        # Warning text — Variant 2 (peer-friendly)
+        warn = QLabel(
+            "<b>⚠️  Be kind to your sysop and the frequency</b><br>"
+            "Schedule no more often than you actually need. Twice a day "
+            "(e.g. 08:00 and 20:00) is plenty for most operators. The "
+            "2-hour minimum is a guardrail, not a recommendation. Manual "
+            "<b>Connect</b> is always available if something can't wait.")
+        warn.setWordWrap(True)
+        if self._dark:
+            warn.setStyleSheet(
+                "QLabel { background:#3a2a14; color:#ffd9a8; "
+                "border:1px solid #6a4a24; border-radius:4px; padding:8px; }")
+        else:
+            warn.setStyleSheet(
+                "QLabel { background:#fff4d6; color:#5a3a08; "
+                "border:1px solid #d4a84a; border-radius:4px; padding:8px; }")
+        outer.addWidget(warn)
+
+        # The live "Next Mail-Call" countdown is shown in the main window
+        # status bar (bottom right). After saving Settings it reflects the
+        # new schedule. We don't duplicate it here because the values in
+        # this tab can be edited but not yet saved.
+        self.lbl_mc_next = QLabel(
+            "Next scheduled run is shown in the main window status bar.")
+        self.lbl_mc_next.setStyleSheet(f"color: {self._note_color}; font-size:11px;")
+        outer.addWidget(self.lbl_mc_next)
+
+        outer.addStretch()
+
+        # Bottom: compact responsibility reminder (visible only when enabled)
+        # + always-visible "Review Responsibility…" link.
+        self.lbl_mc_reminder = QLabel(
+            "<b>⚠️  Mail-Call is armed</b> — you remain the control "
+            "operator. Stuck PTT, bumped VFO, antenna/coax failures, and "
+            "software hangs are <b>not</b> detected by software.")
+        self.lbl_mc_reminder.setWordWrap(True)
+        if self._dark:
+            self.lbl_mc_reminder.setStyleSheet(
+                "QLabel { background:#3a1414; color:#ffc8c8; "
+                "border:1px solid #6a2424; border-radius:4px; padding:6px; }")
+        else:
+            self.lbl_mc_reminder.setStyleSheet(
+                "QLabel { background:#fde4e4; color:#7a1010; "
+                "border:1px solid #c84a4a; border-radius:4px; padding:6px; }")
+        outer.addWidget(self.lbl_mc_reminder)
+
+        review_row = QHBoxLayout()
+        review_row.addStretch()
+        self.btn_mc_review = QPushButton("📖  Review Responsibility…")
+        self.btn_mc_review.setFlat(True)
+        if self._dark:
+            self.btn_mc_review.setStyleSheet(
+                "QPushButton { color:#88aaff; text-decoration:underline; }"
+                "QPushButton:hover { color:#aaccff; }")
+        else:
+            self.btn_mc_review.setStyleSheet(
+                "QPushButton { color:#1a4488; text-decoration:underline; }"
+                "QPushButton:hover { color:#0a2266; }")
+        self.btn_mc_review.clicked.connect(self._mc_review_clicked)
+        review_row.addWidget(self.btn_mc_review)
+        outer.addLayout(review_row)
+
+        # Wire enable-state and mode-change to gate child widgets.
+        # The enable checkbox routes through _mc_on_enable_toggled which
+        # fires the responsibility-acceptance dialog on first ON-transition.
+        self.chk_mc_enabled.toggled.connect(self._mc_on_enable_toggled)
+        for rb in (self.rb_mc_once, self.rb_mc_twice, self.rb_mc_thrice,
+                   self.rb_mc_every, self.rb_mc_custom):
+            rb.toggled.connect(self._mc_update_enabled_state)
+        # Switching the Connection between RF and Telnet changes whether
+        # the RF-specific reminder banner + Review link apply.
+        self.combo_mc_connection.currentIndexChanged.connect(
+            self._mc_update_reminder)
+        self._mc_update_enabled_state()
+        self._mc_update_reminder()
+
+        # Disable the whole tab content if there's no usable connection to
+        # the Home BBS — either Home BBS isn't set, or no bbs_list entry
+        # matches it.
+        if not home_bbs:
+            self._mc_disable_tab(outer, sched_box,
+                "<i>Set a Home BBS in the My Station tab to enable Mail-Call !!!.</i>")
+        elif not matching:
+            home_base = self._base_callsign(home_bbs)
+            self._mc_disable_tab(outer, sched_box,
+                f"<i>No BBS List entry matches Home BBS <b>{home_bbs}</b>. "
+                f"Add a BBS List entry with callsign <b>{home_base}</b> "
+                f"(or <b>{home_base}-N</b>) to enable Mail-Call !!!.</i>")
+
+        return w
+
+    def _mc_disable_tab(self, outer_layout, sched_box, hint_html: str):
+        """Grey out the Mail-Call tab content and show a hint at the top."""
+        for widget in (self.chk_mc_enabled, sched_box, self.lbl_mc_home,
+                       self.combo_mc_connection):
+            widget.setEnabled(False)
+        hint = QLabel(hint_html)
+        hint.setStyleSheet("color:#ff8844; font-size:11px;")
+        hint.setWordWrap(True)
+        outer_layout.insertWidget(1, hint)
+
+    def _mc_update_enabled_state(self):
+        """Gate child widgets on the enable checkbox + selected schedule mode."""
+        on = self.chk_mc_enabled.isChecked()
+        # Time-zone radios + schedule radios live or die with the master switch
+        for w in (self.rb_mc_tz_local, self.rb_mc_tz_utc,
+                  self.rb_mc_once, self.rb_mc_twice, self.rb_mc_thrice,
+                  self.rb_mc_every, self.rb_mc_custom):
+            w.setEnabled(on)
+
+        # Per-mode child widgets are also gated on which mode is selected
+        self.spin_mc_every.setEnabled(on and self.rb_mc_every.isChecked())
+        custom_active = on and self.rb_mc_custom.isChecked()
+        self.lst_mc_custom.setEnabled(custom_active)
+        self.te_mc_custom.setEnabled(custom_active)
+        self.btn_mc_add_time.setEnabled(custom_active)
+        self.btn_mc_rm_time.setEnabled(custom_active)
+
+    def _mc_add_custom_time(self):
+        t = self.te_mc_custom.time()
+        t_str = t.toString("HH:mm")
+        # Reject duplicates
+        existing = [self.lst_mc_custom.item(i).text()
+                    for i in range(self.lst_mc_custom.count())]
+        if t_str in existing:
+            return
+        existing.append(t_str)
+        existing.sort()
+        self.lst_mc_custom.clear()
+        for s in existing:
+            self.lst_mc_custom.addItem(s)
+
+    def _mc_remove_custom_time(self):
+        row = self.lst_mc_custom.currentRow()
+        if row >= 0:
+            self.lst_mc_custom.takeItem(row)
+
+    # ── Connection-picker helpers ──────────────────────────────────
+
+    @staticmethod
+    def _base_callsign(addr: str) -> str:
+        """
+        Extract the base callsign from any of the formats QtC stores.
+
+        BBS hierarchical addressing (HA) lets other BBSes route mail to
+        you via your home BBS. Examples of what this normalizes:
+
+          'KC9MTP.#NWIN.IN.USA.NOAM'  →  'KC9MTP'   (My Station home_bbs,
+                                                     contact home_bbs)
+          'KC9MTP-1'                  →  'KC9MTP'   (bbs_list.callsign)
+          'KC9MTP'                    →  'KC9MTP'   (bare call)
+
+        So Mail-Call can find every bbs_list entry that belongs to the
+        user's home BBS station, regardless of which form was typed.
+        """
+        s = (addr or "").strip().upper()
+        s = s.split('.', 1)[0]   # drop H-routing tail
+        s = s.split('-', 1)[0]   # drop SSID suffix
+        return s
+
+    def _mc_matching_entries(self) -> list:
+        """Return all bbs_list entries whose base callsign matches the
+        base callsign of the user's home_bbs (HA address)."""
+        home_base = self._base_callsign(
+            self._cfg.get("user", {}).get("home_bbs", ""))
+        if not home_base:
+            return []
+        return [e for e in self._cfg.get("bbs_list", [])
+                if self._base_callsign(e.get("callsign", "")) == home_base]
+
+    def _mc_has_visited_home_bbs(self) -> bool:
+        """Return True if the user has connected at least once to any
+        bbs_list entry whose base callsign matches their Home BBS.
+
+        Mail-Call relies on per-BBS state that's only stamped on a
+        completed manual connect (visited_bbs, bbs_watermarks, etc.).
+        Without that first connect the unattended scheduler can't tell
+        new mail from a backlog or pick the right bulletin baseline."""
+        mycall = (self._cfg.get("user", {}).get("callsign", "") or
+                  "").upper().strip()
+        if not mycall:
+            return False
+        visited = self._cfg.get("visited_bbs", {}) or {}
+        for entry in self._mc_matching_entries():
+            bbs_call = entry.get("callsign", "")
+            if f"{mycall}@{bbs_call}" in visited:
+                return True
+        return False
+
+    @staticmethod
+    def _mc_entry_label(entry: dict) -> str:
+        """Human-readable label for the Connection dropdown."""
+        transport_map = {
+            "vara_hf": "VARA HF",
+            "vara_fm": "VARA FM",
+            "telnet":  "Telnet",
+        }
+        tname = transport_map.get(entry.get("transport", ""),
+                                   entry.get("transport", "?"))
+        host = entry.get("host", "")
+        if entry.get("transport") == "telnet":
+            port = entry.get("telnet_port", "")
+        else:
+            port = entry.get("vara_cmd_port", "")
+        location = f"{host}:{port}" if host and port else (host or "?")
+        return f"{entry.get('callsign','?')} — {tname} ({location})"
+
+    @staticmethod
+    def _mc_entry_key(entry: dict) -> dict:
+        """Composite key that survives bbs_list reorders/edits."""
+        return {
+            "callsign":  entry.get("callsign", "").upper(),
+            "transport": entry.get("transport", ""),
+            "host":      entry.get("host", ""),
+        }
+
+    def _mc_selected_entry(self):
+        """The bbs_list entry the user has currently selected, or None."""
+        if not hasattr(self, "combo_mc_connection"):
+            return None
+        return self.combo_mc_connection.currentData()
+
+    @staticmethod
+    def _mc_transport_class(entry: dict) -> str:
+        """Return 'rf' or 'telnet' for the chosen entry — used to pick which
+        responsibility text to show and which acceptance flag to check."""
+        return "telnet" if entry.get("transport") == "telnet" else "rf"
+
+    # ── Responsibility acceptance ──────────────────────────────────
+    #
+    # Acceptance is required only for RF transports (VARA HF/FM) because
+    # those key a radio unattended. Telnet connections need no acceptance —
+    # no PTT, no antenna, no RF safety surface.
+
+    def _mc_already_accepted_rf(self) -> bool:
+        """Has the user accepted the current RF responsibility text?"""
+        mc = self._cfg.get("mail_call", {})
+        return int(mc.get("responsibility_accepted_rf_version", 0)) == \
+            self.MAILCALL_RESPONSIBILITY_VERSION
+
+    def _mc_on_enable_toggled(self, checked: bool):
+        """
+        Handle the Enable Mail-Call !!! checkbox toggle.
+
+        On ON-transition over an RF transport, show the RF responsibility
+        dialog if not already accepted. Telnet selections skip the dialog
+        entirely. If the user cancels the RF dialog, snap the checkbox
+        back off.
+        """
+        if checked:
+            entry = self._mc_selected_entry()
+            if entry is None:
+                # No selectable connection — revert. The tab's grey-out
+                # logic should normally prevent reaching this branch.
+                self.chk_mc_enabled.blockSignals(True)
+                self.chk_mc_enabled.setChecked(False)
+                self.chk_mc_enabled.blockSignals(False)
+                self._mc_update_enabled_state()
+                self._mc_update_reminder()
+                return
+            # Refuse to enable until the user has completed at least one
+            # manual connect to their Home BBS. That first connect stamps
+            # visited_bbs and watermarks — without those, Mail-Call would
+            # treat the entire mailbox as "new" on its first unattended
+            # fire and could ingest a huge backlog over slow RF.
+            if not self._mc_has_visited_home_bbs():
+                home_base = self._base_callsign(
+                    self._cfg.get("user", {}).get("home_bbs", "")) or "(none)"
+                QMessageBox.information(
+                    self, "Mail-Call !!! — Connect to Home BBS first",
+                    f"<b>Mail-Call can't be enabled yet.</b><br><br>"
+                    f"You need to connect to your Home BBS "
+                    f"<b>{home_base}</b> at least once from the toolbar "
+                    f"Connect button before scheduling unattended "
+                    f"sessions.<br><br>"
+                    f"That first connect lets QtC learn your mailbox "
+                    f"watermark and the current bulletin baseline so "
+                    f"Mail-Call doesn't tie up the frequency downloading "
+                    f"an entire backlog on its first unattended run.<br><br>"
+                    f"Once you've connected to <b>{home_base}</b> once "
+                    f"and confirmed everything looks right, come back "
+                    f"here and enable Mail-Call !!!.")
+                self.chk_mc_enabled.blockSignals(True)
+                self.chk_mc_enabled.setChecked(False)
+                self.chk_mc_enabled.blockSignals(False)
+                self._mc_update_enabled_state()
+                self._mc_update_reminder()
+                return
+            if self._mc_transport_class(entry) == "rf" \
+                    and not self._mc_already_accepted_rf():
+                accepted = self._show_responsibility_dialog(accept_mode=True)
+                if accepted:
+                    self._cfg.setdefault("mail_call", {})
+                    self._cfg["mail_call"][
+                        "responsibility_accepted_rf_version"] = \
+                        self.MAILCALL_RESPONSIBILITY_VERSION
+                else:
+                    self.chk_mc_enabled.blockSignals(True)
+                    self.chk_mc_enabled.setChecked(False)
+                    self.chk_mc_enabled.blockSignals(False)
+        self._mc_update_enabled_state()
+        self._mc_update_reminder()
+
+    def _mc_review_clicked(self):
+        """Review-only display of the RF responsibility text."""
+        self._show_responsibility_dialog(accept_mode=False)
+
+    def _mc_update_reminder(self):
+        """Show the in-tab RF reminder banner and Review link only when
+        Mail-Call is enabled AND the selected connection is RF. Telnet
+        has no PTT/antenna/coax surface, so the RF-specific reminder is
+        hidden for it."""
+        entry = self._mc_selected_entry()
+        is_rf = entry is not None and self._mc_transport_class(entry) == "rf"
+        show = self.chk_mc_enabled.isChecked() and is_rf
+        self.lbl_mc_reminder.setVisible(show)
+        if hasattr(self, "btn_mc_review"):
+            self.btn_mc_review.setVisible(is_rf)
+
+    def _show_responsibility_dialog(self, accept_mode: bool = True) -> bool:
+        """
+        Display the RF responsibility text.
+
+        accept_mode=True   — checkbox-gated Accept button. Returns True iff
+                             the user ticked the box and clicked Accept.
+        accept_mode=False  — read-only review. Returns True (no decision).
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("QtC — Mail-Call !!! Responsibility (RF)")
+        dlg.setMinimumSize(560, 480)
+
+        v = QVBoxLayout(dlg)
+        v.setContentsMargins(18, 18, 18, 14)
+        v.setSpacing(12)
+
+        body = QTextEdit()
+        body.setReadOnly(True)
+        body.setHtml(self.MAILCALL_RESPONSIBILITY_HTML_RF)
+        if self._dark:
+            body.setStyleSheet(
+                "QTextEdit { background:#1a0e0e; color:#ffe0c8; "
+                "border:1px solid #6a2424; border-radius:4px; padding:8px; }")
+        else:
+            body.setStyleSheet(
+                "QTextEdit { background:#fff8f0; color:#1a1010; "
+                "border:1px solid #c84a4a; border-radius:4px; padding:8px; }")
+        v.addWidget(body)
+
+        chk = QCheckBox("I understand and accept these responsibilities.")
+        chk.setStyleSheet("font-weight: bold;")
+        v.addWidget(chk)
+
+        btns = QDialogButtonBox()
+        if accept_mode:
+            accept_btn = btns.addButton(
+                "Enable Mail-Call !!!", QDialogButtonBox.ButtonRole.AcceptRole)
+            cancel_btn = btns.addButton(
+                "Cancel", QDialogButtonBox.ButtonRole.RejectRole)
+            accept_btn.setEnabled(False)
+            chk.toggled.connect(accept_btn.setEnabled)
+            accept_btn.clicked.connect(dlg.accept)
+            cancel_btn.clicked.connect(dlg.reject)
+        else:
+            # Review mode — pre-tick the checkbox as a memory aid, OK only
+            chk.setChecked(True)
+            chk.setEnabled(False)
+            ok_btn = btns.addButton(
+                "Close", QDialogButtonBox.ButtonRole.AcceptRole)
+            ok_btn.clicked.connect(dlg.accept)
+        v.addWidget(btns)
+
+        return dlg.exec() == QDialog.DialogCode.Accepted
 
     def _build_app_tab(self) -> QWidget:
         w = QWidget()
@@ -2261,7 +2930,88 @@ class SettingsDialog(QDialog):
             "signal": sig_map[self.ptt_signal.currentIndex()],
         }
 
+        # Mail-Call !!! tab — validate custom-times 2hr gap before accepting
+        mc_mode = (
+            "once"   if self.rb_mc_once.isChecked()   else
+            "twice"  if self.rb_mc_twice.isChecked()  else
+            "thrice" if self.rb_mc_thrice.isChecked() else
+            "every"  if self.rb_mc_every.isChecked()  else
+            "custom"
+        )
+        custom_times = [self.lst_mc_custom.item(i).text()
+                        for i in range(self.lst_mc_custom.count())]
+        custom_times.sort()
+        if mc_mode == "custom":
+            err = self._mc_validate_gap(custom_times)
+            if err:
+                QMessageBox.warning(self, "Mail-Call !!! schedule",
+                    f"{err}\n\n"
+                    "BBS sysops appreciate at least a 2-hour gap between "
+                    "scheduled connections. Please adjust the times.")
+                return
+
+        # Refuse OK if Mail-Call is enabled but no connection is picked
+        # (defensive — the tab is greyed out when there are no matches).
+        selected_entry = self._mc_selected_entry()
+        if self.chk_mc_enabled.isChecked() and selected_entry is None:
+            QMessageBox.warning(self, "Mail-Call !!!",
+                "Mail-Call is enabled but no connection is selected.\n\n"
+                "Either add a BBS List entry matching your Home BBS "
+                "callsign, or disable Mail-Call.")
+            return
+
+        # If the user switched to an RF connection without ever accepting
+        # the RF responsibility text, refuse OK and tell them how to fix.
+        # Telnet connections need no acceptance.
+        if self.chk_mc_enabled.isChecked() and selected_entry is not None:
+            if self._mc_transport_class(selected_entry) == "rf" \
+                    and not self._mc_already_accepted_rf():
+                QMessageBox.warning(self, "Mail-Call !!!",
+                    "You have selected an RF (VARA) connection but have not "
+                    "accepted the RF responsibility text.\n\n"
+                    "Toggle the Enable checkbox off, then back on, to see "
+                    "the RF responsibility prompt.")
+                return
+
+        # Persist the chosen connection by composite key + RF acceptance
+        # version (set in _mc_on_enable_toggled).
+        existing_mc = self._cfg.get("mail_call", {})
+        self._cfg["mail_call"] = {
+            "enabled":       self.chk_mc_enabled.isChecked(),
+            "time_zone":     "utc" if self.rb_mc_tz_utc.isChecked() else "local",
+            "schedule_mode": mc_mode,
+            "every_n_hours": self.spin_mc_every.value(),
+            "custom_times":  custom_times,
+            "bbs_key":       (self._mc_entry_key(selected_entry)
+                              if selected_entry else None),
+            "responsibility_accepted_rf_version": int(existing_mc.get(
+                "responsibility_accepted_rf_version", 0)),
+        }
+
         self.accept()
+
+    @staticmethod
+    def _mc_validate_gap(times: list) -> str:
+        """
+        Returns "" if all adjacent gaps (incl. wrap across midnight) are
+        >= 2 hours, else a human-readable error string. `times` is a
+        sorted list of "HH:MM" strings.
+        """
+        if len(times) < 2:
+            return ""
+        mins = []
+        for s in times:
+            h, m = s.split(":")
+            mins.append(int(h) * 60 + int(m))
+        for i in range(len(mins) - 1):
+            if mins[i + 1] - mins[i] < 120:
+                return (f"Times {times[i]} and {times[i + 1]} are less "
+                        f"than 2 hours apart.")
+        wrap = (mins[0] + 24 * 60) - mins[-1]
+        if wrap < 120:
+            return (f"Times {times[-1]} and {times[0]} are less than "
+                    f"2 hours apart across midnight.")
+        return ""
 
     def get_config(self) -> dict:
         return self._cfg
@@ -2350,9 +3100,11 @@ class _BBSEntryDialog(QDialog):
         self.e_freq.setToolTip("Frequency in MHz (for future rig control)")
 
         self.e_bw = QComboBox()
-        self.e_bw.addItems(["500", "2300"])
-        self.e_bw.setFixedWidth(70)
-        self.e_bw.setCurrentText(e.get("bw", "500"))
+        # Wide enough for "NARROW" + dropdown arrow without clipping.
+        self.e_bw.setFixedWidth(120)
+        # Items are populated by _on_transport_changed so the dropdown
+        # matches HF (500/2300 kHz) vs FM (NARROW/WIDE).
+        self._vara_initial_bw = e.get("bw", "")
 
         vara_form.addRow("Frequency (MHz):", self.e_freq)
         vara_form.addRow("Bandwidth:",       self.e_bw)
@@ -2404,6 +3156,15 @@ class _BBSEntryDialog(QDialog):
         # Set initial panel visibility
         self._on_transport_changed(self.transport_combo.currentIndex())
 
+    # VARA HF bandwidth values are kHz numbers ("BW500" / "BW2300" on the
+    # wire). VARA FM uses bare keyword commands ("NARROW" / "WIDE") with
+    # no BW prefix — verified against VARA FM modem behavior.
+    _VARA_BW_OPTIONS = {
+        "vara_hf": ["500", "2300"],
+        "vara_fm": ["NARROW", "WIDE"],
+    }
+    _VARA_BW_DEFAULT = {"vara_hf": "500", "vara_fm": "NARROW"}
+
     def _on_transport_changed(self, index: int):
         _, key = self.TRANSPORTS[index]
         is_vara    = key in ("vara_hf", "vara_fm")
@@ -2413,6 +3174,25 @@ class _BBSEntryDialog(QDialog):
         self.vara_group.setVisible(is_vara)
         self.telnet_group.setVisible(is_telnet)
         self.future_group.setVisible(is_future)
+
+        if is_vara:
+            # Repopulate the BW dropdown with the right options for this
+            # VARA variant. Pick the saved value when it's valid for the
+            # new variant, otherwise fall back to the variant default.
+            opts = self._VARA_BW_OPTIONS[key]
+            current = self.e_bw.currentText()
+            saved = getattr(self, "_vara_initial_bw", "") or ""
+            self.e_bw.blockSignals(True)
+            self.e_bw.clear()
+            self.e_bw.addItems(opts)
+            picked = (saved if saved in opts else
+                      current if current in opts else
+                      self._VARA_BW_DEFAULT[key])
+            self.e_bw.setCurrentText(picked)
+            self.e_bw.blockSignals(False)
+            # Saved value is only used to seed the first paint; clear it
+            # so subsequent transport switches use the live combo value.
+            self._vara_initial_bw = ""
 
         if is_future:
             label_map = {
@@ -2449,6 +3229,204 @@ class _BBSEntryDialog(QDialog):
             "notes":       self.e_notes.text().strip(),
             "no_terminal_prompt": self.chk_no_terminal_prompt.isChecked(),
         }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main Window
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Mail-Call !!! Scheduler
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MailCallScheduler(QObject):
+    """
+    Computes next-fire times from the user's Mail-Call config and triggers
+    a Connect when a slot is crossed. Runs entirely on the Qt main thread
+    via a QTimer — no background work, no signals across threads.
+
+    Design contract (see CLAUDE.md / Mail-Call design memo):
+      - Run-mode: app-open-only. Scheduler dies with the app.
+      - Per-fire: same code path as the toolbar Connect button.
+      - Collision (manual session active): skip silently + log [SCHED].
+      - Missed slot on launch: NEVER catch up — compute "next slot > now"
+        and wait. Users open QtC to compose outbox before connecting; an
+        auto-connect on launch would transmit before they're ready.
+      - Pre-fire validation: BBS entry must still exist in bbs_list, AND
+        responsibility must be accepted for that entry's transport class.
+    """
+
+    sig_fire    = pyqtSignal(dict)   # the bbs_list entry to connect to
+    sig_status  = pyqtSignal(str)    # status text for the main-window indicator
+    sig_skipped = pyqtSignal(str)    # reason for a skipped fire (for [SCHED] log)
+
+    TICK_MS = 15_000   # 15 s — fine for minute-precision slots
+
+    def __init__(self, get_config, is_busy, parent=None):
+        """
+        get_config: callable returning the current config dict.
+        is_busy:    callable returning True if a manual session is active.
+        """
+        super().__init__(parent)
+        self._get_config = get_config
+        self._is_busy    = is_busy
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.TICK_MS)
+        self._timer.timeout.connect(self._tick)
+        self._next_fire = None
+        self._last_status = None
+        # External code (MainWindow's busy-retry) sets this to mute scheduler
+        # status updates so its own countdown isn't clobbered every tick.
+        self._status_paused = False
+
+    def set_status_paused(self, paused: bool):
+        """When True, the scheduler stops emitting sig_status updates.
+
+        Used by MainWindow during a Mail-Call busy-retry window so the
+        retry countdown ("channel busy, retry 2/3 in 02:45") doesn't get
+        overwritten on the next scheduler tick. Caller restores via
+        set_status_paused(False) + refresh().
+        """
+        self._status_paused = paused
+
+    def start(self):
+        self._refresh()
+        self._timer.start()
+
+    def stop(self):
+        self._timer.stop()
+
+    def refresh(self):
+        """Reload from config — call after Settings is OK'd."""
+        self._next_fire = None
+        self._refresh()
+
+    # ── core ──────────────────────────────────────────────────────
+
+    def _now(self):
+        mc = self._get_config().get("mail_call", {}) or {}
+        if mc.get("time_zone", "local") == "utc":
+            return datetime.utcnow()
+        return datetime.now()
+
+    @staticmethod
+    def _slots_for_day(day_date, mc):
+        """Return sorted [datetime] slots for the given calendar day."""
+        mode  = mc.get("schedule_mode", "twice")
+        times = []
+        if   mode == "once":   times = [(8, 0)]
+        elif mode == "twice":  times = [(8, 0), (20, 0)]
+        elif mode == "thrice": times = [(6, 0), (14, 0), (22, 0)]
+        elif mode == "every":
+            n = max(2, int(mc.get("every_n_hours", 4)))
+            times = [(h, 0) for h in range(0, 24, n)]
+        elif mode == "custom":
+            for s in mc.get("custom_times", []) or []:
+                try:
+                    h, m = s.split(":")
+                    times.append((int(h), int(m)))
+                except (ValueError, AttributeError):
+                    continue
+        times.sort()
+        return [datetime(day_date.year, day_date.month, day_date.day, h, m)
+                for h, m in times]
+
+    def _compute_next_fire(self, after):
+        """First slot strictly after `after`, scanning today + tomorrow + +2d."""
+        mc = self._get_config().get("mail_call", {}) or {}
+        for offset in range(3):
+            day = (after + timedelta(days=offset)).date()
+            for s in self._slots_for_day(day, mc):
+                if s > after:
+                    return s
+        return None
+
+    def _find_entry(self):
+        cfg = self._get_config()
+        key = (cfg.get("mail_call", {}) or {}).get("bbs_key") or {}
+        if not key.get("callsign"):
+            return None
+        for e in cfg.get("bbs_list", []):
+            if (e.get("callsign", "").upper() == key.get("callsign", "")
+                and e.get("transport", "")    == key.get("transport", "")
+                and e.get("host", "")         == key.get("host", "")):
+                return e
+        return None
+
+    def _validate(self):
+        """
+        Return (entry, error_text). entry is None when Mail-Call cannot
+        currently fire (and error_text describes why for the status line).
+        """
+        cfg = self._get_config()
+        mc  = cfg.get("mail_call", {}) or {}
+        if not mc.get("enabled"):
+            return None, "Mail-Call: disabled"
+        entry = self._find_entry()
+        if entry is None:
+            return None, "Mail-Call: chosen BBS no longer in BBS List"
+        # Only RF requires responsibility acceptance — Telnet has no RF
+        # safety surface, so the scheduler does not gate Telnet fires on it.
+        if entry.get("transport") != "telnet":
+            if int(mc.get("responsibility_accepted_rf_version", 0)) \
+                    < SettingsDialog.MAILCALL_RESPONSIBILITY_VERSION:
+                return None, "Mail-Call: RF responsibility not accepted"
+        return entry, ""
+
+    def _refresh(self):
+        entry, err = self._validate()
+        if err:
+            self._next_fire = None
+            self._emit_status(err)
+            return
+        self._next_fire = self._compute_next_fire(self._now())
+        self._update_status()
+
+    def _tick(self):
+        # Re-validate on every tick — config or bbs_list may have changed
+        entry, err = self._validate()
+        if err:
+            self._next_fire = None
+            self._emit_status(err)
+            return
+
+        if self._next_fire is None:
+            self._next_fire = self._compute_next_fire(self._now())
+
+        now = self._now()
+        if self._next_fire is not None and now >= self._next_fire:
+            self._do_fire(entry)
+            # Compute the slot AFTER the one we just fired, so an immediate
+            # re-tick doesn't loop on the same time.
+            self._next_fire = self._compute_next_fire(self._next_fire + timedelta(minutes=1))
+        self._update_status()
+
+    def _do_fire(self, entry):
+        if self._is_busy():
+            self.sig_skipped.emit("manual session already active")
+            return
+        self.sig_fire.emit(entry)
+
+    # ── status text ───────────────────────────────────────────────
+
+    def _update_status(self):
+        if self._next_fire is None:
+            return   # _refresh already emitted the "disabled / not ready" text
+        now   = self._now()
+        delta = self._next_fire - now
+        secs  = max(0, int(delta.total_seconds()))
+        h, m  = divmod(secs // 60, 60)
+        tz    = (self._get_config().get("mail_call", {}) or {}).get("time_zone", "local")
+        tz_lbl = "UTC" if tz == "utc" else "Local"
+        time_str = self._next_fire.strftime("%H:%M")
+        self._emit_status(f"Next Mail-Call: {time_str} {tz_lbl}  (in {h}h {m:02d}m)")
+
+    def _emit_status(self, text):
+        if self._status_paused:
+            return
+        if text != self._last_status:
+            self._last_status = text
+            self.sig_status.emit(text)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2513,6 +3491,40 @@ class MainWindow(QMainWindow):
         # Apply saved font size to all text panes
         font_size = self.config.get("app", {}).get("font_size", 10)
         self._apply_font_size(font_size)
+
+        # Mail-Call !!! scheduler — fires Connect at configured times.
+        # is_busy uses btn_connect.isEnabled() since worker isn't cleared
+        # back to None on disconnect (see _on_disconnected).
+        self._mc_scheduler = MailCallScheduler(
+            get_config=lambda: self.config,
+            is_busy=lambda: not self.btn_connect.isEnabled(),
+            parent=self,
+        )
+        self._mc_scheduler.sig_fire.connect(self._mc_handle_fire)
+        self._mc_scheduler.sig_status.connect(self._mc_update_status)
+        self._mc_scheduler.sig_skipped.connect(self._mc_handle_skipped)
+        self._mc_scheduler.start()
+
+        # Mail-Call retry state. The scheduler fires sig_fire when a slot is
+        # due; the handler then runs a combined-budget retry loop that counts
+        # both channel-busy detections AND VARA connect-failures against a
+        # single MC_MAX_TRIES budget. A wall-clock MC_SLOT_DEADLINE_SECS cap
+        # rolls the slot over no matter what, preventing busy↔fail ping-pong.
+        self._mc_active_entry   = None   # presence = "Mail-Call owns this connect"
+        self._mc_tries_used     = 0      # combined attempt counter for current slot
+        self._mc_slot_deadline  = None   # datetime; stamped on first fire of slot
+        self._mc_retry_pending  = False  # countdown active between attempts
+        self._mc_retry_target   = None
+        self._mc_retry_deadline = None
+        # Stays True from the moment Mail-Call claims a slot through the
+        # full session lifecycle until _on_disconnected runs. Used by the
+        # bulletin path to bypass the selection dialog (unattended runs
+        # auto-download all new bulletins). _mc_active_entry is too narrow
+        # — it clears on connect success, before bulletins are even seen.
+        self._mc_session_owned  = False
+        self._mc_retry_timer = QTimer(self)
+        self._mc_retry_timer.setInterval(1000)   # 1s status countdown tick
+        self._mc_retry_timer.timeout.connect(self._mc_retry_tick)
 
     # ── Menu bar ──────────────────────────────────────────────────
 
@@ -2596,11 +3608,14 @@ class MainWindow(QMainWindow):
 
         vara_layout.addWidget(QLabel("  BW:"))
         self.bw_combo = QComboBox()
-        self.bw_combo.addItems(["500", "2300"])
-        self.bw_combo.setFixedWidth(62)
-        self.bw_combo.setToolTip("VARA HF bandwidth — must match the BBS node setting")
+        # Populated lazily by _toolbar_bw_set_for_mode — HF starts with
+        # 500/2300 kHz options, FM swaps in NARROW/WIDE when picked.
+        # Width fits "NARROW" + arrow without clipping.
+        self.bw_combo.setFixedWidth(110)
+        self.bw_combo.setToolTip("VARA bandwidth — must match the BBS node setting")
         self.bw_combo.currentTextChanged.connect(lambda bw: self._vara_set_bw(bw))
         vara_layout.addWidget(self.bw_combo)
+        self._toolbar_bw_set_for_mode("VARA HF", preferred="")
 
         self.tb_stack.addWidget(vara_panel)   # index 0
 
@@ -2759,6 +3774,14 @@ class MainWindow(QMainWindow):
         self._vara_info_label.setVisible(False)
         sb.addPermanentWidget(self._vara_info_label)
 
+        # Mail-Call status — "Next Mail-Call: 14:00 Local (in 1h 47m)" or
+        # "Mail-Call: disabled" / error text. Hidden when empty.
+        self._mc_status_label = QLabel("")
+        self._mc_status_label.setStyleSheet(
+            "color:#88aa88; font-size: 11px; padding: 0 6px;")
+        self._mc_status_label.setVisible(False)
+        sb.addPermanentWidget(self._mc_status_label)
+
         # Progress bar — fixed width, shown during operations
         self._prog_bar = QProgressBar()
         self._prog_bar.setTextVisible(True)
@@ -2822,11 +3845,43 @@ class MainWindow(QMainWindow):
             self.mode_combo.setCurrentText(mode_str)
             self.mode_combo.blockSignals(False)
             self.call_edit.setText(entry.get("callsign", ""))
-            self.bw_combo.setCurrentText(entry.get("bw", "500"))
-            self._vara_set_bw(entry.get("bw", "500"))
+            # Populate BW combo for the selected mode using the saved
+            # value when valid; the mode default otherwise.
+            saved_bw = entry.get("bw", "")
+            self._toolbar_bw_set_for_mode(mode_str, preferred=saved_bw)
+            self._vara_set_bw(self.bw_combo.currentText())
+
+    # VARA bandwidth dropdown options — mirrors _BBSEntryDialog so the
+    # toolbar and the entry dialog stay in sync. HF uses kHz numbers
+    # (BW500/BW2300 on the wire); FM uses bare NARROW/WIDE keywords.
+    _TB_VARA_BW = {
+        "VARA HF": (["500", "2300"], "500"),
+        "VARA FM": (["NARROW", "WIDE"], "NARROW"),
+    }
+
+    def _toolbar_bw_set_for_mode(self, mode_str: str, preferred: str = ""):
+        """Repopulate the toolbar BW combo for the given VARA mode.
+
+        preferred is the value to select if it's valid for the new mode
+        (e.g. the saved bw on a BBS entry); otherwise the previous combo
+        text is kept if still valid, else the mode default.
+        """
+        opts, default = self._TB_VARA_BW.get(mode_str, (["500", "2300"], "500"))
+        current = self.bw_combo.currentText()
+        pick = (preferred if preferred in opts else
+                current if current in opts else
+                default)
+        self.bw_combo.blockSignals(True)
+        self.bw_combo.clear()
+        self.bw_combo.addItems(opts)
+        self.bw_combo.setCurrentText(pick)
+        self.bw_combo.blockSignals(False)
 
     def _on_mode_changed(self, mode_str: str):
-        pass   # mode change within VARA panel — no visibility change needed
+        # Swap BW dropdown options when the user toggles HF vs FM in the
+        # toolbar. Don't push to VARA here — the bw_combo change signal
+        # fires _vara_set_bw on its own once the new value is selected.
+        self._toolbar_bw_set_for_mode(mode_str)
 
     def _on_save_bbs(self):
         is_telnet = (self.tb_stack.currentIndex() == 1)
@@ -2930,10 +3985,13 @@ class MainWindow(QMainWindow):
         if transport == "telnet":
             conn_desc = f"{entry['host']}:{entry['telnet_port']}"
         else:
-            mode_label = "VARA HF" if entry.get("vara_type") == "hf" else "VARA FM"
+            is_hf = (entry.get("vara_type") == "hf")
+            mode_label = "VARA HF" if is_hf else "VARA FM"
             freq = entry.get("freq", "")
-            bw   = entry.get("bw", "500")
-            conn_desc = f"{mode_label}  {freq}  BW{bw}".strip()
+            bw   = entry.get("bw", "500" if is_hf else "NARROW")
+            # HF prints as "BW500"/"BW2300"; FM prints the keyword as-is.
+            bw_label = f"BW{bw}" if is_hf else str(bw).upper()
+            conn_desc = f"{mode_label}  {freq}  {bw_label}".strip()
 
         self._set_status(f"Connecting to {entry['callsign']}  ({conn_desc})...", connecting=True)
         self.terminal.append(
@@ -3027,14 +4085,28 @@ class MainWindow(QMainWindow):
         transport  = entry.get("transport", "")
         if transport == "telnet":
             detail = entry.get("host", "")
-        else:
+        elif transport == "vara_hf":
             bw = entry.get("bw", "500")
-            detail = f"VARA HF  BW{bw}" if transport == "vara_hf" else f"VARA FM  BW{bw}"
+            detail = f"VARA HF  BW{bw}"
+        else:
+            # VARA FM — bw is a bare keyword ("NARROW"/"WIDE"), no prefix
+            bw = entry.get("bw", "NARROW")
+            detail = f"VARA FM  {str(bw).upper()}"
         self._set_status(
             f"Connected  ·  {entry['callsign']}  ({detail})",
             connected=True)
         self.btn_refresh.setEnabled(True)
         self.terminal.set_connected(True)
+
+        # If Mail-Call owns this slot, the connect succeeded — clear all
+        # retry state so the scheduler returns to normal "Next Mail-Call: …"
+        # status. The session itself proceeds (mail check, disconnect) just
+        # like a manual connect from here on.
+        if self._mc_active_entry is not None:
+            self._on_log(
+                f"[SCHED] Mail-Call: connected on try "
+                f"{self._mc_tries_used}/{self.MC_MAX_TRIES} — slot complete")
+            self._mc_end_retry()
 
     def _check_outbox_for_terminal(self):
         """In Terminal/Debug view with no mail check running, still notify
@@ -3262,6 +4334,10 @@ class MainWindow(QMainWindow):
         # Mark that we just disconnected — _on_connect will apply
         # a longer VARA reset delay if this was a remote disconnect
         self._last_disconnect_time = __import__("time").time()
+        # Mail-Call session (if any) is now over — any subsequent connect
+        # from the toolbar must be treated as manual until the scheduler
+        # claims another slot.
+        self._mc_session_owned = False
         # Reclaim the VaraControl socket for pre-session BW commands
         self._vara_ctrl.open()
 
@@ -3383,7 +4459,17 @@ class MainWindow(QMainWindow):
         self._set_status(f"Error: {msg}", connected=False)
         self.terminal.append(f"\n[ERROR] {msg}\n", "#ff4444")
         self.debug_view.append(f"\n[ERROR] {msg}\n", "#ff4444")
-        QMessageBox.critical(self, "Connection Error", msg)
+
+        # If Mail-Call owns this attempt, suppress the modal popup (it would
+        # block unattended operation) and trigger a retry — or roll over if
+        # the budget/deadline is exhausted. The 8-sec VARA recovery still
+        # runs; by the time the retry fires (~3 min later) btn_connect is
+        # long since re-enabled.
+        if self._mc_active_entry is not None:
+            self._mc_handle_connect_failure(msg)
+        else:
+            QMessageBox.critical(self, "Connection Error", msg)
+
         # Give VARA a moment to reset its TCP listener before allowing reconnect
         # and reclaiming VaraControl — a failed RF connect can take ~10-15s to recover
         self.terminal.append("[SYS] Waiting for VARA to reset…\n", "#888888")
@@ -3561,6 +4647,15 @@ class MainWindow(QMainWindow):
         pending = self.db.get_pending_outbox()
         if pending:
             self.mail_view.enable_send_outbox(True)
+            # Mail-Call session: auto-send without prompting — same
+            # premise as the bulletin bypass (unattended overnight run).
+            if self._mc_session_owned:
+                auto_line = (f"[OUTBOX] Mail-Call session — auto-sending "
+                             f"{len(pending)} message(s).\n")
+                self.terminal.append(auto_line, "#aaffff")
+                self.debug_view.append(auto_line, "#aaffff")
+                self._on_send_outbox()
+                return
             r = QMessageBox.question(
                 self, "Outbox",
                 f"{len(pending)} message(s) waiting in outbox — send now?",
@@ -3640,6 +4735,21 @@ class MainWindow(QMainWindow):
         bbs_id = (f"{self.config.get('user',{}).get('callsign','NOCALL').upper()}"
                   f"@{self._get_active_bbs_entry().get('callsign','')}")
 
+        # Mail-Call session: skip the selection dialog and auto-download
+        # every new bulletin. Premise (see Mail-Call design): a station
+        # running scheduled connects stays current, so the unattended
+        # batch is small. Forcing a user-input dialog would stall the
+        # session forever overnight.
+        if self._mc_session_owned:
+            auto_line = (f"[BULL] Mail-Call session — auto-selecting all "
+                         f"{total} bulletin(s), no dialog.\n")
+            self.terminal.append(auto_line, "#aaffff")
+            self.debug_view.append(auto_line, "#aaffff")
+            self._set_status(
+                f"Downloading {total} bulletin(s)…", connected=True)
+            self.worker.do_download_bulletins(bulletins_by_cat)
+            return
+
         dlg = BulletinSelectDialog(bulletins_by_cat,
                                    link_bps=link_bps, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -3681,6 +4791,16 @@ class MainWindow(QMainWindow):
         pending = self.db.get_pending_outbox()
         if pending:
             self.mail_view.enable_send_outbox(True)
+            # Mail-Call session: same premise as the bulletin bypass — the
+            # session is unattended, so prompting for "send now?" would
+            # stall forever. Auto-send the queued outbox messages.
+            if self._mc_session_owned:
+                auto_line = (f"[OUTBOX] Mail-Call session — auto-sending "
+                             f"{len(pending)} message(s).\n")
+                self.terminal.append(auto_line, "#aaffff")
+                self.debug_view.append(auto_line, "#aaffff")
+                self._on_send_outbox()
+                return
             r = QMessageBox.question(
                 self, "Outbox",
                 f"{len(pending)} message(s) waiting in outbox — send now?",
@@ -3973,9 +5093,266 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(f"QtC - {mycall}" if mycall else "QtC")
             # Apply font size immediately — no restart needed
             self._apply_font_size(self.config.get("app", {}).get("font_size", 10))
+            # Reload Mail-Call config (schedule/bbs_key/enabled may have changed)
+            self._mc_scheduler.refresh()
             QMessageBox.information(self, "Settings Saved",
                 f"Settings saved to {_CONFIG_PATH}.\n"
                 "Reconnect to apply any connection changes.")
+
+    # ── Mail-Call !!! scheduler handlers ──────────────────────────
+
+    # Mail-Call retry tunables. The combined budget covers both channel-busy
+    # detections and VARA connect-failures — every attempt of either kind
+    # burns one credit. The slot deadline is a wall-clock safety net that
+    # overrides the counter if anything keeps the slot active too long
+    # (e.g. ping-pong between busy and connect-fail conditions).
+    MC_RETRY_SECONDS      = 180    # 3 minutes between attempts (busy or fail)
+    MC_MAX_TRIES          = 5      # combined budget per slot (busy + connect-fail)
+    MC_SLOT_DEADLINE_SECS = 1200   # 20-minute wall-clock cap per slot
+
+    def _mc_handle_fire(self, entry: dict):
+        """
+        Triggered by MailCallScheduler when a scheduled slot is crossed.
+
+        Stamps per-slot state (_mc_active_entry, _mc_slot_deadline) and
+        delegates to _mc_attempt_vara_fire on VARA transports. The combined
+        retry budget (busy + connect-fail) and the wall-clock deadline are
+        enforced inside that method. Telnet has no busy/RF failure modes
+        and fires directly.
+
+        Note: sig_log lives on SessionWorker, NOT on MainWindow. We log
+        directly via self._on_log(...).
+        """
+        if not self.btn_connect.isEnabled():
+            self._on_log("[SCHED] Skipped — manual session already active")
+            return
+
+        # New slot — claim ownership and stamp the wall-clock deadline.
+        # _mc_active_entry being set tells _on_error/_on_connected that
+        # Mail-Call (not the user) initiated this connect attempt.
+        self._mc_active_entry  = entry
+        self._mc_tries_used    = 0
+        self._mc_slot_deadline = (
+            datetime.now() + timedelta(seconds=self.MC_SLOT_DEADLINE_SECS))
+        # Survives the connect-success clear of _mc_active_entry so the
+        # rest of the session (mail download, bulletin check, outbox,
+        # disconnect) knows it ran unattended.
+        self._mc_session_owned = True
+
+        transport = entry.get("transport", "")
+        if transport in ("vara_hf", "vara_fm"):
+            self._mc_attempt_vara_fire(entry)
+        else:
+            # Telnet — no RF retry concept, fire and let _on_connected
+            # clear the slot state.
+            self._mc_tries_used = 1
+            self._mc_do_connect(entry)
+
+    def _mc_attempt_vara_fire(self, entry: dict):
+        """
+        Make a VARA Mail-Call attempt. Order of checks:
+
+          1. Wall-clock slot deadline — rolls over if exceeded, no matter
+             what the counter says (this is the ping-pong safety net).
+          2. Combined try budget (busy + connect-fail) — rolls over if
+             MC_MAX_TRIES has already been spent.
+          3. Channel busy (VaraControl DCD) — burns one credit, schedules
+             a +MC_RETRY_SECONDS retry. RF politeness on top of VARA's own
+             internal channel-clear wait.
+          4. Clear — burns one credit and fires the connect. A connect-fail
+             later triggers another retry via _on_error, which calls
+             _mc_handle_connect_failure.
+
+        Counter rule: every attempt of either kind (busy detection OR a
+        fired connect) burns one credit. This makes it mathematically
+        impossible for a busy/fail bounce to extend the slot indefinitely.
+        """
+        # 1. Wall-clock safety net
+        if (self._mc_slot_deadline
+                and datetime.now() >= self._mc_slot_deadline):
+            self._on_log(
+                f"[SCHED] Mail-Call: slot window "
+                f"({self.MC_SLOT_DEADLINE_SECS // 60} min) expired — "
+                f"rolling over to next slot")
+            self._mc_end_retry()
+            return
+
+        # 2. Budget exhausted
+        if self._mc_tries_used >= self.MC_MAX_TRIES:
+            self._on_log(
+                f"[SCHED] Mail-Call: retry budget exhausted "
+                f"({self._mc_tries_used}/{self.MC_MAX_TRIES}) — "
+                f"rolling over to next slot")
+            self._mc_end_retry()
+            return
+
+        # 3. Channel busy — increment and schedule retry
+        if self._vara_ctrl.is_busy():
+            self._mc_tries_used += 1
+            self._on_log(
+                f"[SCHED] Mail-Call: channel busy "
+                f"(try {self._mc_tries_used}/{self.MC_MAX_TRIES}) — "
+                f"retry in {self.MC_RETRY_SECONDS // 60} minutes")
+            self._mc_schedule_retry(entry)
+            return
+
+        # 4. Clear — increment and fire
+        self._mc_tries_used += 1
+        if self._mc_tries_used > 1:
+            self._on_log(
+                f"[SCHED] Mail-Call: try {self._mc_tries_used}/"
+                f"{self.MC_MAX_TRIES}, firing connect")
+        self._mc_do_connect(entry)
+
+    def _mc_schedule_retry(self, entry: dict):
+        """Arm the +MC_RETRY_SECONDS countdown for the next attempt. Shared
+        by the busy path (in _mc_attempt_vara_fire) and the connect-fail
+        path (in _mc_handle_connect_failure) — they use the same interval
+        so there's only one knob to tune."""
+        self._mc_retry_pending  = True
+        self._mc_retry_target   = entry
+        self._mc_retry_deadline = (
+            datetime.now() + timedelta(seconds=self.MC_RETRY_SECONDS))
+        self._mc_scheduler.set_status_paused(True)
+        if not self._mc_retry_timer.isActive():
+            self._mc_retry_timer.start()
+        self._mc_retry_tick()   # show countdown immediately
+
+    def _mc_retry_tick(self):
+        """1-second tick between Mail-Call attempts — update the status bar
+        countdown and re-fire when the deadline hits."""
+        if not self._mc_retry_pending:
+            self._mc_retry_timer.stop()
+            return
+
+        # Cancel if external state makes the retry moot
+        mc = self.config.get("mail_call", {}) or {}
+        if not mc.get("enabled"):
+            self._on_log("[SCHED] Mail-Call: cancelled retry — "
+                         "feature disabled")
+            self._mc_end_retry()
+            return
+
+        # btn_connect goes False both when the user clicks Connect AND when
+        # VARA is recovering from our own failed attempt. _mc_active_entry
+        # being set tells us the slot is still ours — only treat the disabled
+        # button as a "manual session" if Mail-Call no longer owns the slot.
+        if (not self.btn_connect.isEnabled()
+                and self._mc_active_entry is None):
+            self._on_log("[SCHED] Mail-Call: cancelled retry — "
+                         "manual session active")
+            self._mc_end_retry()
+            return
+
+        now = datetime.now()
+        if now >= self._mc_retry_deadline:
+            target = self._mc_retry_target
+            self._mc_retry_pending = False
+            self._mc_attempt_vara_fire(target)
+        else:
+            remaining = self._mc_retry_deadline - now
+            secs = max(0, int(remaining.total_seconds()))
+            m, s = divmod(secs, 60)
+            self._mc_status_label.setText(
+                f"Mail-Call: retry "
+                f"{self._mc_tries_used}/{self.MC_MAX_TRIES} "
+                f"in {m}:{s:02d}")
+            self._mc_status_label.setVisible(True)
+
+    def _mc_end_retry(self):
+        """Tear down all Mail-Call slot/retry state and let the scheduler
+        resume its normal Next-Mail-Call countdown. Called on slot success
+        (in _on_connected), on roll-over (deadline or budget exhausted),
+        and on cancellation (feature disabled, manual session)."""
+        # If we never got connected (i.e. abandoning the slot), clear the
+        # session-owned flag too — there's no _on_disconnected coming to
+        # do it. When called from _on_connected, btn_connect is disabled
+        # (we're live) so the flag stays set for the rest of the session.
+        if self.btn_connect.isEnabled():
+            self._mc_session_owned = False
+        self._mc_active_entry   = None
+        self._mc_tries_used     = 0
+        self._mc_slot_deadline  = None
+        self._mc_retry_pending  = False
+        self._mc_retry_target   = None
+        self._mc_retry_deadline = None
+        self._mc_retry_timer.stop()
+        self._mc_scheduler.set_status_paused(False)
+        self._mc_scheduler.refresh()
+
+    def _mc_handle_connect_failure(self, msg: str):
+        """Called from _on_error when Mail-Call owns the failed connect.
+
+        The try counter was already incremented inside _mc_attempt_vara_fire
+        before the connect was fired, so it already reflects this attempt.
+        Check the deadline and budget, then either schedule the next retry
+        or roll over to the next slot.
+        """
+        entry = self._mc_active_entry
+        if entry is None:
+            return   # defensive — shouldn't be called outside an MC slot
+
+        # Always log the failure with the current counter
+        self._on_log(
+            f"[SCHED] Mail-Call: connect failed "
+            f"(try {self._mc_tries_used}/{self.MC_MAX_TRIES}) — {msg}")
+
+        # Wall-clock deadline beats counter
+        if (self._mc_slot_deadline
+                and datetime.now() >= self._mc_slot_deadline):
+            self._on_log(
+                f"[SCHED] Mail-Call: slot window expired after connect-fail "
+                f"— rolling over to next slot")
+            self._mc_end_retry()
+            return
+
+        # Budget exhausted
+        if self._mc_tries_used >= self.MC_MAX_TRIES:
+            self._on_log(
+                f"[SCHED] Mail-Call: retry budget exhausted after connect-fail "
+                f"({self._mc_tries_used}/{self.MC_MAX_TRIES}) — "
+                f"rolling over to next slot")
+            self._mc_end_retry()
+            return
+
+        # Schedule next attempt
+        self._on_log(
+            f"[SCHED] Mail-Call: retrying in "
+            f"{self.MC_RETRY_SECONDS // 60} minutes "
+            f"(next try {self._mc_tries_used + 1}/{self.MC_MAX_TRIES})")
+        self._mc_schedule_retry(entry)
+
+    def _mc_do_connect(self, entry: dict):
+        """Final step — select the right BBS-combo entry, fire Connect."""
+        want = (entry.get("callsign", "").upper(),
+                entry.get("transport", ""),
+                entry.get("host", ""))
+        matched_idx = -1
+        for i in range(self.bbs_combo.count()):
+            e = self.bbs_combo.itemData(i) or {}
+            if (e.get("callsign", "").upper(),
+                e.get("transport", ""),
+                e.get("host", "")) == want:
+                matched_idx = i
+                break
+        if matched_idx < 0:
+            self._on_log("[SCHED] Skipped — chosen BBS no longer in list")
+            return
+
+        self.bbs_combo.setCurrentIndex(matched_idx)
+        self._on_log(
+            f"[SCHED] Mail-Call firing → {entry.get('callsign','?')} "
+            f"via {entry.get('transport','?')}")
+        self._on_connect()
+
+    def _mc_update_status(self, text: str):
+        """Show/hide and update the Mail-Call status label in the status bar."""
+        self._mc_status_label.setText(text)
+        self._mc_status_label.setVisible(bool(text))
+
+    def _mc_handle_skipped(self, reason: str):
+        """Scheduler reported a skipped fire — log it to the Debug view."""
+        self._on_log(f"[SCHED] Skipped — {reason}")
 
     def _on_about(self):
         QMessageBox.about(self, "About QtC",
@@ -4024,6 +5401,10 @@ class MainWindow(QMainWindow):
         self.conn_light.setStyleSheet(f"color:{color}; font-size:18px;")
 
     def closeEvent(self, event):
+        # Stop the Mail-Call scheduler so its QTimer doesn't keep ticking
+        # during the shutdown teardown.
+        if hasattr(self, "_mc_scheduler"):
+            self._mc_scheduler.stop()
         # Clean up worker whether connected or mid-connect
         if self.worker:
             if self.worker.session:
@@ -4079,16 +5460,6 @@ def _apply_dark_palette(app):
 
 
 def main():
-    # Dismiss PyInstaller's bootloader splash (no-op when running from
-    # source — pyi_splash only exists inside a frozen exe built with the
-    # Splash() block in QtC.spec). Closing it now lets our in-Python
-    # QSplashScreen take over without a visible flash.
-    try:
-        import pyi_splash   # type: ignore
-        pyi_splash.close()
-    except ImportError:
-        pass
-
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.wayland*=false")
     app = QApplication(sys.argv)
     app.setApplicationName("QtC")
@@ -4102,9 +5473,11 @@ def main():
     except Exception:
         pass   # if config can't be read yet, default light mode is fine
 
-    # Resolve resource paths — works both as a script and as a frozen exe
+    # Resolve resource paths — works both as a script and as a frozen exe.
+    # PyInstaller 6 one-folder layout puts datas in _internal/ (sys._MEIPASS),
+    # not next to the exe — fall through to that if present.
     if getattr(sys, 'frozen', False):
-        _base = os.path.dirname(sys.executable)
+        _base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
     else:
         _base = os.path.dirname(os.path.abspath(__file__))
 
@@ -4114,13 +5487,13 @@ def main():
         from PyQt6.QtGui import QIcon
         app.setWindowIcon(QIcon(_icon_path))
 
-    # Splash screen — shown while MainWindow constructs. The PNG is
-    # generated by make_splash.py at install time. We don't gate this
-    # behind sys.platform since a quick splash on Linux source-runs is
-    # nice polish; if the file's missing we just skip silently.
-    SPLASH_MIN_SECONDS = 3.0   # tune to taste; minimum visible time
+    # Splash screen — shown while MainWindow constructs, then dismissed as
+    # soon as the main window paints. No forced minimum hold; the splash
+    # lives exactly as long as MainWindow takes to build. On Windows that's
+    # ~5s of continuous splash; on Linux source-runs it's a brief flash,
+    # which is acceptable for the dev path. PNG is generated by
+    # make_splash.py at install/build time; if missing we just skip.
     splash = None
-    splash_shown_at = None
     _splash_path = os.path.join(_base, "qtc_splash.png")
     if os.path.exists(_splash_path):
         pm = QPixmap(_splash_path)
@@ -4128,19 +5501,10 @@ def main():
             splash = QSplashScreen(pm, Qt.WindowType.WindowStaysOnTopHint)
             splash.show()
             app.processEvents()
-            splash_shown_at = time.monotonic()
 
     win = MainWindow()
     win.show()
     if splash is not None:
-        # Hold splash for at least SPLASH_MIN_SECONDS so it doesn't flash
-        # by on fast machines. processEvents() keeps Qt repainting while
-        # we wait — without it the splash freezes mid-paint.
-        if splash_shown_at is not None:
-            deadline = splash_shown_at + SPLASH_MIN_SECONDS
-            while time.monotonic() < deadline:
-                app.processEvents()
-                time.sleep(0.03)
         splash.finish(win)
 
     # First-run check — if no real callsign set, open settings immediately

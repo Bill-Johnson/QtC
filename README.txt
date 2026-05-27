@@ -14,26 +14,81 @@ Developed by Bill Johnson KC9MTP — Valparaiso, Indiana.
 
 Features
 
-- VARA HF / VARA FM — RF connect with busy-channel detection and PTT control
-- Telnet — for local testing and LAN-connected nodes; auto-disconnects after mail check
-- Mail check — LM with new-only (PN) or full (PN+PY) options
-- Auto-download — new personal mail downloads automatically on connect
-- Bulletins — subscribe to categories (SITREP, EWN, WX, etc.); browse in folder panel
+Transports
+- VARA HF — RF mail and file transfer with busy-channel detection, PTT
+  keying, and live link stats (bitrate, SN, bandwidth) in the status bar
+- VARA FM — packet-voice frequencies with NARROW / WIDE bandwidth control;
+  same UI as HF
+- Telnet — LAN / internet nodes for local testing; auto-disconnects after
+  the mail check completes
+- PTT — RTS or DTR via serial port; defensive flow-control flags for
+  Digirig / CP2105 setups
+
+Mail
+- Watermark-based check — first connect pulls a short tail (LL N), returning
+  connects pull only new messages (L watermark-); only personal mail
+  addressed to your callsign is auto-downloaded — never sysop chatter or
+  system traffic
+- Auto-download of new personal mail on every connect
 - Compose & reply — personal (P) and bulletin (B) message types
-- Outbox queue — stage messages, send in one batch when connected
-- Address book — auto-fill in compose, use-count ranked dropdown
-- Multi-select delete — Ctrl+click or Shift+click to select and delete multiple messages
-- Message search — real-time filter with scope dropdown and amber highlight in preview
-- Progress tracking — download and send progress in toolbar and status bar
-- VARA link stats — live bitrate, SN, and bandwidth in status bar
-- Terminal view — clean dumb terminal for manual BBS commands
-- Debug view — verbose session log for troubleshooting
+- Outbox queue — stage messages offline, send in one batch when connected,
+  with per-message send-now and @BBS-only filters
+- Hierarchical addressing (HA) — full support for routed addresses
+  (e.g. KC9MTP.#NWIN.IN.USA.NOAM) in My Station, the address book,
+  and Compose
+
+Bulletins
+- Subscribe by category (SITREP, EWN, WX, BDN, ...); browse in the
+  folder tree
+- Selection dialog with size estimates — prune before pulling over slow RF
+- First-visit backlog management — only the 2 newest bulletins per
+  category are kept on a new install; skipped bulletins are tombstoned
+  and never reappear
+- 120-day tombstone cleanup on every launch
+
+Mail-Call !!! — scheduled unattended sessions
+- Once daily, twice daily, three-times daily, every N hours, or custom
+  times (Local or UTC)
+- Auto-connects at slot times — no human in the loop
+- Skips selection dialogs, auto-pulls all new bulletins, auto-sends
+  queued outbox
+- 2-hour minimum guardrail; refuses to enable until your Home BBS has
+  been visited at least once so the first unattended fire isn't a
+  giant backlog
+
+YAPP file transfer (RF)
+- Pull files from the BBS files area using the WA7MBL YAPP protocol
+  over VARA HF / FM
+- Stall-watchdog tuned for weak HF — no premature aborts at 61 bps
+- Clean abort path — won't leave the BBS transmitting into the
+  terminal log
+- Files saved to ~/.local/share/qtc/downloads/ (Linux) or
+  %APPDATA%\qtc\downloads\ (Windows)
+
+Address Book
+- HA-aware contact list — callsign, name, city/state, Home BBS, send mode
+- Auto-fill in Compose; use-count ranked dropdown
+- One-click "+save to address book" link in the Compose dialog
+
+UI / UX
+- Three-pane main window — folder tree, message list, preview pane
 - Folder badges — Inbox (N new), Outbox (N), Bulletins (N new)
-- Mark all read — one-click bulk read in inbox
+- Message search — real-time filter with scope dropdown and amber
+  highlight in preview
+- Multi-select delete — Ctrl+click or Shift+click to act on multiple
+  messages or bulletins
+- Mark All Read — one-click bulk read in the inbox
+- Terminal view — clean dumb terminal for manual BBS commands, with a
+  YAPP file-download button
+- Debug view — verbose session log with a "Save Log..." export for
+  capturing RF transfer traces
 - Dark mode — full Fusion dark palette, toggled in Settings -> App
-- Font size — adjustable message font with live preview
-- PTT control — RTS or DTR via serial port
-- Cross-platform — Linux, Windows 11, Raspberry Pi OS
+- Adjustable message font with live preview
+- Splash screen during launch
+
+Cross-platform
+- Linux, Windows 11, Raspberry Pi OS
+- Windows ships as a standalone .exe — no Python required
 
 ------------------------------------------------------------------------
 
@@ -59,6 +114,14 @@ Raspberry Pi 4 / 5 (Raspberry Pi OS Bookworm)
   cd QtC-<version>-beta
   ./install.sh
 
+If ./install.sh reports "Permission denied" (or sudo ./install.sh says
+"command not found"), the script lost its executable bit during the file
+copy — common when files are transferred via FAT/exFAT USB sticks, scp
+without -p, or pasted into a new file in an editor. Restore it with:
+
+  chmod +x install.sh uninstall.sh
+  ./install.sh
+
 Once installed, launch QtC from your applications menu or type qtc in a terminal.
 
 Pi notes:
@@ -77,8 +140,17 @@ Linux (Fedora / Ubuntu / Debian)
   cd QtC-<version>-beta
   ./install.sh
 
-The installer checks all five source files, installs dependencies, and places
-a qtc launcher in /usr/local/bin/. Config and messages are preserved on reinstall.
+If ./install.sh reports "Permission denied" (or sudo ./install.sh says
+"command not found"), the script lost its executable bit during the file
+copy — common when files are transferred via FAT/exFAT USB sticks, scp
+without -p, or pasted into a new file in an editor. Restore it with:
+
+  chmod +x install.sh uninstall.sh
+  ./install.sh
+
+The installer verifies the five Python source files, regenerates the splash
+image with make_splash.py, installs dependencies, and places a qtc launcher
+in /usr/local/bin/. Config and messages are preserved on reinstall.
 
 To run manually without installing:
   pip install -r requirements.txt --break-system-packages
@@ -167,25 +239,153 @@ To force a full bulletin re-download:
 
 Source Files
 
-  main_window.py  — GUI: PyQt6 main window, toolbar, mail view, terminal, dialogs
-  bbs_session.py  — BBS login, mail check, message download and send
+  main_window.py  — GUI: PyQt6 main window, toolbar, mail view, terminal,
+                    dialogs, Mail-Call scheduler
+  bbs_session.py  — BBS login, mail check, message download / send,
+                    YAPP file transfer
   transport.py    — VARA HF, VARA FM, and Telnet transports
+                    (single-reader pattern)
   ptt.py          — PTT control via serial RTS/DTR
-  database.py     — SQLite inbox/outbox/sent/bulletins/contacts
+  database.py     — SQLite: inbox, outbox, sent, bulletins, watermarks,
+                    contacts
+  make_splash.py  — Pillow generator for qtc_splash.png — version-stamped
+                    at install/build time
 
 ------------------------------------------------------------------------
 
 Known Limitations (Beta)
 
 - No rig control yet — set frequency manually on your radio
-- VARA FM support in code but not yet field tested
+- YAPP upload not yet implemented (download only)
+- YAPP over Telnet is unreliable — RF paths (VARA HF / VARA FM) are the
+  supported transport for file transfer
 - Direwolf and Soundmodem transports planned for a future release
-- Windows exe available as a separate release asset — no Python required (see releases page)
+- Windows exe available as a separate release asset — no Python required
+  (see releases page)
 - install.ps1 remains available for users who prefer running from source
 
 ------------------------------------------------------------------------
 
 Changelog
+
+0.13.2-beta (2026-05-24)
+- Added: Mail-Call auto-downloads bulletins without the selection dialog
+  — when a Mail-Call slot fires, the bulletin selection dialog is
+  skipped and every new bulletin is pulled in one batch. The dialog
+  was added so users could prune large bulk pulls over slow VARA, but
+  a station running scheduled Mail-Call slots is already staying
+  current, so the unattended batch is small. Manual Connect flow is
+  unchanged — dialog still appears so the user can prune. Log line
+  "[BULL] Mail-Call session — auto-selecting all N bulletin(s)" shows
+  what happened.
+- Added: Mail-Call auto-sends outbox without the "send now?" prompt —
+  both prompt locations skip the QMessageBox when the session is owned
+  by Mail-Call. Per-message send_now and at_bbs filters are still
+  honored, so the unattended path inherits the right behavior for
+  free. Log line "[OUTBOX] Mail-Call session — auto-sending N
+  message(s)" shows what was sent.
+- Added: Mail-Call refuses to enable until Home BBS is visited at
+  least once — checks visited_bbs for any MYCALL@HOMECALL key
+  matching the Home BBS base callsign. If none exists, an info dialog
+  explains that the user must Connect from the toolbar once first so
+  QtC learns the mailbox watermark and current bulletin baseline.
+  Prevents Mail-Call's first unattended fire from ingesting the
+  entire mailbox over RF.
+- Added: BBS List table redesigned with 8 type-grouped columns
+  (Type | Name | Callsign | Freq | BW | Host | Port | Notes) —
+  em-dash placeholders show "not applicable" for the inactive
+  transport's cells (Host/Port on VARA rows; Freq/BW on Telnet rows).
+  Sortable headers. Visually unambiguous which fields belong to which
+  transport — no more empty Host cells on VARA entries leaving new
+  packet users confused.
+- Added: VARA FM bandwidth support — the BBS entry dialog and the
+  toolbar's BW combo now swap their options based on VARA mode: HF
+  shows 500 / 2300 (kHz), FM shows NARROW / WIDE. The transport
+  layer sends the correct wire command (BW500 / BW2300 for HF; bare
+  NARROW / WIDE for FM). The pre-session BW push also works for FM.
+- Fixed: Address Book dialog opened too narrow — Home BBS column
+  truncated full hierarchical addresses, Edit/Delete buttons were
+  partially clipped. Default size bumped from 560x480 to 880x480
+  minimum / 960x560 opened. Home BBS column 160->230, Send Mode
+  90->110, action column 110->140. Full HA addresses like
+  KC9MTP.#NWIN.IN.USA.NOAM now display without horizontal scrolling.
+- Fixed: Settings -> BBS List opened too narrow to show all 8
+  columns — BW chopped "NARROW" to "NAR...", Notes header chopped to
+  "Nc", horizontal scrollbar appeared on every open. Settings dialog
+  minimum 640->820, default open 740->900. BW 60->90 (fits NARROW),
+  Host 160->130, Port 58->75. Users no longer have to resize on
+  every Settings open.
+- Fixed: FM Bandwidth dropdown clipped "NARROW" in the BBS Entry
+  dialog and toolbar — both combos widened (dialog 90->120, toolbar
+  86->110) so the keyword + dropdown arrow render without overlap.
+- Fixed: Connection status banner printed "BWNARROW" / "BWWIDE" for
+  VARA FM — branched on vara_type so HF prints BW500/BW2300 and FM
+  prints the bare keyword.
+
+0.13.1-beta (2026-05-19)
+- Fixed: New-user registration skipped on LinBPQ BBSes that use ">" as
+  the Name-prompt terminator — _handle_registration bailed out whenever
+  the banner ended in ">", treating it as "already at main BBS prompt."
+  But LinBPQ 6.0.25.16 sends "Please enter your Name\r>" with ">" as
+  the input-waiting indicator (not ":"). New users got dropped to a
+  normal command prompt, then hit Unknown command errors when QtC
+  issued LL 20. Bail-out check now requires the actual main prompt
+  "de <callsign>>" at the end of the banner, so bare-">" registration
+  prompts fall through to keyword matching and the Name/QTH/Zip/Home
+  values from My Station settings get auto-sent. Reported 2026-05-19
+  by Bill testing K2ROG -> KC9MTP-1 over VARA HF.
+- Fixed: Ghost lines, leading-character drops, and duplicate output in
+  Terminal View — both transports had two threads independently calling
+  recv() on the same socket (the background streamer and the foreground
+  _expect()). Whichever won got the bytes the other couldn't see,
+  producing all three symptoms: duplicate banners, fragments like
+  "stcode using qth and zip commands." with the "Po" prefix missing, and
+  mid-line breaks across PTT turnarounds. Rewrote both transports as
+  single-reader: one reader thread owns recv() on the data socket and
+  the rest of the code (read_until, read_raw_bytes, flush_input)
+  consumes from a shared lock-protected buffer. _expect() no longer
+  double-logs while terminal mode is on. Line emission now flushes only
+  on real terminators (\r, \n, >, :, ?), so an RF-frame split inside a
+  line is reassembled instead of printed in pieces.
+
+0.12.1-beta (2026-05-15)
+- Fixed: YAPP downloads bailing mid-file on weak HF — the per-block read
+  used a fixed 20s timeout, structurally too short at 61 bps (a 234-byte
+  block needs ~30s pure transmit time before ARQ retries). Replaced with
+  a stall-watchdog that keeps reading as long as bytes are arriving and
+  gives up only after 30s of true silence (hard ceiling 300s/block).
+  Reported by Adam KJ5MIW on 2026-05-12 pulling BDN_Short_Center.mdf.
+- Fixed: YAPP abort left BBS transmitting the rest of the file into the
+  terminal log — when the receiver gave up mid-transfer, it raised
+  IOError without telling the sender. The BBS kept transmitting; the
+  remaining file bytes appeared as [RX] text once terminal mode
+  re-engaged. Receiver now sends CN (Cancel — proper [CAN][len][reason]
+  form per WA7MBL RFC v1.1) and drains the wire to silence before
+  re-raising, so the BBS prompt arrives cleanly.
+- Fixed: New-user registration sent bare values to LinBPQ — QTH, ZIP,
+  and HOME are dual-purpose commands in the BPQ user database (bare =
+  query the stored value, with arg = set it). QtC was sending raw
+  values like "Valparaiso, IN", which BPQ rejected as unknown commands.
+  Registration now sends the prefixed form (QTH Valparaiso, IN, ZIP
+  46383, HOME KC9MTP); the name prompt remains a bare value.
+- Fixed: PTT silently failed to open the serial port — PTTController.open()
+  swallowed serial.Serial exceptions and left _ser = None, and neither
+  Test PTT nor the connect path checked whether the open had actually
+  succeeded. Users would watch the waterfall transmit with no PTT keying
+  and no error. Added PTTController.is_open and last_error; both call
+  sites now surface the underlying exception (QMessageBox for Test PTT,
+  [PTT] *** log line + error signal for the connect path) with the hint
+  "this port may be open in Vara Terminal or another app — close it and
+  reconnect." Reported by Adam KJ5MIW on 2026-05-14 (Panasonic FZ-G1 +
+  Digirig CP2105).
+- Changed: PTT settings dialog hint — now explicitly warns that only one
+  program can hold the serial port at a time, and that on CP2105
+  dual-port devices (some Digirig models) PTT is on the Standard port,
+  not the Enhanced port.
+- Changed: Defensive pyserial flags — PTTController.open() now passes
+  rtscts=False, dsrdtr=False, xonxoff=False so pyserial doesn't
+  auto-toggle RTS/DTR as flow control on driver versions that do so by
+  default.
 
 0.12.0-beta (2026-05-07)
 - Added: Splash screen — shown both by the PyInstaller bootloader
