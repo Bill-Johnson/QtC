@@ -183,13 +183,32 @@ Then re-copy the 9 source files from the USB stick / repo and go back to Step 2.
 
 ## Branch Notes
 
-`BUILD_WINDOWS.md` and `QtC.spec` live on the `windows` branch only.
-All `.py` source files are identical to `main`.
-To update after a new `main` release:
+This doc lives on **both** `main` and `windows` so a fresh clone of `main`
+can find it. `QtC.spec` lives on the `windows` branch only — that's where
+PyInstaller actually runs.
+
+To build a new release on the HP Win11 box, always:
+
+```
+git checkout windows
+git pull origin windows
+```
+
+A fresh clone of the repo defaults to `main`, which doesn't contain
+`QtC.spec`. Building from `main` will fail to find the spec, or worse —
+if `QtC.spec` happens to be present from an earlier checkout, you may
+end up building with the wrong (pre-0.13.2) spec that produced the
+double-splash bug.
+
+After every new `main` release, merge it into `windows` so the windows
+branch carries the updated `.py` sources:
+
 ```
 git checkout windows
 git merge main
+git push origin windows
 ```
+
 Then rebuild from Step 2 (regenerate splash for the new version).
 
 ---
