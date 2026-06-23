@@ -1,4 +1,4 @@
-# QtC v0.13.2-beta — bbs_session.py  (built 2026-05-24)
+# QtC v0.14.0-beta — bbs_session.py  (built 2026-06-13)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -511,6 +511,13 @@ def parse_message_list(raw_text: str) -> List[BBSMessage]:
 # BBS Session
 # ─────────────────────────────────────────────
 
+class DownloadAborted(Exception):
+    """Raised inside the download path when the user aborts a transfer.
+    Caught by download_messages, which then sends 'A' to the BBS and
+    resyncs to the command prompt — the session stays connected."""
+    pass
+
+
 class BBSSession:
     """
     Manages a full BBS session for LinBPQ/BPQ32.
@@ -884,6 +891,11 @@ class BBSSession:
         # Stage 2: wait for BBS prompt — confirms BBS is ready for next command
         END_MARKER = "[End of Message"
         raw = self._expect(END_MARKER, timeout=timeout)
+        # User bailed mid-read (e.g. poor conditions). read_until returned
+        # early because the abort flag is set; stop here and let
+        # download_messages send 'A' to the BBS and resync to the prompt.
+        if getattr(self.transport, "abort_requested", lambda: False)():
+            raise DownloadAborted()
         # Now drain to the BBS prompt to clear it from the buffer
         tail = self._expect(self.PROMPT_BBS, timeout=30)
         raw = raw + tail
@@ -923,8 +935,13 @@ class BBSSession:
 
     def download_messages(self, messages: List[BBSMessage]) \
             -> List[BBSMessage]:
-        """Download a list of messages. Returns list with .body filled."""
+        """Download a list of messages. Returns list with .body filled.
+        Messages downloaded before a user abort keep their bodies; the rest
+        are left undownloaded and the session is resynced to the BBS prompt."""
         total = len(messages)
+        # Clear any stale abort flag so a previous bail can't kill this run.
+        if hasattr(self.transport, "clear_abort"):
+            self.transport.clear_abort()
         # Pause data monitor for entire download sequence —
         # prevents frame-split data from being double-displayed
         if hasattr(self.transport, "set_terminal_mode"):
@@ -933,6 +950,10 @@ class BBSSession:
         self.transport.flush_input()
         try:
             for i, msg in enumerate(messages, 1):
+                # Honor an abort requested between messages, too.
+                if getattr(self.transport, "abort_requested",
+                           lambda: False)():
+                    raise DownloadAborted()
                 self._log("SYS",
                     f"Downloading message {i} of {total} "
                     f"(#{msg.msg_number}, ~{msg.size} bytes)")
@@ -941,11 +962,30 @@ class BBSSession:
                 msg.downloaded = True
                 # Brief pause between messages — let BBS settle
                 time.sleep(0.3)
+        except DownloadAborted:
+            self._abort_to_prompt()
         finally:
             # Always re-enable terminal mode
             if hasattr(self.transport, "set_terminal_mode"):
                 self.transport.set_terminal_mode(True)
         return messages
+
+    def _abort_to_prompt(self):
+        """Clean user-abort path: the blocking read was already interrupted,
+        so tell the BBS to stop sending ('A' — abort paged output, per the
+        LinBPQ/BPQ32 command set) and resync to the command prompt. The RF
+        session stays connected so the user can disconnect cleanly (CW ID)
+        or carry on. Note: 'A' aborts paged output; if the node isn't paging,
+        the BBS finishes the current item before the prompt returns."""
+        if hasattr(self.transport, "clear_abort"):
+            self.transport.clear_abort()   # so the resync read isn't aborted
+        self._log("SYS", "Download aborted by user — sending 'A' to the BBS")
+        try:
+            self._send("A")
+            self._expect(self.PROMPT_BBS, timeout=30)
+            self._log("SYS", "Back at the BBS command prompt")
+        except Exception as e:
+            self._log("SYS", f"Abort resync issue (still connected): {e}")
 
     def send_message(self, to_call: str, subject: str, body: str,
                      msg_type: str = "P",
@@ -1046,18 +1086,16 @@ class BBSSession:
     def list_categories(self) -> list:
         """
         Send LC to get available bulletin categories on this BBS.
-        Returns list of category name strings e.g. ['ALL', 'EWN', 'BDN']
+        Returns list of (category, count) tuples e.g.
+        [('ALL', 3), ('BDN', 2), ('EWN', 2)].
+        LinBPQ LC output looks like: "ALL    3  BDN    2  EWN    2".
         """
         self._send("lc")
         raw = self._expect(self.PROMPT_BBS, timeout=30)
         self._log("SYS", f"LC response: {raw.strip()!r}")
-        # LinBPQ LC output: "ALL    3  BDN    2  EWN    2"
-        # Parse: words that are all uppercase letters are category names
-        import re
-        cats = re.findall(r'\b([A-Z][A-Z0-9]+)\b', raw)
-        # Filter out common non-category words
+        pairs = re.findall(r'\b([A-Z][A-Z0-9]+)\s+(\d+)\b', raw)
         skip = {"BBS", "DE", "OK", "TNX", "NIL", "NO", "YES"}
-        return [c for c in cats if c not in skip]
+        return [(cat, int(n)) for cat, n in pairs if cat not in skip]
 
     def check_bulletins(self, subscriptions: list) -> dict:
         """

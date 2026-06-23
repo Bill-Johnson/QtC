@@ -4,7 +4,7 @@
 #   or:  powershell -ExecutionPolicy Bypass -File install.ps1
 
 $ErrorActionPreference = "Stop"
-$VERSION = "0.13.2-beta"
+$VERSION = "0.14.0-beta"
 $INSTALL_DIR = "$env:APPDATA\qtc"
 $BACKUP_CONFIG = "$env:USERPROFILE\qtc_config_backup.json"
 $BACKUP_DB     = "$env:USERPROFILE\qtc_messages_backup.db"

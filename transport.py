@@ -1,4 +1,4 @@
-# QtC v0.13.2-beta — transport.py  (built 2026-05-24)
+# QtC v0.14.0-beta — transport.py  (built 2026-06-13)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -22,6 +22,18 @@ try:
     from ptt import PTTController
 except ImportError:
     PTTController = None
+
+# Codecs offered for decoding BBS content. utf-8 is the default; cp437 and
+# cp850 are the DOS "OEM" code pages used by bulletins with 8-bit ASCII
+# box-drawing / block graphics. All are single-byte (cp437/cp850) or
+# self-synchronizing (utf-8), so per-chunk decoding in the reader is safe.
+SUPPORTED_TEXT_CODECS = ("utf-8", "cp437", "cp850")
+
+def _validate_codec(codec: str) -> str:
+    """Return a known-good codec name, defaulting to utf-8 for anything
+    unrecognized so a typo in config.json can never break the data path."""
+    name = (codec or "").strip().lower().replace("_", "-")
+    return name if name in SUPPORTED_TEXT_CODECS else "utf-8"
 
 class TelnetTransport:
     """
@@ -50,6 +62,29 @@ class TelnetTransport:
         self._stop_reader     = threading.Event()
         self._reader_thread   = None
         self._log = None   # set by SessionWorker to emit [RX] log lines
+        # Codec used to decode BBS content (terminal view + message bodies).
+        # Default UTF-8; can be switched to cp437/cp850 so bulletins built
+        # with DOS 8-bit ASCII box-drawing graphics render correctly.
+        self._text_codec = "utf-8"
+        # User-abort flag. Set from the GUI thread to break a blocking
+        # read_until() immediately (e.g. bailing on a slow download) instead
+        # of waiting out the multi-minute message timeout.
+        self._abort = threading.Event()
+
+    def set_text_codec(self, codec: str):
+        """Select the codec for decoding BBS content. Falls back to utf-8
+        if the name is unknown so a bad config value can never crash I/O."""
+        self._text_codec = _validate_codec(codec)
+
+    def request_abort(self):
+        """Break any in-progress read_until() right away (thread-safe)."""
+        self._abort.set()
+
+    def clear_abort(self):
+        self._abort.clear()
+
+    def abort_requested(self) -> bool:
+        return self._abort.is_set()
 
     def set_terminal_mode(self, enabled: bool):
         """Toggle [RX] line streaming. Reader thread runs either way."""
@@ -83,7 +118,7 @@ class TelnetTransport:
             if not self._terminal_mode:
                 line_buf = ""
                 continue
-            text = chunk.decode("utf-8", errors="replace")
+            text = chunk.decode(self._text_codec, errors="replace")
             for ch in text:
                 if ch in ("\r", "\n"):
                     if line_buf.strip() and self._log:
@@ -191,16 +226,23 @@ class TelnetTransport:
         deadline = time.time() + timeout
         while True:
             with self._lock:
+                # User abort — return whatever's buffered now. The caller
+                # checks abort_requested() and stops; the flag stays set
+                # until the abort path resyncs.
+                if self._abort.is_set():
+                    result = self._buf
+                    self._buf = b""
+                    return result.decode(self._text_codec, errors="replace")
                 idx = self._buf.lower().find(expected_b.lower())
                 if idx >= 0:
                     end = idx + len(expected_b)
                     result = self._buf[:end]
                     self._buf = self._buf[end:]
-                    return result.decode("utf-8", errors="replace")
+                    return result.decode(self._text_codec, errors="replace")
                 if time.time() >= deadline:
                     result = self._buf
                     self._buf = b""
-                    return result.decode("utf-8", errors="replace")
+                    return result.decode(self._text_codec, errors="replace")
             time.sleep(0.05)
 
     def read_eager(self) -> str:
@@ -208,7 +250,7 @@ class TelnetTransport:
         with self._lock:
             result = self._buf
             self._buf = b""
-            return result.decode("utf-8", errors="replace")
+            return result.decode(self._text_codec, errors="replace")
 
     def read_all_pending(self, settle_time: float = 0.5) -> str:
         """Read all pending data, waiting briefly for the reader to drain new bytes."""
@@ -325,6 +367,29 @@ class VaraTransport:
         # Optional callback fired when VARA sends DISCONNECTED unexpectedly
         # (BBS or remote timeout). Set by SessionWorker to trigger GUI update.
         self._on_disconnected_cb = None
+
+        # Codec for decoding BBS content on the data port (terminal view +
+        # message bodies). The cmd port is always ASCII/utf-8 (VARA's own
+        # protocol) and is never affected by this. See _validate_codec.
+        self._text_codec = "utf-8"
+        # User-abort flag — see TelnetTransport. Set from the GUI thread to
+        # break a blocking data-port read_until() immediately.
+        self._abort = threading.Event()
+
+    def set_text_codec(self, codec: str):
+        """Select the codec for decoding BBS content on the data port.
+        Falls back to utf-8 for any unknown name."""
+        self._text_codec = _validate_codec(codec)
+
+    def request_abort(self):
+        """Break any in-progress read_until() right away (thread-safe)."""
+        self._abort.set()
+
+    def clear_abort(self):
+        self._abort.clear()
+
+    def abort_requested(self) -> bool:
+        return self._abort.is_set()
 
     # ── Internal helpers ──────────────────────────────────────────
 
@@ -496,7 +561,7 @@ class VaraTransport:
                 line_buf = ""
                 continue
 
-            text = chunk.decode("utf-8", errors="replace")
+            text = chunk.decode(self._text_codec, errors="replace")
             for ch in text:
                 if ch in ("\r", "\n"):
                     _emit_line(line_buf.strip())
@@ -757,16 +822,23 @@ class VaraTransport:
         deadline = time.time() + timeout
         while True:
             with self._data_lock:
+                # User abort — return whatever's buffered now. The caller
+                # checks abort_requested() and stops; the flag stays set
+                # until the abort path resyncs.
+                if self._abort.is_set():
+                    result = self._data_buf
+                    self._data_buf = b""
+                    return result.decode(self._text_codec, errors="replace")
                 idx = self._data_buf.lower().find(expected_b.lower())
                 if idx >= 0:
                     end = idx + len(expected_b)
                     result = self._data_buf[:end]
                     self._data_buf = self._data_buf[end:]
-                    return result.decode("utf-8", errors="replace")
+                    return result.decode(self._text_codec, errors="replace")
                 if time.time() >= deadline:
                     result = self._data_buf
                     self._data_buf = b""
-                    return result.decode("utf-8", errors="replace")
+                    return result.decode(self._text_codec, errors="replace")
             # No match yet — give the reader a moment to add more bytes
             time.sleep(0.05)
 
@@ -775,7 +847,7 @@ class VaraTransport:
         with self._data_lock:
             result = self._data_buf
             self._data_buf = b""
-            return result.decode("utf-8", errors="replace")
+            return result.decode(self._text_codec, errors="replace")
 
     def read_all_pending(self, settle_time: float = 0.5) -> str:
         """Read all pending data, waiting briefly for the reader to drain new frames."""

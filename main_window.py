@@ -1,4 +1,4 @@
-# QtC v0.13.2-beta — main_window.py  (built 2026-05-24)
+# QtC v0.14.0-beta — main_window.py  (built 2026-06-21)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
-APP_VERSION = "0.13.2-beta"  # keep in sync with header comment
+APP_VERSION = "0.14.0-beta"  # keep in sync with header comment
 """
 QtC — Main Window (PyQt6)
 v0.2 — Quick-connect bar, auto-download, terminal swap button
@@ -33,11 +33,13 @@ from PyQt6.QtWidgets import (
     QProgressBar, QSpinBox, QFileDialog, QSplashScreen,
     QRadioButton, QButtonGroup, QGroupBox, QTimeEdit
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QTime, QObject
-from PyQt6.QtGui import QFont, QColor, QTextCursor, QPalette, QAction, QPixmap
+from PyQt6.QtCore import (Qt, QThread, pyqtSignal, QSize, QTimer, QTime,
+                          QObject, QEvent)
+from PyQt6.QtGui import (QFont, QColor, QTextCursor, QPalette, QAction, QPixmap,
+                         QShortcut, QKeySequence)
 
 from transport import TelnetTransport
-from bbs_session import BBSSession, BBSMailSummary
+from bbs_session import BBSSession, BBSMailSummary, DownloadAborted
 
 from database import MessageDatabase, ContactsDB
 
@@ -118,6 +120,7 @@ class SessionWorker(QThread):
     sig_progress      = pyqtSignal(str, int, int, str)  # op, current, total, detail
     sig_bulletin_check = pyqtSignal(object)   # {category: [BBSMessage]} — show dialog
     sig_bulletin_done  = pyqtSignal(int)       # count of bulletins downloaded
+    sig_categories_ready = pyqtSignal(object, bool)  # list[(cat,count)], open_dialog
     sig_yapp_progress  = pyqtSignal(int, int, str)  # bytes_done, total, filename
     sig_yapp_done      = pyqtSignal(str, str)        # save_path, display_name
     sig_yapp_error     = pyqtSignal(str)
@@ -153,6 +156,17 @@ class SessionWorker(QThread):
         self._task = ("disconnect",)
         if not self.isRunning(): self.start()
 
+    def do_abort(self):
+        """Stop an in-progress download immediately (called from the GUI
+        thread). Sets the transport abort flag so the worker's blocked read
+        returns at once; the download path then sends 'A' to the BBS and
+        resyncs to the command prompt, leaving the session connected. Safe
+        to call mid-download — it only flips a threading.Event."""
+        s = self.session
+        if s and getattr(s, "transport", None) \
+                and hasattr(s.transport, "request_abort"):
+            s.transport.request_abort()
+
     def do_terminal_send(self, cmd: str):
         self._task = ("terminal_send", cmd)
         if not self.isRunning(): self.start()
@@ -174,6 +188,18 @@ class SessionWorker(QThread):
         self._task = ("download_bulletins", messages_by_cat)
         if not self.isRunning(): self.start()
 
+    def do_list_categories(self, open_dialog: bool = False):
+        """Run LC on the active session, persist known_categories +
+        last_lc_at, and drop one inbox notification per newly-appeared
+        category. Triggered by the auto-update connect-flow hook (when
+        check_on_connect is on and the 10-day window has elapsed) and
+        by the Refresh-now button on the Bulletins settings tab.
+        `open_dialog` is retained on the signal signature for
+        forward-compat but is currently unused — all subscription
+        editing happens offline in the checkable category list."""
+        self._task = ("list_categories", open_dialog)
+        if not self.isRunning(): self.start()
+
     def run(self):
         try:
             t = self._task
@@ -188,6 +214,7 @@ class SessionWorker(QThread):
             elif t[0] == "send":          self._run_send(*t[1:])
             elif t[0] == "check_bulletins":    self._run_check_bulletins(t[1])
             elif t[0] == "download_bulletins": self._run_download_bulletins(t[1])
+            elif t[0] == "list_categories":    self._run_list_categories(t[1])
             elif t[0] == "yapp_download":      self._run_yapp_download(t[1], t[2])
             # Drain any queued send tasks
             import queue as _queue
@@ -277,6 +304,13 @@ class SessionWorker(QThread):
 
         else:
             raise ValueError(f"Unknown transport: {transport}")
+
+        # Apply the user-selected text codec for decoding BBS content
+        # (utf-8 default; cp437/cp850 render DOS box-drawing bulletins —
+        # GitHub issue #2). The transport validates the name and silently
+        # falls back to utf-8 if it is unknown.
+        if hasattr(t, "set_text_codec"):
+            t.set_text_codec(self.config.get("app", {}).get("text_codec", "utf-8"))
 
         s._log = lambda d, txt: self.sig_log.emit(f"[{d}] {txt.strip()}")
         return s
@@ -410,6 +444,9 @@ class SessionWorker(QThread):
         # consuming bytes that download_message needs and causing hangs.
         if hasattr(self.session.transport, "set_terminal_mode"):
             self.session.transport.set_terminal_mode(False)
+        # Clear any stale abort flag so a previous bail can't kill this run.
+        if hasattr(self.session.transport, "clear_abort"):
+            self.session.transport.clear_abort()
         self.session.transport.flush_input()
         try:
             for i, msg in enumerate(messages, 1):
@@ -424,6 +461,10 @@ class SessionWorker(QThread):
                     msg.downloaded = True
                     self.db.save_to_inbox(msg, bbs_id)
                     count += 1
+        except DownloadAborted:
+            # User hit Stop: read was already interrupted; tell the BBS to
+            # stop sending ('A') and resync to the prompt. Stay connected.
+            self.session._abort_to_prompt()
         finally:
             if hasattr(self.session.transport, "set_terminal_mode"):
                 self.session.transport.set_terminal_mode(True)
@@ -462,22 +503,26 @@ class SessionWorker(QThread):
         bbs_id = (f"{self.config.get('user',{}).get('callsign','NOCALL').upper()}"
                   f"@{self.bbs_entry['callsign']}")
 
-        # ── First bulletin connect — auto-tombstone all but 2 newest ──────
+        # ── First bulletin connect — auto-tombstone all but N newest ──────
         # Detect first time bulletins have been checked on this BBS by looking
         # for a "bulletins_seen" key in visited_bbs. If absent, tombstone all
-        # but the 2 most recent per category so the user doesn't see a huge
-        # backlog on first connect.
+        # but the N most recent per category so the user doesn't see a huge
+        # backlog on first connect. N is transport-aware: VARA HF is slow,
+        # so cap tighter (2 per category); VARA FM and Telnet have more
+        # headroom, so allow 3 per category.
         mycall    = self.config.get("user", {}).get("callsign", "NOCALL").upper()
         visit_key = f"{mycall}@{self.bbs_entry['callsign']}"
         bull_key  = f"bulletins_seen@{self.bbs_entry['callsign']}"
         visited   = self.config.get("visited_bbs", {})
+        first_keep = 2 if self.bbs_entry.get(
+            "transport", "vara_hf") == "vara_hf" else 3
 
         if bull_key not in visited:
-            # First time — tombstone everything except 2 newest per category
+            # First time — tombstone everything except N newest per category
             for cat, msgs in results.items():
                 # msgs are already newest-first from L> (descending)
-                to_keep     = msgs[:2]
-                to_tombstone = msgs[2:]
+                to_keep     = msgs[:first_keep]
+                to_tombstone = msgs[first_keep:]
                 if to_tombstone:
                     self.db.add_bulletin_tombstones_batch(to_tombstone, bbs_id)
                     self.sig_log.emit(
@@ -504,34 +549,111 @@ class SessionWorker(QThread):
         import time as _time
         if hasattr(self.session.transport, "set_terminal_mode"):
             self.session.transport.set_terminal_mode(False)
+        # Clear any stale abort flag so a previous bail can't kill this run.
+        if hasattr(self.session.transport, "clear_abort"):
+            self.session.transport.clear_abort()
         self.session.transport.flush_input()
         bbs_id = (f"{self.config.get('user',{}).get('callsign','NOCALL').upper()}"
                   f"@{self.bbs_entry['callsign']}")
         count = 0
         total = sum(len(msgs) for msgs in messages_by_cat.values())
         i = 0
-        for cat, msgs in messages_by_cat.items():
-            for msg in msgs:
-                i += 1
-                detail = f"{cat} #{msg.msg_number} · ~{msg.size} bytes"
-                self.sig_progress.emit("downloading", i - 1, total, detail)
-                self.sig_log.emit(
-                    f"[SYS] Downloading bulletin {i}/{total} "
-                    f"{cat} #{msg.msg_number} ~{msg.size} bytes")
-                body = self.session.download_message(
-                    msg.msg_number, size_hint=msg.size)
-                msg.body = body
-                # Extract BID from body header if present
-                import re as _re
-                bid_m = _re.search(r'Bid:\s*(\S+)', body, _re.I)
-                bid = bid_m.group(1) if bid_m else ""
-                self.db.save_bulletin(msg, bbs_id, bid=bid)
-                count += 1
-                _time.sleep(0.3)   # brief pause between bulletins
-        if hasattr(self.session.transport, "set_terminal_mode"):
-            self.session.transport.set_terminal_mode(True)
+        try:
+            for cat, msgs in messages_by_cat.items():
+                for msg in msgs:
+                    i += 1
+                    detail = f"{cat} #{msg.msg_number} · ~{msg.size} bytes"
+                    self.sig_progress.emit("downloading", i - 1, total, detail)
+                    self.sig_log.emit(
+                        f"[SYS] Downloading bulletin {i}/{total} "
+                        f"{cat} #{msg.msg_number} ~{msg.size} bytes")
+                    body = self.session.download_message(
+                        msg.msg_number, size_hint=msg.size)
+                    msg.body = body
+                    # Extract BID from body header if present
+                    import re as _re
+                    bid_m = _re.search(r'Bid:\s*(\S+)', body, _re.I)
+                    bid = bid_m.group(1) if bid_m else ""
+                    self.db.save_bulletin(msg, bbs_id, bid=bid)
+                    count += 1
+                    _time.sleep(0.3)   # brief pause between bulletins
+        except DownloadAborted:
+            # User hit Stop: read was already interrupted; tell the BBS to
+            # stop sending ('A') and resync to the prompt. Stay connected.
+            self.session._abort_to_prompt()
+        finally:
+            if hasattr(self.session.transport, "set_terminal_mode"):
+                self.session.transport.set_terminal_mode(True)
         self.sig_progress.emit("done", 0, 0, "")
         self.sig_bulletin_done.emit(count)
+
+    def _run_list_categories(self, open_dialog: bool):
+        """Run LC on the active session, diff against known_categories,
+        emit one inbox notification per newly-appeared category, persist
+        last_lc_at + known_categories, then emit sig_categories_ready."""
+        import time as _time
+        import datetime as _dt
+        if not self.session:
+            self.sig_error.emit("Not connected to BBS.")
+            return
+        if hasattr(self.session.transport, "set_terminal_mode"):
+            self.session.transport.set_terminal_mode(False)
+        self.session.transport.flush_input()
+        _time.sleep(0.5)
+        try:
+            categories = self.session.list_categories()
+        finally:
+            if hasattr(self.session.transport, "set_terminal_mode"):
+                self.session.transport.set_terminal_mode(True)
+
+        bull_cfg  = self.config.setdefault("bulletins", {})
+        auto_cfg  = bull_cfg.setdefault("auto_category_update", {})
+        prev      = auto_cfg.get("known_categories") or []
+        prev_names = {c[0] if isinstance(c, (list, tuple)) else c
+                      for c in prev}
+        mycall    = self.config.get("user", {}).get(
+            "callsign", "NOCALL").upper()
+        home_bbs  = self.config.get("user", {}).get(
+            "home_bbs", "").strip().upper()
+
+        # Drop one inbox notification per newly-appeared category name.
+        # Skip on the very first run (prev empty) — that's the baseline,
+        # not a "new" event.
+        if prev_names:
+            for cat, count in categories:
+                if cat not in prev_names:
+                    subject = (f"New bulletin category on "
+                               f"{home_bbs or 'Home BBS'}: {cat}")
+                    body = (
+                        f"Your Home BBS ({home_bbs or '?'}) has a new "
+                        f"bulletin category since the last check:\n\n"
+                        f"    {cat}  ({count} bulletins currently posted)\n\n"
+                        f"To subscribe:\n"
+                        f"  - Open Settings → Bulletins\n"
+                        f"  - Click \"📡 Get categories from BBS…\" "
+                        f"and tick {cat}, or\n"
+                        f"  - Add {cat} on its own line in the "
+                        f"Subscriptions box\n\n"
+                        f"You'll then receive new {cat} bulletins on "
+                        f"your next Home BBS connect.\n\n"
+                        f"-- QtC Category Update\n")
+                    try:
+                        self.db.create_system_message(mycall, subject, body)
+                        self.sig_log.emit(
+                            f"[SYS] New bulletin category detected: {cat} "
+                            f"(see 🔔 Notifications folder)")
+                    except Exception as e:
+                        self.sig_log.emit(
+                            f"[SYS] Could not insert category notification "
+                            f"for {cat}: {e}")
+
+        # Persist cache + timestamp. Stored as list-of-lists for JSON.
+        auto_cfg["known_categories"] = [[c, n] for c, n in categories]
+        auto_cfg["last_lc_at"] = _dt.datetime.utcnow().strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        save_config(self.config)
+
+        self.sig_categories_ready.emit(categories, open_dialog)
 
     def _run_yapp_download(self, filename: str, save_dir: str):
         """
@@ -967,6 +1089,7 @@ class TerminalWidget(QWidget):
             "Type 'files' first to see what's available.")
         self.get_file_btn.setEnabled(False)   # enabled on connect
         self.get_file_btn.clicked.connect(self.sig_get_file.emit)
+
         self.clear_btn = QPushButton("Clear")
         self.clear_btn.setFixedWidth(60)
         self.clear_btn.clicked.connect(self._clear)
@@ -1183,6 +1306,7 @@ class MailView(QWidget):
         self._fi = QTreeWidgetItem(self.folder_tree, ["📥  Inbox"])
         self._fo = QTreeWidgetItem(self.folder_tree, ["📤  Outbox"])
         self._fs = QTreeWidgetItem(self.folder_tree, ["📨  Sent"])
+        self._fn = QTreeWidgetItem(self.folder_tree, ["🔔  Notifications"])
 
         # Bulletins parent folder — children added dynamically
         self._fb = QTreeWidgetItem(self.folder_tree, ["📋  Bulletins"])
@@ -1212,7 +1336,8 @@ class MailView(QWidget):
         self._search_edit.textChanged.connect(self._on_search_changed)
         self._search_scope = QComboBox()
         self._search_scope.addItems(
-            ["All folders", "Inbox", "Outbox", "Sent", "Bulletins"])
+            ["All folders", "Inbox", "Outbox", "Sent",
+             "Notifications", "Bulletins"])
         self._search_scope.setFixedWidth(120)
         self._search_scope.currentIndexChanged.connect(self._on_search_changed)
         self._search_close = QPushButton("✕")
@@ -1306,12 +1431,108 @@ class MailView(QWidget):
         h.setSizes([160, 900])
         layout.addWidget(h)
 
+        self._setup_list_hotkeys()
+        self._setup_tab_cycle()
+        self._setup_pane_focus_style()
+
+    def _setup_pane_focus_style(self):
+        """Subtle 1px green edge marks the active reading pane (issue #3).
+        Paired with the dimmed inactive selection in _apply_dark_palette,
+        this makes it obvious which of the three panes Tab — or a click —
+        landed on, instead of every pane looking equally highlighted."""
+        edge = "#00a050"   # theme green accent (matches dark-mode Highlight)
+
+        def qss(cls, idle):
+            return (f"{cls} {{ border: 1px solid {idle}; border-radius: 3px; }}"
+                    f"{cls}:focus {{ border: 1px solid {edge}; }}")
+
+        self.folder_tree.setStyleSheet(qss("QTreeWidget",  "palette(mid)"))
+        self.msg_table.setStyleSheet(qss("QTableWidget", "palette(mid)"))
+        # The body already sits inside a framed panel, so keep it borderless
+        # until focused to avoid a double edge.
+        self.preview_body.setStyleSheet(qss("QTextEdit",  "transparent"))
+
+    def focus_default(self):
+        """Put keyboard focus on the first pane of the Tab cycle so Tab stays
+        inside the three reading panes from the start, instead of beginning up
+        in the connection toolbar (issue #3)."""
+        self.folder_tree.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _setup_tab_cycle(self):
+        """Tab cycles focus through exactly three reading panes (issue #3):
+        folder tree → message list → message body → back to the folder tree
+        (Shift+Tab reverses). The cycle is closed — Tab never escapes up to
+        the connection/toolbar controls. Arrow keys keep their natural job in
+        each pane: select the folder, select the message, or (in the body)
+        scroll the text for reading. Implemented as an event filter so Tab is
+        intercepted before the item views consume it for cell navigation."""
+        self._tab_cycle = (self.folder_tree, self.msg_table, self.preview_body)
+        for wdg in self._tab_cycle:
+            wdg.installEventFilter(self)
+        # Stop the body from swallowing Tab as a literal tab character.
+        self.preview_body.setTabChangesFocus(True)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.KeyPress and obj in self._tab_cycle:
+            key = event.key()
+            if key in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab):
+                idx  = self._tab_cycle.index(obj)
+                step = -1 if key == Qt.Key.Key_Backtab else 1
+                nxt  = self._tab_cycle[(idx + step) % len(self._tab_cycle)]
+                nxt.setFocus(Qt.FocusReason.TabFocusReason)
+                return True
+            # In the reading pane, Up/Down scroll the body a line at a time so
+            # there's immediate feedback (a read-only QTextEdit otherwise just
+            # walks an invisible cursor before the view moves).
+            if obj is self.preview_body and key in (
+                    Qt.Key.Key_Up, Qt.Key.Key_Down):
+                sb = self.preview_body.verticalScrollBar()
+                step = sb.singleStep() or 1
+                sb.setValue(sb.value()
+                            + (step if key == Qt.Key.Key_Down else -step))
+                return True
+        return super().eventFilter(obj, event)
+
+    def _setup_list_hotkeys(self):
+        """Single-keystroke commands for keyboard users while the message
+        list has focus (issue #3). Each one clicks the matching button, so
+        the enabled/disabled state is honored exactly and the same code path
+        runs. They are scoped to the table (WidgetWithChildrenShortcut), so
+        typing in the search box or a dialog is never hijacked. The
+        point-n-click buttons stay for mouse users."""
+        def bind(keys, button):
+            for k in keys:
+                sc = QShortcut(QKeySequence(k), self.msg_table)
+                sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+                sc.activated.connect(button.click)
+
+        bind(["N"],           self.btn_new)
+        bind(["R"],           self.btn_reply)
+        bind(["D", "Delete"], self.btn_delete)
+        bind(["F"],           self.btn_search)
+        bind(["M"],           self.btn_mark_all_read)
+
+        # Enter on a selected row jumps into the reading pane so the body can
+        # be scrolled with PageUp/PageDown / arrows; Esc returns to the list.
+        for key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            sc = QShortcut(QKeySequence(key), self.msg_table)
+            sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            sc.activated.connect(self._kb_enter_reading_pane)
+        sc_back = QShortcut(QKeySequence(Qt.Key.Key_Escape), self.preview_body)
+        sc_back.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc_back.activated.connect(self.msg_table.setFocus)
+
+    def _kb_enter_reading_pane(self):
+        if self.msg_table.currentRow() >= 0:
+            self.preview_body.setFocus()
+
     def _folder_changed(self, current, _):
         if current is None:
             return
         if   current is self._fi: self.sig_folder_changed.emit("inbox")
         elif current is self._fo: self.sig_folder_changed.emit("outbox")
         elif current is self._fs: self.sig_folder_changed.emit("sent")
+        elif current is self._fn: self.sig_folder_changed.emit("notifications")
         elif current is self._fb: self.sig_folder_changed.emit("bulletins")
         else:
             # Check if it's a bulletin category child
@@ -1404,11 +1625,13 @@ class MailView(QWidget):
         results = []
 
         scope_map = {
-            "All folders": ["inbox", "outbox", "sent", "bulletins"],
-            "Inbox":       ["inbox"],
-            "Outbox":      ["outbox"],
-            "Sent":        ["sent"],
-            "Bulletins":   ["bulletins"],
+            "All folders":   ["inbox", "outbox", "sent",
+                              "notifications", "bulletins"],
+            "Inbox":         ["inbox"],
+            "Outbox":        ["outbox"],
+            "Sent":          ["sent"],
+            "Notifications": ["notifications"],
+            "Bulletins":     ["bulletins"],
         }
         folders = scope_map.get(scope, ["inbox", "outbox", "sent"])
 
@@ -1505,14 +1728,19 @@ class MailView(QWidget):
         if   cur is self._fi: return "inbox"
         elif cur is self._fo: return "outbox"
         elif cur is self._fs: return "sent"
+        elif cur is self._fn: return "notifications"
         return "inbox"
 
     # ── Public methods called by MainWindow ────────────────────
 
-    def update_folder_counts(self, unread: int, pending: int, sent: int = 0):
+    def update_folder_counts(self, unread: int, pending: int, sent: int = 0,
+                             notifications: int = 0):
         self._fi.setText(0, f"📥  Inbox ({unread} new)" if unread else "📥  Inbox")
         self._fo.setText(0, f"📤  Outbox ({pending})"   if pending else "📤  Outbox")
         self._fs.setText(0, f"📨  Sent ({sent})"        if sent    else "📨  Sent")
+        self._fn.setText(
+            0, f"🔔  Notifications ({notifications} new)"
+            if notifications else "🔔  Notifications")
 
     def load_table(self, rows, folder: str):
         """Populate the message table for the given folder."""
@@ -1521,10 +1749,12 @@ class MailView(QWidget):
         self.preview_body.clear()
         self.btn_reply.setEnabled(False)
         self.btn_delete.setEnabled(False)
-        self.btn_mark_all_read.setVisible(folder == "inbox")
         is_bulletin = folder == "bulletins" or folder.startswith("bulletin:")
-        self.btn_new.setVisible(not is_bulletin)
-        self.btn_reply.setVisible(not is_bulletin)
+        is_notif    = folder == "notifications"
+        self.btn_mark_all_read.setVisible(folder == "inbox" or is_notif)
+        # No composing or replying to bulletins or QtC notifications
+        self.btn_new.setVisible(not is_bulletin and not is_notif)
+        self.btn_reply.setVisible(not is_bulletin and not is_notif)
         self.btn_delete.setVisible(True)
 
         if folder == "outbox":
@@ -1532,7 +1762,9 @@ class MailView(QWidget):
         elif is_bulletin:
             self._fill_bulletins(rows, folder=folder)
         else:
-            self._fill_inbox_sent(rows, show_from=(folder == "inbox"))
+            self._fill_inbox_sent(
+                rows, show_from=(folder == "inbox" or is_notif),
+                notifications=is_notif)
 
     def _short_date(self, raw: str) -> str:
         """Normalize any date string to short DD-Mon format.
@@ -1551,7 +1783,7 @@ class MailView(QWidget):
         except Exception:
             return raw[:10]
 
-    def _fill_inbox_sent(self, rows, show_from: bool):
+    def _fill_inbox_sent(self, rows, show_from: bool, notifications: bool = False):
         self.msg_table.setHorizontalHeaderLabels(
             ["", "From" if show_from else "To", "Subject", "Date", "Size"])
         for rd in rows:
@@ -1560,8 +1792,14 @@ class MailView(QWidget):
             unread = not rd.get("read", 0)
             font = QFont(); font.setBold(unread)
 
-            dot = QTableWidgetItem("●" if unread else "")
-            dot.setForeground(QColor("#0066cc" if unread else "#cccccc"))
+            # QtC notifications get a bell icon so they read as "from QtC,
+            # not radio mail" — kept (greyed) even after they're read.
+            if notifications:
+                dot = QTableWidgetItem("🔔")
+                dot.setForeground(QColor("#cc8800" if unread else "#cccccc"))
+            else:
+                dot = QTableWidgetItem("●" if unread else "")
+                dot.setForeground(QColor("#0066cc" if unread else "#cccccc"))
             dot.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.msg_table.setItem(r, 0, dot)
 
@@ -1693,10 +1931,13 @@ class MailView(QWidget):
             self.preview_body.setTextCursor(selections[0].cursor)
 
     def mark_row_read(self, row: int):
-        """Remove bold and unread dot from a table row."""
+        """Remove bold and unread marker from a table row.
+        Notification rows keep their 🔔 bell (just greyed); mail rows lose
+        the blue dot."""
         dot = self.msg_table.item(row, 0)
         if dot:
-            dot.setText("")
+            if dot.text() != "🔔":
+                dot.setText("")
             dot.setForeground(QColor("#cccccc"))
         for c in range(1, 5):
             it = self.msg_table.item(row, c)
@@ -1854,8 +2095,11 @@ class SettingsDialog(QDialog):
         # Callsign/Freq/BW/Host/Port/Notes) at their default widths
         # without horizontal scrolling, and Notes has room to show
         # comment text — no need for the user to resize on each open.
-        self.setMinimumSize(820, 580)
-        self.resize(900, 720)
+        # Sized so the Bulletins tab's new Auto-Update + Recover groups
+        # have room without squishing — the listbox needs ~110px and the
+        # two groups together need ~440px of vertical real estate.
+        self.setMinimumSize(820, 720)
+        self.resize(900, 880)
 
         layout = QVBoxLayout(self)
 
@@ -2218,48 +2462,332 @@ class SettingsDialog(QDialog):
     def _build_bulletins_tab(self) -> QWidget:
         w = QWidget()
         outer = QVBoxLayout(w)
-        outer.setContentsMargins(18, 18, 18, 18)
-        outer.setSpacing(12)
+        outer.setContentsMargins(14, 14, 14, 10)
+        outer.setSpacing(8)
 
         b = self._cfg.get("bulletins", {})
+        # Cache is read from the parent's *live* config (not the dialog's
+        # snapshot) so an in-flight LC fetch's result shows up here.
+        p = self.parent()
+        live_auto = ((p.config.get("bulletins", {}).get(
+                        "auto_category_update", {}) if p else {}) or {})
+        home_bbs_raw = self._cfg.get("user", {}).get(
+            "home_bbs", "").strip().upper()
+        home_bbs = home_bbs_raw.split(".")[0].split("-")[0]
+        self._bull_connected_at_open = self._is_connected_for_bulletins()
 
+        # Master switch — gates both LC seeding/refresh AND the per-
+        # category L> bulletin check on connect.
         self.chk_bull_auto = QCheckBox(
             "Check for new bulletins on connect")
-        self.chk_bull_auto.setChecked(bool(b.get("check_on_connect", False)))
+        self.chk_bull_auto.setChecked(
+            bool(b.get("check_on_connect", False)))
         outer.addWidget(self.chk_bull_auto)
 
         note = QLabel(
-            "<i>Enter one category per line (e.g. SITREP, EWN, WX).<br>"
-            "QtC will run L&gt; CATEGORY for each subscription after "
-            "personal mail is checked.<br>"
-            "Category names are not case-sensitive.</i>")
+            "<i>When enabled, QtC fetches the list of available "
+            "categories from your Home BBS on first connect and "
+            "refreshes once every 10 days.<br>"
+            "Tick the categories below to subscribe.</i>")
         note.setStyleSheet(f"color: {self._note_color}; font-size:11px;")
         note.setWordWrap(True)
         outer.addWidget(note)
 
-        # Home BBS warning box
+        # Home BBS warning box (unchanged)
         warn = QLabel(
             "<b>Home BBS only</b><br>"
             "Bulletin download only runs when connected to your Home BBS "
             "(set in My Station). This prevents re-downloading the same "
-            "bulletins when visiting other nodes, since BBS-to-BBS duplicate "
-            "checking (BID) is not available in this version.")
+            "bulletins when visiting other nodes, since BBS-to-BBS "
+            "duplicate checking (BID) is not available in this version.")
         warn.setWordWrap(True)
         warn.setStyleSheet(
             "background: #FAEEDA; border-left: 3px solid #BA7517; "
             "color: #633806; font-size: 11px; padding: 8px 12px;")
         outer.addWidget(warn)
 
-        outer.addWidget(QLabel("Subscriptions (one category per line):"))
-        self.bull_list = QTextEdit()
-        self.bull_list.setFont(QFont("Courier New", 10))
-        self.bull_list.setFixedHeight(140)
-        subs = b.get("subscriptions", [])
-        self.bull_list.setPlainText("\n".join(subs))
-        outer.addWidget(self.bull_list)
+        # Header row for the categories list
+        home_label = home_bbs or "Home BBS"
+        outer.addWidget(QLabel(
+            f"Available categories on {home_label} — "
+            f"tick to subscribe:"))
+
+        ts_row = QHBoxLayout()
+        ts_row.setContentsMargins(0, 0, 0, 0)
+        self.lbl_bull_last_lc = QLabel(self._bull_format_last_lc(
+            live_auto.get("last_lc_at")))
+        self.lbl_bull_last_lc.setStyleSheet("font-size: 11px;")
+        ts_row.addWidget(self.lbl_bull_last_lc)
+        ts_row.addStretch()
+        self.btn_bull_refresh = QPushButton("🔄  Refresh now")
+        self.btn_bull_refresh.clicked.connect(
+            self._bull_fetch_categories)
+        self.btn_bull_refresh.setEnabled(self._bull_connected_at_open)
+        if not self._bull_connected_at_open:
+            self.btn_bull_refresh.setToolTip(
+                "Connect to your Home BBS first to use this button "
+                "and update the category list instantly.\n"
+                "Telnet users should connect while in Terminal View.")
+        ts_row.addWidget(self.btn_bull_refresh)
+        outer.addLayout(ts_row)
+
+        # The checkable category list IS the subscription UI.
+        self.lst_bull_cats = QListWidget()
+        self.lst_bull_cats.setFont(QFont("Courier New", 10))
+        self.lst_bull_cats.setMinimumHeight(200)
+        # Render: merge cached categories with existing subscriptions
+        # (the latter so migration from the old free-text UI doesn't
+        # lose the user's picks before LC has ever run).
+        known = live_auto.get("known_categories") or []
+        existing_subs = [s.upper().strip() for s in
+                         (b.get("subscriptions") or []) if s.strip()]
+        self._bull_populate_cat_list(known, existing_subs)
+        outer.addWidget(self.lst_bull_cats)
+
+        list_footnote = QLabel(
+            "<i>Categories shown with '?' are subscribed but had no "
+            "bulletins in the last bulletin category check (LC). "
+            "Untick to remove the subscription.</i>")
+        list_footnote.setStyleSheet(
+            f"color: {self._note_color}; font-size: 11px;")
+        list_footnote.setWordWrap(True)
+        outer.addWidget(list_footnote)
+
+        # ── Recover a lost bulletin group (unchanged) ─────────────
+        self._bull_reset_box = QGroupBox("Recover a lost bulletin")
+        reset_layout = QVBoxLayout(self._bull_reset_box)
+        reset_layout.setContentsMargins(12, 8, 12, 10)
+        reset_layout.setSpacing(6)
+
+        reset_note = QLabel(
+            "Skipped a bulletin in the selection dialog and wish you "
+            "hadn't? QtC remembers what you skipped so it doesn't keep "
+            "asking. Resetting clears those 'skipped' markers for your "
+            "Home BBS so those bulletins become eligible again on your "
+            "next check.<br><br>"
+            "<i>This does NOT delete any downloaded bulletins, mail, "
+            "or contacts.</i>")
+        reset_note.setStyleSheet(
+            f"color: {self._note_color}; font-size: 11px;")
+        reset_note.setWordWrap(True)
+        reset_layout.addWidget(reset_note)
+
+        reset_btn_row = QHBoxLayout()
+        reset_btn_row.setContentsMargins(0, 0, 0, 0)
+        home_label_reset = home_bbs or "Home BBS"
+        self.btn_bull_reset = QPushButton(
+            f"🔄  Reset bulletin check state for {home_label_reset}…")
+        self.btn_bull_reset.clicked.connect(self._bull_reset_clicked)
+        reset_btn_row.addWidget(self.btn_bull_reset)
+        reset_btn_row.addStretch()
+        reset_layout.addLayout(reset_btn_row)
+        outer.addWidget(self._bull_reset_box)
+
+        # No-home-BBS gate — the Reset section is meaningless without it.
+        if not home_bbs:
+            self._bull_reset_box.setEnabled(False)
+            no_home = QLabel(
+                "<i>Set a Home BBS on the My Station tab to enable "
+                "bulletin reset.</i>")
+            no_home.setStyleSheet(
+                f"color: {self._note_color}; font-size: 11px;")
+            no_home.setWordWrap(True)
+            outer.addWidget(no_home)
+
+        first_connect_note = QLabel(
+            "<i><b>First-time connects to your Home BBS:</b> the very "
+            "first bulletin check is kept short on purpose — 2 newest "
+            "per category on VARA HF, 3 on VARA FM or Telnet. Sorry, "
+            "RF just isn't 1 Gb/s fiber, and both the BBS and the "
+            "frequency are shared with other ops.</i>")
+        first_connect_note.setStyleSheet(
+            f"color: {self._note_color}; font-size: 11px;")
+        first_connect_note.setWordWrap(True)
+        outer.addWidget(first_connect_note)
+
+        # Live-wire to the worker so an in-flight LC refreshes the UI
+        worker = self._bull_parent_worker()
+        if worker is not None:
+            worker.sig_categories_ready.connect(self._bull_on_cats_ready)
+            self.finished.connect(
+                lambda _: self._bull_disconnect_worker_sig())
 
         outer.addStretch()
         return w
+
+    # ── Bulletins tab — helpers ───────────────────────────────────
+
+    def _bull_parent_worker(self):
+        p = self.parent()
+        return getattr(p, "worker", None) if p else None
+
+    def _is_connected_for_bulletins(self) -> bool:
+        """True when the parent main window is currently connected to a BBS.
+        Mirrors btn_refresh's enabled state (set in _on_connected, cleared
+        in _on_disconnected) — that's the simplest is-actively-connected
+        signal exposed by MainWindow."""
+        p = self.parent()
+        return bool(p and getattr(p, "btn_refresh", None)
+                    and p.btn_refresh.isEnabled())
+
+    def _bull_format_last_lc(self, ts) -> str:
+        if not ts:
+            return "Last checked: never"
+        s = str(ts).replace("Z", "")
+        if "T" in s:
+            d, t = s.split("T", 1)
+            return f"Last checked: {d} {t[:5]} UTC"
+        return f"Last checked: {ts}"
+
+    def _bull_populate_cat_list(self, known, subs):
+        """Render the checkable category list.
+
+        known = [[cat, count], ...] — cached LC output for the Home BBS
+        subs  = uppercase category names currently subscribed
+        Items present in `subs` but missing from `known` are rendered
+        with count '?' so the user's pre-existing picks survive the
+        migration from the old free-text UI until the next LC run.
+        Checked state = name in `subs`."""
+        self.lst_bull_cats.clear()
+        subs_set = {s.upper() for s in subs if s}
+        rows = []
+        seen = set()
+        for c in known:
+            if isinstance(c, (list, tuple)) and len(c) >= 2:
+                name, count = str(c[0]).upper(), c[1]
+            else:
+                name, count = str(c).upper(), 0
+            rows.append((name, count))
+            seen.add(name)
+        for s in sorted(subs_set - seen):
+            rows.append((s, None))   # None → render as "?"
+
+        if not rows:
+            empty = QListWidgetItem(
+                "(empty — connect to your Home BBS with the master "
+                "checkbox above enabled to populate)")
+            empty.setFlags(Qt.ItemFlag.ItemIsEnabled)  # non-selectable
+            self.lst_bull_cats.addItem(empty)
+            return
+
+        for name, count in sorted(rows):
+            count_str = "?" if count is None else str(count)
+            item = QListWidgetItem(f"  {name:<12}  {count_str}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                Qt.CheckState.Checked if name in subs_set
+                else Qt.CheckState.Unchecked)
+            self.lst_bull_cats.addItem(item)
+
+    def _bull_collect_checked(self) -> list:
+        """Return uppercase category names currently checked in the
+        listbox. Empty list if the list is the (empty) placeholder row."""
+        result = []
+        for i in range(self.lst_bull_cats.count()):
+            item = self.lst_bull_cats.item(i)
+            if not (item.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+                continue
+            if item.checkState() != Qt.CheckState.Checked:
+                continue
+            txt = item.text().strip()
+            if not txt:
+                continue
+            cat = txt.split()[0].upper()
+            if cat:
+                result.append(cat)
+        return result
+
+    def _bull_fetch_categories(self):
+        """Triggered by the small Refresh now button. Power-user
+        override — runs LC immediately. Auto-update already handles
+        the 10-day cadence; this is the 'I want it updated NOW' path."""
+        worker = self._bull_parent_worker()
+        if worker is None or getattr(worker, "session", None) is None:
+            QMessageBox.warning(
+                self, "Not Connected",
+                "Connect to your Home BBS first, then try again.")
+            return
+        self.btn_bull_refresh.setEnabled(False)
+        self.btn_bull_refresh.setText("Fetching…")
+        worker.do_list_categories(open_dialog=False)
+
+    def _bull_on_cats_ready(self, categories, _open_dialog):
+        """Worker has fetched LC and persisted the cache. Re-render the
+        checkbox list preserving the user's current selections so an
+        in-flight LC doesn't lose what they've ticked."""
+        p = self.parent()
+        live_auto = ((p.config.get("bulletins", {}).get(
+                        "auto_category_update", {}) if p else {}) or {})
+        new_known = [[c, n] for c, n in categories]
+        currently_checked = self._bull_collect_checked()
+        self._bull_populate_cat_list(new_known, currently_checked)
+        self.lbl_bull_last_lc.setText(
+            self._bull_format_last_lc(live_auto.get("last_lc_at")))
+        self.btn_bull_refresh.setText("🔄  Refresh now")
+        self.btn_bull_refresh.setEnabled(self._bull_connected_at_open)
+
+    def _bull_disconnect_worker_sig(self):
+        worker = self._bull_parent_worker()
+        if worker is None:
+            return
+        try:
+            worker.sig_categories_ready.disconnect(self._bull_on_cats_ready)
+        except (TypeError, RuntimeError):
+            pass
+
+    def _bull_reset_clicked(self):
+        home_bbs_raw = self._cfg.get("user", {}).get(
+            "home_bbs", "").strip().upper()
+        home_bbs = home_bbs_raw.split(".")[0].split("-")[0]
+        if not home_bbs:
+            return
+        msg = (
+            f"Reset bulletin check state for {home_bbs}?\n\n"
+            f"This will:\n"
+            f"  • Forget that you've checked bulletins on {home_bbs} "
+            f"before (so the next check will re-tombstone all but the "
+            f"2 newest per category, capping any backlog)\n"
+            f"  • Clear all 'previously skipped' markers for {home_bbs} "
+            f"(so bulletins you skipped before become eligible again)\n\n"
+            f"This does NOT delete any downloaded bulletins from your "
+            f"folders. Your personal mail, contacts, and watermarks "
+            f"are untouched.")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Reset bulletin check state")
+        box.setText(msg)
+        btn_reset = box.addButton(
+            "Reset", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is not btn_reset:
+            return
+
+        p = self.parent()
+        if p is None:
+            return
+        flag_key = f"bulletins_seen@{home_bbs}"
+        had_flag = (p.config.setdefault("visited_bbs", {})
+                    .pop(flag_key, None) is not None)
+        try:
+            n_tombs = p.db.clear_bulletin_tombstones_for_bbs(home_bbs)
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Reset failed", f"Could not clear tombstones:\n{e}")
+            return
+        save_config(p.config)
+        # Mirror into our snapshot so OK won't re-add the flag
+        self._cfg.setdefault("visited_bbs", {}).pop(flag_key, None)
+
+        QMessageBox.information(
+            self, "Reset complete",
+            f"Bulletin check state for {home_bbs} has been reset.\n\n"
+            f"• First-connect flag "
+            f"{'cleared' if had_flag else 'was not set'}.\n"
+            f"• {n_tombs} 'previously skipped' marker"
+            f"{'s' if n_tombs != 1 else ''} cleared.\n\n"
+            f"Your next bulletin check on {home_bbs} will re-cap any "
+            f"backlog and let previously-skipped bulletins through.")
 
     # ── Tab: Mail-Call !!! ─────────────────────────────────────────
     #
@@ -2867,10 +3395,31 @@ class SettingsDialog(QDialog):
         self.e_max_size = QLineEdit(str(a.get("max_message_size_kb", 50)))
         self.e_max_size.setFixedWidth(70)
 
+        # Character-set selector (issue #2). utf-8 default; cp437/cp850 let
+        # DOS-art bulletins in the TECH area render their box-drawing graphics
+        # instead of showing replacement glyphs. Applies to the next text the
+        # BBS sends (and to a live session immediately on save).
+        self.combo_codec = QComboBox()
+        self.combo_codec.addItem("UTF-8 (default)", "utf-8")
+        self.combo_codec.addItem("CP437 (DOS graphics)", "cp437")
+        self.combo_codec.addItem("CP850 (DOS Latin-1)", "cp850")
+        self.combo_codec.setToolTip(
+            "Character set used to decode incoming BBS text.\n"
+            "Switch to CP437/CP850 to read bulletins built with\n"
+            "8-bit ASCII (DOS) box-drawing graphics, then view\n"
+            "the bulletin in the Terminal view.")
+        _codec_idx = self.combo_codec.findData(
+            str(a.get("text_codec", "utf-8")).lower())
+        self.combo_codec.setCurrentIndex(_codec_idx if _codec_idx >= 0 else 0)
+        codec_row = QHBoxLayout()
+        codec_row.addWidget(self.combo_codec)
+        codec_row.addStretch()
+
         form.addRow("", self.chk_auto_dl)
         form.addRow("", self.chk_dark_mode)
         form.addRow("Message font size:", font_row)
         form.addRow("", self._font_preview)
+        form.addRow("Character set:", codec_row)
         form.addRow("Data directory:", self.e_data_dir)
         form.addRow("Max message size (KB):", self.e_max_size)
 
@@ -2907,20 +3456,30 @@ class SettingsDialog(QDialog):
         self._cfg["app"]["dark_mode"]            = self.chk_dark_mode.isChecked()
         self._cfg["app"]["font_size"]            = self.spin_font.value()
         self._cfg["app"]["data_dir"]             = self.e_data_dir.text().strip() or "data"
+        self._cfg["app"]["text_codec"]           = self.combo_codec.currentData()
         sz = self.e_max_size.text().strip()
         self._cfg["app"]["max_message_size_kb"]  = int(sz) if sz.isdigit() else 50
 
-        # Bulletins tab
+        # Bulletins tab — single master switch gates LC seeding +
+        # bulletin check; subscriptions are derived from the checkable
+        # category list (the user's tick marks).
         self._cfg.setdefault("bulletins", {})
-        self._cfg["bulletins"]["check_on_connect"] = self.chk_bull_auto.isChecked()
-        raw_subs = self.bull_list.toPlainText().strip()
-        subs = []
-        for line in raw_subs.splitlines():
-            # Strip @ scope if user typed SITREP@USA — store category only
-            cat = line.strip().upper().split("@")[0]
-            if cat:
-                subs.append(cat)
-        self._cfg["bulletins"]["subscriptions"] = subs
+        self._cfg["bulletins"]["check_on_connect"] = (
+            self.chk_bull_auto.isChecked())
+        self._cfg["bulletins"]["subscriptions"] = (
+            self._bull_collect_checked())
+
+        # last_lc_at and known_categories are runtime state owned by
+        # SessionWorker; pull the latest from the live parent config so
+        # a Refresh-now done while this dialog was open isn't wiped by
+        # our stale snapshot.
+        p = self.parent()
+        live_auto = ((p.config.get("bulletins", {}).get(
+                        "auto_category_update", {}) if p else {}) or {})
+        self._cfg["bulletins"]["auto_category_update"] = {
+            "last_lc_at":       live_auto.get("last_lc_at"),
+            "known_categories": live_auto.get("known_categories") or [],
+        }
 
         # PTT tab
         sig_map = {0: "rts", 1: "dtr", 2: "rts+dtr"}
@@ -3484,6 +4043,9 @@ class MainWindow(QMainWindow):
         self._send_current    = 0
         self._last_disconnect_time = 0.0   # used to add extra VARA reset delay
         self._last_link_bps   = 0          # last seen VARA link speed for estimates
+        self._post_lc_action  = None   # callable to run after sig_categories_ready
+                                       # (used to chain LC → bulletin check in the
+                                       # connect flow; cleared as it fires)
         self._update_folder_counts()   # populate badges on startup
 
         self._refresh_folder("inbox")
@@ -3538,27 +4100,66 @@ class MainWindow(QMainWindow):
         act_addrbook = QAction("&Address Book…", self)
         act_addrbook.triggered.connect(self._on_address_book)
         act_quit = QAction("&Quit", self)
+        act_quit.setShortcut(QKeySequence("Ctrl+Q"))
         act_quit.triggered.connect(self.close)
         file_menu.addAction(act_settings)
         file_menu.addAction(act_addrbook)
         file_menu.addSeparator()
         file_menu.addAction(act_quit)
 
-        # View
+        # Message — mail actions (issue #3). Each also works as a single
+        # keystroke when the message list has focus (see Help → Keyboard
+        # Shortcuts). Lambdas click the MailView buttons, which exist by the
+        # time these fire, so disabled/enabled state is honored.
+        msg_menu = mb.addMenu("&Message")
+        act_new = QAction("✏  &New Message", self)
+        act_new.setShortcut(QKeySequence("Ctrl+N"))
+        act_new.triggered.connect(lambda: self.mail_view.btn_new.click())
+        act_reply = QAction("↩  &Reply", self)
+        act_reply.setShortcut(QKeySequence("Ctrl+R"))
+        act_reply.triggered.connect(lambda: self.mail_view.btn_reply.click())
+        act_del = QAction("🗑  &Delete", self)
+        act_del.triggered.connect(lambda: self.mail_view.btn_delete.click())
+        act_find = QAction("🔍  &Search", self)
+        act_find.setShortcut(QKeySequence("Ctrl+F"))
+        act_find.triggered.connect(lambda: self.mail_view.btn_search.click())
+        act_markall = QAction("✓  Mark All R&ead", self)
+        act_markall.setShortcut(QKeySequence("Ctrl+Shift+M"))
+        act_markall.triggered.connect(
+            lambda: self.mail_view.btn_mark_all_read.click())
+        act_outbox = QAction("📤  Send &Outbox Now", self)
+        act_outbox.setShortcut(QKeySequence("Ctrl+Shift+O"))
+        act_outbox.triggered.connect(
+            lambda: self.mail_view.btn_send_outbox.click())
+        for a in (act_new, act_reply, act_del, act_find):
+            msg_menu.addAction(a)
+        msg_menu.addSeparator()
+        msg_menu.addAction(act_markall)
+        msg_menu.addAction(act_outbox)
+
+        # View — function keys switch the central pane
         view_menu = mb.addMenu("&View")
         act_mail = QAction("📬  Mail View", self)
+        act_mail.setShortcut(QKeySequence("F2"))
         act_term = QAction("💻  Terminal View", self)
+        act_term.setShortcut(QKeySequence("F3"))
+        act_debug = QAction("🔬  Debug View", self)
+        act_debug.setShortcut(QKeySequence("F4"))
         act_mail.triggered.connect(lambda: self._switch_view(self.VIEW_MAIL))
         act_term.triggered.connect(lambda: self._switch_view(self.VIEW_TERMINAL))
-        act_debug = view_menu.addAction("🔬  Debug View")
         act_debug.triggered.connect(lambda: self._switch_view(self.VIEW_DEBUG))
         view_menu.addAction(act_mail)
         view_menu.addAction(act_term)
+        view_menu.addAction(act_debug)
 
         # Help
         help_menu = mb.addMenu("&Help")
+        act_keys = QAction("⌨  &Keyboard Shortcuts", self)
+        act_keys.setShortcut(QKeySequence("F1"))
+        act_keys.triggered.connect(self._on_shortcuts_help)
         act_about = QAction("&About", self)
         act_about.triggered.connect(self._on_about)
+        help_menu.addAction(act_keys)
         help_menu.addAction(act_about)
 
     # ── Toolbar ───────────────────────────────────────────────────
@@ -3666,6 +4267,26 @@ class MainWindow(QMainWindow):
         self.btn_disconnect.clicked.connect(self._on_disconnect)
         tb.addWidget(self.btn_connect)
         tb.addWidget(self.btn_disconnect)
+
+        # Stop a slow download without dropping the link: interrupts the
+        # read and sends 'A' to the BBS to return to the command prompt.
+        # Hidden until a download is actually running (see _on_progress).
+        self.btn_abort = QPushButton("⏹ Stop")
+        self.btn_abort.setToolTip(
+            "Stop the current download and return to the BBS command "
+            "prompt.\nSends 'A' to the BBS; you stay connected so you can "
+            "disconnect\ncleanly or carry on.")
+        self.btn_abort.setStyleSheet(
+            "QPushButton { background-color:#5a2a2a; color:#ffcccc; "
+            "border:1px solid #aa4444; }"
+            "QPushButton:disabled { background-color:transparent; "
+            "color:#777777; border:1px solid #555555; }")
+        self.btn_abort.clicked.connect(self._on_abort)
+        # Always visible so it's easy to find; enabled only while a download
+        # is actually running (see _on_progress). Greyed-out at rest tells
+        # the user the capability exists.
+        self.btn_abort.setEnabled(False)
+        tb.addWidget(self.btn_abort)
 
         self.btn_refresh = QPushButton("🔄 Refresh")
         self.btn_refresh.setToolTip(
@@ -3801,7 +4422,11 @@ class MainWindow(QMainWindow):
         self._set_transport_terminal_mode(view in (self.VIEW_TERMINAL, self.VIEW_DEBUG))
         if view == self.VIEW_TERMINAL:
             self.terminal.input_line.setFocus()
-        elif view == self.VIEW_MAIL and self._pending_summary is not None:
+        elif view == self.VIEW_MAIL:
+            # Land focus inside the three-pane Tab cycle so Tab never starts
+            # up in the connection toolbar (issue #3).
+            self.mail_view.focus_default()
+        if view == self.VIEW_MAIL and self._pending_summary is not None:
             # User switched to Mail view after choosing to download from Terminal
             summary = self._pending_summary
             self._pending_summary = None
@@ -3814,6 +4439,16 @@ class MainWindow(QMainWindow):
     def _on_terminal_toggle(self):
         # Legacy — kept for any menu wiring, routes to terminal view
         self._switch_view(self.VIEW_TERMINAL)
+
+    def showEvent(self, event):
+        """On first show, seed keyboard focus into the mail panes (the default
+        view) so the initial Tab stays in the three-pane cycle rather than
+        walking the connection toolbar (issue #3)."""
+        super().showEvent(event)
+        if not getattr(self, "_initial_focus_done", False):
+            self._initial_focus_done = True
+            if self.stack.currentIndex() == self.VIEW_MAIL:
+                self.mail_view.focus_default()
 
     # ── BBS combo helpers ─────────────────────────────────────────
 
@@ -4011,6 +4646,7 @@ class MainWindow(QMainWindow):
         self.worker.sig_progress.connect(self._on_progress)
         self.worker.sig_bulletin_check.connect(self._on_bulletin_check)
         self.worker.sig_bulletin_done.connect(self._on_bulletin_done)
+        self.worker.sig_categories_ready.connect(self._on_categories_ready)
         self.worker.sig_yapp_progress.connect(self._on_yapp_progress)
         self.worker.sig_yapp_done.connect(self._on_yapp_done)
         self.worker.sig_yapp_error.connect(self._on_yapp_error)
@@ -4074,6 +4710,18 @@ class MainWindow(QMainWindow):
             t = self.worker.session.transport
             if hasattr(t, "set_terminal_mode"):
                 t.set_terminal_mode(enabled)
+
+    def _apply_text_codec(self, codec: str):
+        """Apply the selected character set (issue #2) to the live transport
+        so the next BBS text decodes with it. The choice is set in App
+        settings and persisted there; this just pushes it to a running
+        session. cp437/cp850 let DOS-art bulletins (e.g. the TECH area)
+        render their box-drawing graphics instead of replacement glyphs."""
+        if self.worker and self.worker.session:
+            t = self.worker.session.transport
+            if hasattr(t, "set_text_codec"):
+                t.set_text_codec(codec)
+            self.terminal.append(f"\n[charset set to {codec}]\n", "#888888")
 
     def _on_rf_connected(self):
         """Fires immediately when RF link is up — before login/registration."""
@@ -4290,7 +4938,12 @@ class MainWindow(QMainWindow):
 
     def _on_progress(self, op: str, current: int, total: int, detail: str):
         """Update toolbar pill and status bar progress during operations."""
+        # The Stop/abort button only makes sense while we're RECEIVING — it
+        # tells the BBS to quit sending. Show it during a download, hide it
+        # otherwise (sending/outbox or done).
+        self.btn_abort.setEnabled(op == "downloading")
         if op == "done" or total == 0:
+            self.btn_abort.setEnabled(False)
             self._prog_bar.setVisible(False)
             self._prog_detail.setVisible(False)
             self.status_label.setVisible(True)
@@ -4311,6 +4964,19 @@ class MainWindow(QMainWindow):
         self._prog_detail.setVisible(True)
         self._prog_bar.setValue(pct)
         self._prog_bar.setVisible(True)
+
+    def _on_abort(self):
+        """Stop button — bail out of a slow download without dropping the
+        link. Interrupts the worker's blocked read immediately; the session
+        then sends 'A' to the BBS and resyncs to the command prompt."""
+        if self.worker:
+            self.worker.do_abort()
+        # Disable so a second click doesn't queue another abort; the progress
+        # 'done' update hides it once the resync finishes.
+        self.btn_abort.setEnabled(False)
+        self.terminal.append("\n[stopping download — returning to BBS prompt]\n",
+                             "#ffaa55")
+        self._set_status("Stopping download…", connected=True)
 
     def _on_disconnected(self):
         self.btn_connect.setEnabled(True)
@@ -4618,12 +5284,76 @@ class MainWindow(QMainWindow):
             # Trigger bulletin check if enabled, subscriptions exist, and on home BBS
             bull_cfg = self.config.get("bulletins", {})
             subs = bull_cfg.get("subscriptions", [])
-            if bull_cfg.get("check_on_connect", False) and subs and self._is_home_bbs():
-                self._set_status("Checking bulletins…", connected=True)
-                QTimer.singleShot(200, lambda: self.worker.do_check_bulletins(subs))
+            on_home   = self._is_home_bbs()
+            want_bull = (bull_cfg.get("check_on_connect", False)
+                         and subs and on_home)
+
+            # Auto Category Update — runs LC at most once per 10 days.
+            # When due AND we're on Home BBS, run LC first then chain
+            # into whatever the existing decision was. Per
+            # feedback_rf_airtime_politeness this is gated by an absolute
+            # time delta, never by "every connect."
+            if on_home and self._auto_category_update_due():
+                self._set_status(
+                    "Updating bulletin categories…", connected=True)
+                if want_bull:
+                    self._post_lc_action = (
+                        lambda subs=subs: self._begin_bulletin_check(subs))
+                else:
+                    self._post_lc_action = self._prompt_outbox
+                QTimer.singleShot(200, lambda: self.worker
+                    .do_list_categories(open_dialog=False))
+                return
+
+            if want_bull:
+                self._begin_bulletin_check(subs)
                 return
             # Route through _prompt_outbox — handles outbox and Telnet auto-disconnect
             self._prompt_outbox()
+
+    def _begin_bulletin_check(self, subs):
+        """Kick off the per-category L> sweep. Factored out so the
+        auto-category-update post-LC chain and the direct path both go
+        through the same entrypoint."""
+        self._set_status("Checking bulletins…", connected=True)
+        QTimer.singleShot(200, lambda: self.worker.do_check_bulletins(subs))
+
+    def _auto_category_update_due(self) -> bool:
+        """True iff 'Check for new bulletins on connect' is on AND
+        (last_lc_at is None OR (now - last_lc_at) >= 10 days).
+        Caller is expected to verify we're on Home BBS first."""
+        bull_cfg = self.config.get("bulletins", {}) or {}
+        if not bull_cfg.get("check_on_connect", False):
+            return False
+        auto_cfg = bull_cfg.get("auto_category_update", {}) or {}
+        last = auto_cfg.get("last_lc_at")
+        if not last:
+            return True
+        import datetime as _dt
+        try:
+            last_dt = _dt.datetime.strptime(
+                str(last).replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+        except (ValueError, TypeError):
+            return True   # bad stored value — treat as never
+        return (_dt.datetime.utcnow() - last_dt) >= _dt.timedelta(days=10)
+
+    def _on_categories_ready(self, categories, open_dialog):
+        """Worker has fetched LC, persisted the cache to config, and may
+        have inserted system-message notifications for newly-appeared
+        categories. Refresh the inbox so the user sees them, then chain
+        into any pending post-LC action."""
+        try:
+            self._refresh_folder("inbox")
+            self._update_folder_counts()
+        except Exception:
+            pass
+        action = self._post_lc_action
+        self._post_lc_action = None
+        if action:
+            try:
+                action()
+            except Exception as e:
+                self._on_log(f"[SYS] Post-LC action failed: {e}")
 
     def _on_download_done(self, count: int):
         self._set_status(
@@ -4888,6 +5618,7 @@ class MainWindow(QMainWindow):
         if   folder == "inbox":    rows = self.db.get_inbox()
         elif folder == "outbox":   rows = self.db.get_outbox()
         elif folder == "sent":     rows = self.db.get_sent()
+        elif folder == "notifications": rows = self.db.get_notifications()
         elif folder == "bulletins": rows = self.db.get_bulletins()
         elif folder.startswith("bulletin:"):
             cat  = folder.split(":", 1)[1]
@@ -4896,10 +5627,11 @@ class MainWindow(QMainWindow):
             rows = self.db.get_sent()
         self.mail_view.load_table(rows, folder)
         # Sync folder tree selection
-        item_map = {"inbox":     self.mail_view._fi,
-                    "outbox":    self.mail_view._fo,
-                    "sent":      self.mail_view._fs,
-                    "bulletins": self.mail_view._fb}
+        item_map = {"inbox":         self.mail_view._fi,
+                    "outbox":        self.mail_view._fo,
+                    "sent":          self.mail_view._fs,
+                    "notifications": self.mail_view._fn,
+                    "bulletins":     self.mail_view._fb}
         item = item_map.get(folder)
         if item:
             self.mail_view.folder_tree.setCurrentItem(item)
@@ -4916,6 +5648,8 @@ class MainWindow(QMainWindow):
             rows = self.db.get_inbox()
         elif folder == "outbox":
             rows = self.db.get_outbox()
+        elif folder == "notifications":
+            rows = self.db.get_notifications()
         elif folder == "bulletins":
             rows = self.db.get_bulletins()
         elif folder.startswith("bulletin:"):
@@ -4927,7 +5661,7 @@ class MainWindow(QMainWindow):
         for rd in rows:
             if rd["id"] == row_id:
                 self.mail_view.show_preview(dict(rd), folder)
-                if folder == "inbox" and not rd.get("read", 0):
+                if folder in ("inbox", "notifications") and not rd.get("read", 0):
                     self.db.mark_read(row_id)
                     self._update_folder_counts()
                     self.mail_view.mark_row_read(
@@ -4990,8 +5724,13 @@ class MainWindow(QMainWindow):
             f"Will send {mode}.")
 
     def _on_mark_all_read(self):
-        self.db.mark_all_read()
-        self._refresh_folder("inbox")
+        folder = self._current_folder
+        if folder == "notifications":
+            self.db.mark_all_notifications_read()
+            self._refresh_folder("notifications")
+        else:
+            self.db.mark_all_read()
+            self._refresh_folder("inbox")
         self._update_folder_counts()
 
     def _on_search(self):
@@ -5001,10 +5740,11 @@ class MainWindow(QMainWindow):
         if not term:
             return
         all_rows = {
-            "inbox":    self.db.get_inbox(),
-            "outbox":   self.db.get_outbox(),
-            "sent":     self.db.get_sent(),
-            "bulletins": self.db.get_bulletins(),
+            "inbox":         self.db.get_inbox(),
+            "outbox":        self.db.get_outbox(),
+            "sent":          self.db.get_sent(),
+            "notifications": self.db.get_notifications(),
+            "bulletins":     self.db.get_bulletins(),
         }
         self.mail_view.run_search(term, scope, all_rows)
 
@@ -5093,6 +5833,9 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(f"QtC - {mycall}" if mycall else "QtC")
             # Apply font size immediately — no restart needed
             self._apply_font_size(self.config.get("app", {}).get("font_size", 10))
+            # Push the chosen character set to a live session right away
+            self._apply_text_codec(
+                self.config.get("app", {}).get("text_codec", "utf-8"))
             # Reload Mail-Call config (schedule/bbs_key/enabled may have changed)
             self._mc_scheduler.refresh()
             QMessageBox.information(self, "Settings Saved",
@@ -5361,6 +6104,75 @@ class MainWindow(QMainWindow):
             "via VARA HF, VARA FM, and Telnet.<br><br>"
             "Built with Python + PyQt6.")
 
+    def _on_shortcuts_help(self):
+        """Keyboard cheat sheet (issue #3). Everything here is also a button
+        or menu item — these keys just make QtC fast to drive without a
+        mouse. Single-letter keys act on the message list when it has focus;
+        the Ctrl/F-key bindings work anywhere in the main window."""
+        rows = [
+            ("Navigation", ""),
+            ("Tab / Shift+Tab",  "Cycle: folders → messages → body"),
+            ("↑ / ↓",            "Folders/list: select · body: scroll"),
+            ("Enter",            "Jump into the reading pane"),
+            ("Esc",              "Back to the list from the body"),
+            ("Views", ""),
+            ("F2 / F3 / F4",   "Mail / Terminal / Debug view"),
+            ("Message list (when focused)", ""),
+            ("N",                "New message"),
+            ("R",                "Reply"),
+            ("D  /  Del",        "Delete"),
+            ("F",                "Search"),
+            ("M",                "Mark all read"),
+            ("Anywhere in the window", ""),
+            ("Ctrl+N",           "New message"),
+            ("Ctrl+R",           "Reply"),
+            ("Ctrl+F",           "Search"),
+            ("Ctrl+Shift+M",     "Mark all read"),
+            ("Ctrl+Shift+O",     "Send outbox now"),
+            ("F1",               "This cheat sheet"),
+            ("Ctrl+Q",           "Quit"),
+        ]
+        lines = []
+        for key, desc in rows:
+            if desc == "":
+                lines.append(f"\n  {key}")
+                lines.append("  " + "─" * len(key))
+            else:
+                lines.append(f"    {key:<16}{desc}")
+        body = "\n".join(lines).lstrip("\n")
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("QtC — Keyboard Shortcuts")
+        dlg.setMinimumWidth(440)
+        lay = QVBoxLayout(dlg)
+        view = QTextEdit()
+        view.setReadOnly(True)
+        # Match the app's configured message font size so readers who bump
+        # the font for their eyes get a bigger cheat sheet too. NoWrap keeps
+        # the key/description columns aligned at larger sizes (a horizontal
+        # scrollbar appears instead of breaking the layout).
+        font_size = int(self.config.get("app", {}).get("font_size", 10))
+        view.setFont(QFont("Courier New", font_size))
+        view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        view.setPlainText(body)
+        lay.addWidget(view)
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        lay.addWidget(btns)
+
+        # Open large enough that the whole sheet fits at the current font with
+        # no scrollbars — comfortably handles the bigger sizes (≥14 pt) that
+        # readers bump to for their eyes. Measured from the font itself so it
+        # stays right at any size; the floor matches the old compact size.
+        fm = view.fontMetrics()
+        text_w = max(fm.horizontalAdvance(ln) for ln in body.split("\n"))
+        n_lines = body.count("\n") + 1
+        w = text_w + 80                              # frame + margins + scrollbar
+        h = fm.lineSpacing() * (n_lines + 2) + 90    # + button box + margins
+        dlg.resize(max(460, w), max(540, h))
+        dlg.exec()
+
     # ── Helpers ───────────────────────────────────────────────────
 
     def _apply_font_size(self, size: int):
@@ -5373,9 +6185,10 @@ class MainWindow(QMainWindow):
 
     def _update_folder_counts(self):
         unread  = self.db.get_unread_count()
+        notifs  = self.db.get_notification_unread_count()
         pending = len(self.db.get_pending_outbox())
         sent    = len(self.db.get_sent())
-        self.mail_view.update_folder_counts(unread, pending, sent)
+        self.mail_view.update_folder_counts(unread, pending, sent, notifs)
         # Update bulletin category subfolders
         cats = self.db.get_bulletin_categories()
         self.mail_view.update_bulletin_categories(cats)
@@ -5446,6 +6259,14 @@ def _apply_dark_palette(app):
     palette.setColor(QPalette.ColorRole.Link,            accent)
     palette.setColor(QPalette.ColorRole.Highlight,       accent)
     palette.setColor(QPalette.ColorRole.HighlightedText, QColor(255, 255, 255))
+    # Inactive selection — a pane that doesn't have keyboard focus dims its
+    # selected row to a neutral gray, so it's clear which of the three mail
+    # panes is active. (setColor above paints every color group the same
+    # green, which is why an unfocused Inbox row otherwise stayed bright.)
+    palette.setColor(QPalette.ColorGroup.Inactive,
+                     QPalette.ColorRole.Highlight,       QColor(70, 70, 70))
+    palette.setColor(QPalette.ColorGroup.Inactive,
+                     QPalette.ColorRole.HighlightedText, QColor(205, 205, 205))
     palette.setColor(QPalette.ColorRole.Mid,             mid)
     palette.setColor(QPalette.ColorRole.Shadow,          darkest)
     palette.setColor(QPalette.ColorRole.Dark,            darkest)

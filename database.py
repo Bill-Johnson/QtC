@@ -1,4 +1,4 @@
-# QtC v0.13.2-beta — database.py  (built 2026-05-24)
+# QtC v0.14.0-beta — database.py  (built 2026-06-21)
 # VARA BBS Client — A modern BBS client for LinBPQ/BPQ32 nodes
 # via VARA HF, VARA FM, and Telnet.
 #
@@ -266,20 +266,46 @@ class MessageDatabase:
                   msg.subject, msg.body, msg.size, int(msg.downloaded)))
 
     def get_inbox(self, bbs_id: str = None) -> list:
+        """Return real radio mail only. QtC-generated notifications live in
+        their own bbs_id namespace (SYSTEM_BBS_ID) and are returned by
+        get_notifications() so they get their own folder instead of being
+        buried at the bottom of the Inbox by msg_number ordering."""
         with self._conn() as conn:
             if bbs_id:
                 rows = conn.execute(
-                    "SELECT * FROM inbox WHERE bbs_id=? ORDER BY msg_number DESC",
-                    (bbs_id,)).fetchall()
+                    "SELECT * FROM inbox WHERE bbs_id=? AND bbs_id!=? "
+                    "ORDER BY msg_number DESC",
+                    (bbs_id, self.SYSTEM_BBS_ID)).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM inbox ORDER BY msg_number DESC").fetchall()
+                    "SELECT * FROM inbox WHERE bbs_id!=? ORDER BY msg_number DESC",
+                    (self.SYSTEM_BBS_ID,)).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_notifications(self) -> list:
+        """Return QtC-generated notifications (new bulletin category, etc.),
+        newest first. These share the inbox table but live in the
+        SYSTEM_BBS_ID namespace."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM inbox WHERE bbs_id=? ORDER BY msg_number DESC",
+                (self.SYSTEM_BBS_ID,)).fetchall()
             return [dict(r) for r in rows]
 
     def get_unread_count(self) -> int:
+        """Unread real-mail count (excludes QtC notifications)."""
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) FROM inbox WHERE read=0").fetchone()
+                "SELECT COUNT(*) FROM inbox WHERE read=0 AND bbs_id!=?",
+                (self.SYSTEM_BBS_ID,)).fetchone()
+            return row[0] if row else 0
+
+    def get_notification_unread_count(self) -> int:
+        """Unread QtC-notification count."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM inbox WHERE read=0 AND bbs_id=?",
+                (self.SYSTEM_BBS_ID,)).fetchone()
             return row[0] if row else 0
 
     def mark_read(self, row_id: int):
@@ -287,9 +313,18 @@ class MessageDatabase:
             conn.execute("UPDATE inbox SET read=1 WHERE id=?", (row_id,))
 
     def mark_all_read(self):
-        """Mark every inbox message as read."""
+        """Mark every real inbox message as read (leaves notifications alone)."""
         with self._conn() as conn:
-            conn.execute("UPDATE inbox SET read=1 WHERE read=0")
+            conn.execute(
+                "UPDATE inbox SET read=1 WHERE read=0 AND bbs_id!=?",
+                (self.SYSTEM_BBS_ID,))
+
+    def mark_all_notifications_read(self):
+        """Mark every QtC notification as read."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE inbox SET read=1 WHERE read=0 AND bbs_id=?",
+                (self.SYSTEM_BBS_ID,))
 
     def delete_message(self, row_id: int):
         """Delete from whichever table contains this id (inbox first, then outbox/sent)."""
@@ -472,6 +507,46 @@ class MessageDatabase:
                 INSERT OR IGNORE INTO bulletin_tombstones (msg_number, bbs_id)
                 VALUES (?,?)
             """, [(m.msg_number, bbs_id) for m in items])
+
+    def clear_bulletin_tombstones_for_bbs(self, home_bbs: str) -> int:
+        """Clear all tombstones whose bbs_id ends with '@<home_bbs>'.
+        Returns the number of rows deleted. Does NOT delete any rows from
+        the bulletins table — downloaded bulletins remain in the user's
+        folders. Used by the Bulletins-tab 'recover a lost bulletin' reset."""
+        pattern = f"%@{home_bbs}"
+        with self._conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM bulletin_tombstones WHERE bbs_id LIKE ?",
+                (pattern,))
+            return cur.rowcount
+
+    # ── Local system messages ──────────────────────────────────────
+
+    SYSTEM_BBS_ID = "QtC-system"
+
+    def create_system_message(self, mycall: str, subject: str,
+                              body: str) -> int:
+        """Insert a local QtC-generated notification into the inbox.
+        Used for things like 'new bulletin category appeared on your Home BBS'.
+        Returns the auto-incrementing msg_number assigned within the
+        SYSTEM_BBS_ID namespace, starting at 1."""
+        import datetime as _dt
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(MAX(msg_number), 0) FROM inbox WHERE bbs_id=?",
+                (self.SYSTEM_BBS_ID,)).fetchone()
+            next_n = (row[0] if row and row[0] is not None else 0) + 1
+            date_str = _dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+            conn.execute("""
+                INSERT INTO inbox
+                  (msg_number, bbs_id, date, msg_type, status,
+                   to_call, from_call, subject, body, size,
+                   downloaded, read)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,0)
+            """, (next_n, self.SYSTEM_BBS_ID, date_str, "P", "N",
+                  mycall.upper(), "QtC", subject, body,
+                  len(body.encode("utf-8")), 1))
+            return next_n
 
     # ── Watermarks ─────────────────────────────────────────────────
 
