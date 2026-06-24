@@ -109,10 +109,10 @@ Verify:
 
 ```
 cd C:\build\QtC\dist
-powershell Compress-Archive -Path QtC -DestinationPath QtC-0.11.0-beta-windows.zip
+powershell Compress-Archive -Path QtC -DestinationPath QtC-0.14.0-beta-windows.zip
 ```
 
-**Result:** `C:\build\QtC\dist\QtC-0.11.0-beta-windows.zip`
+**Result:** `C:\build\QtC\dist\QtC-0.14.0-beta-windows.zip`
 
 > The `-Path QtC` argument refers to the **folder** `C:\build\QtC\dist\QtC\`,
 > not the exe. The zip will contain a top-level `QtC\` folder with the exe
