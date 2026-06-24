@@ -120,16 +120,6 @@ powershell Compress-Archive -Path QtC -DestinationPath QtC-0.11.0-beta-windows.z
 
 ---
 
-## Step 6 — Upload to GitHub Releases
-
-Upload `C:\build\QtC\dist\QtC-0.11.0-beta-windows.zip` as a **second asset**
-on the existing Linux release at:
-`https://github.com/Bill-Johnson/QtC/releases`
-
-Do NOT create a separate Windows-only release.
-
----
-
 ## Troubleshooting
 
 **"Unable to find QtC.spec"**
