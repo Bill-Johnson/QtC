@@ -20,6 +20,9 @@ Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 ![Bulletin folders](screenshots/2_Bulletin_Folders.png)
 *Bulletins — categorized folder tree (BDN, EWN, SITREP …) with size-aware preview*
 
+![Bulletin subscriptions](screenshots/Bulletin_Subs.png)
+*Settings → Bulletins — pull the live category list off the BBS (📡 Get categories from BBS…) and check the ones you want*
+
 ![Mail-Call !!!](screenshots/7_Mail-Call.png)
 *Mail-Call !!! — scheduled unattended Home-BBS sessions (once daily, twice daily, every N hours, or custom times)*
 
@@ -34,6 +37,12 @@ Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 
 ![Compose Message](screenshots/3_Compose_message.png)
 *Compose — personal (P) and bulletin (B) types, address-book auto-fill, HA Home-BBS field*
+
+![Character set](screenshots/Char_Sets.png)
+*Settings → App — pick the text codec (UTF-8, CP437, or CP850) so DOS box-drawing bulletins render correctly*
+
+![Keyboard shortcuts](screenshots/Keyboard_Short_Cuts.png)
+*Help → Keyboard Shortcuts (F1) — drive QtC entirely from the keyboard*
 
 ---
 
@@ -54,9 +63,15 @@ Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 
 ### Bulletins
 - Subscribe by category (SITREP, EWN, WX, BDN, …); browse in the folder tree
+- **Pull the category list off the BBS** — *📡 Get categories from BBS…* runs the node's `LC` command and shows every category it carries, with message counts, as a checkable list; pick subscriptions from what the BBS actually offers instead of typing names blind
+- **New-category alerts** — QtC remembers the known category set and drops a 🔔 Notifications entry whenever a brand-new category appears on your BBS
 - **Selection dialog with size estimates** — prune before pulling over slow RF
-- **First-visit backlog management** — only the 2 newest bulletins per category are kept on a new install; skipped bulletins are tombstoned and never reappear
+- **First-visit backlog management** — only the newest few bulletins per category are kept on a new install (2 on HF, 3 on the roomier FM / Telnet paths); skipped bulletins are tombstoned and never reappear
 - 120-day tombstone cleanup on every launch
+
+### Notifications
+- **🔔 Notifications folder** — QtC-generated alerts (such as a new bulletin category) land in their own folder instead of mixing into your Inbox
+- Real radio mail and app notifications are counted and marked-read separately, so an app alert never inflates your unread-mail badge
 
 ### Mail-Call !!! — scheduled unattended sessions
 - Once daily, twice daily, three-times daily, every N hours, or custom times (Local or UTC)
@@ -77,7 +92,10 @@ Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 
 ### UI / UX
 - Three-pane main window — folder tree, message list, preview pane
-- Folder badges — Inbox (N new), Outbox (N), Bulletins (N new)
+- Folder badges — Inbox (N new), Outbox (N), Bulletins (N new), Notifications (N new)
+- **Keyboard-driven navigation** — Tab/Shift+Tab cycles folders → message list → reading pane; Enter opens the body, Esc returns to the list; F2/F3/F4 switch Mail/Terminal/Debug; single-key list actions (N new, R reply, D/Del delete, F search, M mark-all-read) plus Ctrl shortcuts that work anywhere. **Help → Keyboard Shortcuts (F1)** shows the full cheat sheet
+- **Character-set selector** — decode BBS content as UTF-8 (default), CP437 (DOS graphics), or CP850 (DOS Latin-1) in Settings → App, so box-drawing / line-art bulletins render correctly
+- **⏹ Stop button** — abort an in-progress download and return the BBS to its command prompt cleanly, instead of leaving it mid-transfer
 - **Message search** — real-time filter with scope dropdown and amber highlight in preview
 - **Multi-select delete** — Ctrl+click or Shift+click to act on multiple messages or bulletins
 - **Mark All Read** — one-click bulk read in the inbox
@@ -206,7 +224,7 @@ Linux/Mac `.tar.gz` release. Requires Python 3.10+, PyQt6, and pyserial.
 1. Open **File → Settings → My Station** — enter callsign, name, QTH, and Home BBS
 2. Go to the **BBS List** tab — add your BBS with transport (VARA HF or Telnet)
 3. Go to the **PTT** tab — select serial port and signal (RTS recommended for Digirig)
-4. Go to the **Bulletins** tab — enter category subscriptions (e.g. SITREP, EWN, WX)
+4. Go to the **Bulletins** tab — click **📡 Get categories from BBS…** to pull the live category list off your node and check the ones you want (or type them by hand, e.g. SITREP, EWN, WX)
 5. Close Settings, select your BBS from the dropdown, and click **⚡ Connect**
 
 On your first connection QtC will ask whether to download all personal messages or new only. After that, only new messages (PN) are fetched automatically — keeping sessions short and efficient over slow RF links.
@@ -266,6 +284,14 @@ sqlite3 ~/.local/share/qtc/data/messages.db "DELETE FROM bulletin_tombstones; DE
 ---
 
 ## Changelog
+
+### 0.14.0-beta (2026-06-23)
+- Added: **🔔 Notifications folder** — QtC-generated alerts now land in a dedicated Notifications folder in the tree instead of mixing into the Inbox. Real radio mail and app notifications are counted and marked-read separately (`get_notifications`, `get_notification_unread_count`, `mark_all_notifications_read`), so an app message never inflates the unread-mail badge. This folder is the reusable home for any future QtC-generated alert.
+- Added: **Bulletin category discovery** — a **📡 Get categories from BBS…** button in Settings → Bulletins runs the node's `LC` command and lists every bulletin category it carries, with message counts, as a checkable list. Subscriptions are picked from what the BBS actually offers rather than typed blind. QtC persists the known category set (`bulletins.auto_category_update.known_categories`) and, on connect, drops a 🔔 notification for each brand-new category that has appeared since the last check.
+- Added: **Per-category first-visit cap is transport-aware** — the newest-N bulletins kept per category on first visit is now 2 over VARA HF (tight RF) and 3 over the roomier VARA FM / Telnet paths.
+- Added: **Character-set selector** (Settings → App) — choose UTF-8 (default), CP437 (DOS graphics), or CP850 (DOS Latin-1) for decoding BBS content. CP437/CP850 render the box-drawing / line-art bulletins still common in TECH and similar areas; an unknown codec falls back to UTF-8. Applied live to the active session (`set_text_codec` on the transport), with a `[charset set to <codec>]` marker in the terminal.
+- Added: **Keyboard-driven navigation + cheat sheet (F1)** — drive QtC without the mouse. Tab/Shift+Tab cycles folders → message list → reading pane; ↑/↓ select or scroll; Enter jumps into the body, Esc returns to the list. F2/F3/F4 switch Mail/Terminal/Debug views. With the message list focused, single keys act: **N** new, **R** reply, **D**/**Del** delete, **F** search, **M** mark-all-read. Anywhere in the window: Ctrl+N, Ctrl+R, Ctrl+F, Ctrl+Shift+M (mark all read), Ctrl+Shift+O (send outbox), Ctrl+Q (quit). **Help → Keyboard Shortcuts (F1)** opens the full cheat sheet, sized to the configured message font. Focused pane is highlighted so it is always clear what the keys will act on.
+- Added: **⏹ Stop button** — abort an in-progress receive. Sets a transport abort flag so a blocked read bails out (`request_abort` / `clear_abort`, `DownloadAborted`), then returns the BBS to its command prompt instead of leaving it mid-transfer. Enabled only while a transfer is actually running.
 
 ### 0.13.2-beta (2026-05-24)
 - Added: **Mail-Call auto-downloads bulletins without the selection dialog** — when a Mail-Call slot fires, `_on_bulletin_check` skips `BulletinSelectDialog` and pulls every new bulletin in one batch. The dialog was added so users could prune large bulk pulls over slow VARA, but a station running scheduled Mail-Call slots is already staying current, so the unattended batch is small. Manual Connect flow is unchanged — dialog still appears so the user can prune. Log line `[BULL] Mail-Call session — auto-selecting all N bulletin(s), no dialog.` shows what happened.
