@@ -27,7 +27,8 @@
         "download_prompt": true,
         "max_message_size_kb": 50,
         "data_dir": "data",
-        "text_codec": "utf-8"
+        "text_codec": "utf-8",
+        "page_limit": 20
     },
     "mail_call": {
         "enabled": false,
@@ -46,5 +47,6 @@
             "known_categories": []
         }
     },
-    "visited_bbs": {}
+    "visited_bbs": {},
+    "bbs_paging": {}
 }

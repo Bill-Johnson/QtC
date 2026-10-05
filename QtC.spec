@@ -20,6 +20,8 @@ a = Analysis(
         # Bundle the SVG icon and splash PNG alongside the exe
         ('qtc_icon.svg', '.'),
         ('qtc_splash.png', '.'),
+        # Version history — the changelog lives here now, not in the READMEs
+        ('VERSION', '.'),
     ],
     hiddenimports=[
         # pyserial is imported lazily inside ptt.py functions — must be explicit
@@ -56,6 +58,10 @@ a = Analysis(
         'xmlrpc',
         'test',
         'unittest',
+        # Development / QA only — the --test-api control socket and its
+        # client never ship. main_window.py says so if --test-api is used.
+        'qtc_test_api',
+        'qtc_ctl',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

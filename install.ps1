@@ -4,7 +4,7 @@
 #   or:  powershell -ExecutionPolicy Bypass -File install.ps1
 
 $ErrorActionPreference = "Stop"
-$VERSION = "0.14.0-beta"
+$VERSION = "0.15.0-beta"
 $INSTALL_DIR = "$env:APPDATA\qtc"
 $BACKUP_CONFIG = "$env:USERPROFILE\qtc_config_backup.json"
 $BACKUP_DB     = "$env:USERPROFILE\qtc_messages_backup.db"
@@ -140,6 +140,10 @@ if (Test-Path "README.txt") {
 }
 if (Test-Path "README.md") {
     Copy-Item "README.md" "$INSTALL_DIR\README.md" -Force
+}
+# Version history — the changelog lives here now, not in the READMEs.
+if (Test-Path "VERSION") {
+    Copy-Item "VERSION" "$INSTALL_DIR\VERSION" -Force
 }
 if (Test-Path "LICENSE") {
     Copy-Item "LICENSE" "$INSTALL_DIR\LICENSE" -Force

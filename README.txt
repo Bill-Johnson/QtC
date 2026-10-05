@@ -4,9 +4,10 @@ Beta · Linux · Windows 11 · Raspberry Pi
   NOTE: QTC — Q-code for "I have messages for you."
 
 QtC is a modern desktop BBS client for amateur radio operators.
-It connects to LinBPQ / BPQ32 nodes via VARA HF, VARA FM, and Telnet,
-and handles mail download, bulletin subscriptions, compose, send, address book,
-and a clean three-pane GUI.
+It connects to LinBPQ / BPQ32 nodes via VARA HF, VARA FM, AX.25 packet
+(through Direwolf or UZ7HO SoundModem / QtSoundModem), and Telnet, and handles
+mail download, bulletin subscriptions, compose, send, address book, and a clean
+three-pane GUI.
 
 Developed by Bill Johnson KC9MTP — Valparaiso, Indiana.
 
@@ -19,22 +20,33 @@ Transports
   keying, and live link stats (bitrate, SN, bandwidth) in the status bar
 - VARA FM — packet-voice frequencies with NARROW / WIDE bandwidth control;
   same UI as HF
+- AX.25 packet — 300 baud HF and 1200 baud VHF through Direwolf or UZ7HO
+  SoundModem / QtSoundModem, using the modem's AGW port. The modem can run
+  on another computer on your network (many operators keep SoundModem on a
+  separate Windows PC) — set its address in the BBS entry
 - Telnet — LAN / internet nodes for local testing; auto-disconnects after
   the mail check completes
-- PTT — RTS or DTR via serial port; defensive flow-control flags for
-  Digirig / CP2105 setups
+- PTT — for VARA, RTS or DTR via serial port, with both lines set low
+  before QtC opens the port, so opening it does not key the radio;
+  defensive flow-control flags for Digirig / CP2105 setups. Packet modems
+  key the radio themselves
 
 Mail
-- Watermark-based check — first connect pulls a short tail (LL N), returning
-  connects pull only new messages (L watermark-); only personal mail
-  addressed to your callsign is auto-downloaded — never sysop chatter or
-  system traffic
-- Auto-download of new personal mail on every connect
+- Bounded mail check — every listing is limited by something you
+  control, never by how busy the BBS is: LM lists your own mailbox,
+  L> CATEGORY lists one page of each bulletin category you subscribe to,
+  and OP sets the BBS page length (20 by default) so a long listing
+  pauses instead of streaming. Only personal mail addressed to your
+  callsign is auto-downloaded — never sysop chatter or system traffic
+- Auto-download of new personal mail when you connect from Mail view.
+  Connecting from Terminal or Debug view logs in and stops there — you
+  drive
 - Compose & reply — personal (P) and bulletin (B) message types
-- Outbox queue — stage messages offline, send in one batch when connected,
-  with per-message send-now and @BBS-only filters
+- Outbox queue — stage messages offline; everything queued goes out
+  together on your next Send / Receive, with each message's size shown
+  in the list
 - Hierarchical addressing (HA) — full support for routed addresses
-  (e.g. KC9MTP.#NWIN.IN.USA.NOAM) in My Station, the address book,
+  (e.g. N0CALL.#REGION.ST.USA.NOAM) in My Station, the address book,
   and Compose
 
 Bulletins
@@ -48,8 +60,9 @@ Bulletins
   Notifications entry whenever a brand-new category appears on your BBS
 - Selection dialog with size estimates — prune before pulling over slow RF
 - First-visit backlog management — only the newest few bulletins per
-  category are kept on a new install (2 on HF, 3 on the roomier FM /
-  Telnet paths); skipped bulletins are tombstoned and never reappear
+  category are kept on a new install (2 on VARA HF and packet, 3 on the
+  roomier VARA FM / Telnet paths); skipped bulletins are tombstoned and
+  never reappear
 - 120-day tombstone cleanup on every launch
 
 Notifications
@@ -67,18 +80,23 @@ Mail-Call !!! — scheduled unattended sessions
 - 2-hour minimum guardrail; refuses to enable until your Home BBS has
   been visited at least once so the first unattended fire isn't a
   giant backlog
+- Over RF, an acceptance dialog spells out what running a radio on a
+  timer means. Check 97.221 before you enable it — unattended automatic
+  operation is limited to certain segments, and QtC cannot see your dial
+  frequency, so verifying it is yours to do
 
 YAPP file transfer (RF)
 - Pull files from the BBS files area using the WA7MBL YAPP protocol
-  over VARA HF / FM
+  over VARA HF / FM and AX.25 packet
 - Stall-watchdog tuned for weak HF — no premature aborts at 61 bps
-- Clean abort path — won't leave the BBS transmitting into the
-  terminal log
+- A file download cannot be stopped once it starts — the BBS has already
+  committed the whole file to the link — so over RF QtC asks before the
+  radio keys
 - Files saved to ~/.local/share/qtc/downloads/ (Linux) or
-  %APPDATA%\qtc\downloads\ (Windows)
+  %APPDATA%\qtc\downloads\ (Windows) by default
 
 Address Book
-- HA-aware contact list — callsign, name, city/state, Home BBS, send mode
+- HA-aware contact list — callsign, name, city/state, Home BBS
 - Auto-fill in Compose; use-count ranked dropdown
 - One-click "+save to address book" link in the Compose dialog
 
@@ -95,17 +113,25 @@ UI / UX
 - Character-set selector — decode BBS content as UTF-8 (default), CP437
   (DOS graphics), or CP850 (DOS Latin-1) in Settings -> App, so
   box-drawing / line-art bulletins render correctly
-- Stop button — abort an in-progress download and return the BBS to its
-  command prompt cleanly, instead of leaving it mid-transfer
+- Abort button — stop a mail or bulletin download that QtC is running
+  and return the BBS to its command prompt with the BBS's own "A"
+  command. You stay connected. It is greyed out during a YAPP file
+  transfer, which cannot be stopped, and in Terminal view, where the A
+  quick button does the same job
+- View dropdown — switch between Mail, Terminal and Debug from the
+  toolbar, or with F2 / F3 / F4
 - Message search — real-time filter with scope dropdown and amber
   highlight in preview
 - Multi-select delete — Ctrl+click or Shift+click to act on multiple
   messages or bulletins
 - Mark All Read — one-click bulk read in the inbox
 - Terminal view — clean dumb terminal for manual BBS commands, with a
-  YAPP file-download button
+  YAPP file-download button and quick buttons for the common commands.
+  Enter on an empty line sends a bare carriage return, which is how you
+  answer the BBS's page prompt when a listing stops at the OP limit
 - Debug view — verbose session log with a "Save Log..." export for
-  capturing RF transfer traces
+  capturing RF transfer traces. The log is only written when you save
+  it, so save before you close QtC
 - Dark mode — full Fusion dark palette, toggled in Settings -> App
 - Adjustable message font with live preview
 - Splash screen during launch
@@ -121,9 +147,11 @@ Requirements
 - Python 3.10 or newer (3.12 recommended)
 - PyQt6
 - pyserial (for PTT)
-- VARA HF modem (registered or trial) — run natively on Windows;
-  run under Wine or Crossover on Linux / Pi
-- A VOX or serial PTT interface
+- For VARA: the VARA HF and/or VARA FM modem (registered or trial) — run
+  natively on Windows; run under Wine or Crossover on Linux / Pi — and a
+  VOX or serial PTT interface
+- For packet: Direwolf, UZ7HO SoundModem (Windows) or QtSoundModem
+  (Linux / Pi)
 - USB Soundcard — Signalink, Rigblaster, Digirig
 - A LinBPQ / BPQ32 node to connect to
 
@@ -174,7 +202,7 @@ without -p, or pasted into a new file in an editor. Restore it with:
 
 The installer verifies the five Python source files, regenerates the splash
 image with make_splash.py, installs dependencies, and places a qtc launcher
-in /usr/local/bin/. Config and messages are preserved on reinstall.
+in ~/.local/bin/. Config and messages are preserved on reinstall.
 
 To run manually without installing:
   pip install -r requirements.txt --break-system-packages
@@ -208,8 +236,11 @@ Step 3 — Run
   This is expected for unsigned executables and only appears once.
 
 Windows notes:
-- VARA HF must be running before you click Connect in QtC
+- VARA, Direwolf or SoundModem must be running before you click Connect
 - Windows Firewall may ask to allow QtC on ports 8300/8301 — click Allow access
+- SoundModem on a separate Windows PC: set that PC's network to Private —
+  SoundModem's firewall rule blocks Public networks, and QtC then cannot
+  reach its AGW port
 - PTT serial ports show as COM3, COM4, etc. — select yours in Settings -> PTT
 - Config and messages are stored in %APPDATA%\qtc\ and preserved across updates
 
@@ -223,7 +254,8 @@ First-Time Setup
 
 1. Open File -> Settings -> My Station
    Enter callsign, name, QTH, and Home BBS
-2. Go to the BBS List tab — add your BBS with transport (VARA HF or Telnet)
+2. Go to the BBS List tab — add your BBS with its transport (VARA HF,
+   VARA FM, Direwolf, (Qt)SoundModem, or Telnet)
 3. Go to the PTT tab — select serial port and signal (RTS recommended for Digirig)
 4. Go to the Bulletins tab — click "Get categories from BBS..." to pull the
    live category list off your node and check the ones you want (or type them
@@ -243,6 +275,19 @@ VARA Setup
 - VARA data port: 8301 (default)
 - Set your callsign in VARA to match the callsign in QtC Settings
 - Set VARA's PTT setting to None — QtC keys the radio via RTS/DTR directly
+
+------------------------------------------------------------------------
+
+Packet Setup (Direwolf / SoundModem)
+
+- Start the modem before you click Connect. QtC talks to its AGW port —
+  Direwolf's AGWPORT (8000 by default), or the AGW port set in
+  SoundModem's settings. Put the same number in the BBS entry
+- Host is 127.0.0.1 when the modem runs on the same computer as QtC, or
+  that computer's address on your network
+- Channel is Direwolf's CHANNEL number, or the SoundModem modem (A = 0).
+  Leave it at 0 for one radio
+- The modem keys the radio — set PTT in Direwolf or SoundModem, not in QtC
 
 ------------------------------------------------------------------------
 
@@ -269,8 +314,8 @@ Source Files
                     dialogs, Mail-Call scheduler
   bbs_session.py  — BBS login, mail check, message download / send,
                     YAPP file transfer
-  transport.py    — VARA HF, VARA FM, and Telnet transports
-                    (single-reader pattern)
+  transport.py    — VARA HF, VARA FM, AGW packet (Direwolf / SoundModem),
+                    and Telnet transports (single-reader pattern)
   ptt.py          — PTT control via serial RTS/DTR
   database.py     — SQLite: inbox, outbox, sent, bulletins, watermarks,
                     contacts
@@ -283,359 +328,20 @@ Known Limitations (Beta)
 
 - No rig control yet — set frequency manually on your radio
 - YAPP upload not yet implemented (download only)
-- YAPP over Telnet is unreliable — RF paths (VARA HF / VARA FM) are the
-  supported transport for file transfer
-- Direwolf and Soundmodem transports planned for a future release
+- YAPP over Telnet is unreliable — RF paths (VARA HF / FM, packet) are
+  the supported transport for file transfer
+- A YAPP file download cannot be stopped once it has started
 - Windows exe available as a separate release asset — no Python required
   (see releases page)
 - install.ps1 remains available for users who prefer running from source
 
 ------------------------------------------------------------------------
 
-Changelog
+Version history
 
-0.14.0-beta (2026-06-23)
-- Added: 🔔 Notifications folder — QtC-generated alerts now land in a
-  dedicated Notifications folder in the tree instead of mixing into the
-  Inbox. Real radio mail and app notifications are counted and marked-read
-  separately, so an app message never inflates the unread-mail badge. This
-  folder is the reusable home for any future QtC-generated alert.
-- Added: Bulletin category discovery — a "Get categories from BBS..."
-  button in Settings -> Bulletins runs the node's LC command and lists
-  every bulletin category it carries, with message counts, as a checkable
-  list. Subscriptions are picked from what the BBS actually offers rather
-  than typed blind. QtC persists the known category set and, on connect,
-  drops a Notifications entry for each brand-new category that has appeared
-  since the last check.
-- Added: Per-category first-visit cap is transport-aware — the newest-N
-  bulletins kept per category on first visit is now 2 over VARA HF (tight
-  RF) and 3 over the roomier VARA FM / Telnet paths.
-- Added: Character-set selector (Settings -> App) — choose UTF-8 (default),
-  CP437 (DOS graphics), or CP850 (DOS Latin-1) for decoding BBS content.
-  CP437/CP850 render the box-drawing / line-art bulletins still common in
-  TECH and similar areas; an unknown codec falls back to UTF-8. Applied
-  live to the active session, with a "[charset set to <codec>]" marker in
-  the terminal.
-- Added: Keyboard-driven navigation + cheat sheet (F1) — drive QtC without
-  the mouse. Tab/Shift+Tab cycles folders -> message list -> reading pane;
-  up/down select or scroll; Enter jumps into the body, Esc returns to the
-  list. F2/F3/F4 switch Mail/Terminal/Debug views. With the message list
-  focused, single keys act: N new, R reply, D/Del delete, F search, M
-  mark-all-read. Anywhere in the window: Ctrl+N, Ctrl+R, Ctrl+F,
-  Ctrl+Shift+M (mark all read), Ctrl+Shift+O (send outbox), Ctrl+Q (quit).
-  Help -> Keyboard Shortcuts (F1) opens the full cheat sheet, sized to the
-  configured message font. The focused pane is highlighted so it is always
-  clear what the keys will act on.
-- Added: Stop button — abort an in-progress receive. Sets a transport
-  abort flag so a blocked read bails out, then returns the BBS to its
-  command prompt instead of leaving it mid-transfer. Enabled only while a
-  transfer is actually running.
-
-0.13.2-beta (2026-05-24)
-- Added: Mail-Call auto-downloads bulletins without the selection dialog
-  — when a Mail-Call slot fires, the bulletin selection dialog is
-  skipped and every new bulletin is pulled in one batch. The dialog
-  was added so users could prune large bulk pulls over slow VARA, but
-  a station running scheduled Mail-Call slots is already staying
-  current, so the unattended batch is small. Manual Connect flow is
-  unchanged — dialog still appears so the user can prune. Log line
-  "[BULL] Mail-Call session — auto-selecting all N bulletin(s)" shows
-  what happened.
-- Added: Mail-Call auto-sends outbox without the "send now?" prompt —
-  both prompt locations skip the QMessageBox when the session is owned
-  by Mail-Call. Per-message send_now and at_bbs filters are still
-  honored, so the unattended path inherits the right behavior for
-  free. Log line "[OUTBOX] Mail-Call session — auto-sending N
-  message(s)" shows what was sent.
-- Added: Mail-Call refuses to enable until Home BBS is visited at
-  least once — checks visited_bbs for any MYCALL@HOMECALL key
-  matching the Home BBS base callsign. If none exists, an info dialog
-  explains that the user must Connect from the toolbar once first so
-  QtC learns the mailbox watermark and current bulletin baseline.
-  Prevents Mail-Call's first unattended fire from ingesting the
-  entire mailbox over RF.
-- Added: BBS List table redesigned with 8 type-grouped columns
-  (Type | Name | Callsign | Freq | BW | Host | Port | Notes) —
-  em-dash placeholders show "not applicable" for the inactive
-  transport's cells (Host/Port on VARA rows; Freq/BW on Telnet rows).
-  Sortable headers. Visually unambiguous which fields belong to which
-  transport — no more empty Host cells on VARA entries leaving new
-  packet users confused.
-- Added: VARA FM bandwidth support — the BBS entry dialog and the
-  toolbar's BW combo now swap their options based on VARA mode: HF
-  shows 500 / 2300 (kHz), FM shows NARROW / WIDE. The transport
-  layer sends the correct wire command (BW500 / BW2300 for HF; bare
-  NARROW / WIDE for FM). The pre-session BW push also works for FM.
-- Fixed: Address Book dialog opened too narrow — Home BBS column
-  truncated full hierarchical addresses, Edit/Delete buttons were
-  partially clipped. Default size bumped from 560x480 to 880x480
-  minimum / 960x560 opened. Home BBS column 160->230, Send Mode
-  90->110, action column 110->140. Full HA addresses like
-  KC9MTP.#NWIN.IN.USA.NOAM now display without horizontal scrolling.
-- Fixed: Settings -> BBS List opened too narrow to show all 8
-  columns — BW chopped "NARROW" to "NAR...", Notes header chopped to
-  "Nc", horizontal scrollbar appeared on every open. Settings dialog
-  minimum 640->820, default open 740->900. BW 60->90 (fits NARROW),
-  Host 160->130, Port 58->75. Users no longer have to resize on
-  every Settings open.
-- Fixed: FM Bandwidth dropdown clipped "NARROW" in the BBS Entry
-  dialog and toolbar — both combos widened (dialog 90->120, toolbar
-  86->110) so the keyword + dropdown arrow render without overlap.
-- Fixed: Connection status banner printed "BWNARROW" / "BWWIDE" for
-  VARA FM — branched on vara_type so HF prints BW500/BW2300 and FM
-  prints the bare keyword.
-
-0.13.1-beta (2026-05-19)
-- Fixed: New-user registration skipped on LinBPQ BBSes that use ">" as
-  the Name-prompt terminator — _handle_registration bailed out whenever
-  the banner ended in ">", treating it as "already at main BBS prompt."
-  But LinBPQ 6.0.25.16 sends "Please enter your Name\r>" with ">" as
-  the input-waiting indicator (not ":"). New users got dropped to a
-  normal command prompt, then hit Unknown command errors when QtC
-  issued LL 20. Bail-out check now requires the actual main prompt
-  "de <callsign>>" at the end of the banner, so bare-">" registration
-  prompts fall through to keyword matching and the Name/QTH/Zip/Home
-  values from My Station settings get auto-sent. Reported 2026-05-19
-  by Bill testing K2ROG -> KC9MTP-1 over VARA HF.
-- Fixed: Ghost lines, leading-character drops, and duplicate output in
-  Terminal View — both transports had two threads independently calling
-  recv() on the same socket (the background streamer and the foreground
-  _expect()). Whichever won got the bytes the other couldn't see,
-  producing all three symptoms: duplicate banners, fragments like
-  "stcode using qth and zip commands." with the "Po" prefix missing, and
-  mid-line breaks across PTT turnarounds. Rewrote both transports as
-  single-reader: one reader thread owns recv() on the data socket and
-  the rest of the code (read_until, read_raw_bytes, flush_input)
-  consumes from a shared lock-protected buffer. _expect() no longer
-  double-logs while terminal mode is on. Line emission now flushes only
-  on real terminators (\r, \n, >, :, ?), so an RF-frame split inside a
-  line is reassembled instead of printed in pieces.
-
-0.12.1-beta (2026-05-15)
-- Fixed: YAPP downloads bailing mid-file on weak HF — the per-block read
-  used a fixed 20s timeout, structurally too short at 61 bps (a 234-byte
-  block needs ~30s pure transmit time before ARQ retries). Replaced with
-  a stall-watchdog that keeps reading as long as bytes are arriving and
-  gives up only after 30s of true silence (hard ceiling 300s/block).
-  Reported by Adam KJ5MIW on 2026-05-12 pulling BDN_Short_Center.mdf.
-- Fixed: YAPP abort left BBS transmitting the rest of the file into the
-  terminal log — when the receiver gave up mid-transfer, it raised
-  IOError without telling the sender. The BBS kept transmitting; the
-  remaining file bytes appeared as [RX] text once terminal mode
-  re-engaged. Receiver now sends CN (Cancel — proper [CAN][len][reason]
-  form per WA7MBL RFC v1.1) and drains the wire to silence before
-  re-raising, so the BBS prompt arrives cleanly.
-- Fixed: New-user registration sent bare values to LinBPQ — QTH, ZIP,
-  and HOME are dual-purpose commands in the BPQ user database (bare =
-  query the stored value, with arg = set it). QtC was sending raw
-  values like "Valparaiso, IN", which BPQ rejected as unknown commands.
-  Registration now sends the prefixed form (QTH Valparaiso, IN, ZIP
-  46383, HOME KC9MTP); the name prompt remains a bare value.
-- Fixed: PTT silently failed to open the serial port — PTTController.open()
-  swallowed serial.Serial exceptions and left _ser = None, and neither
-  Test PTT nor the connect path checked whether the open had actually
-  succeeded. Users would watch the waterfall transmit with no PTT keying
-  and no error. Added PTTController.is_open and last_error; both call
-  sites now surface the underlying exception (QMessageBox for Test PTT,
-  [PTT] *** log line + error signal for the connect path) with the hint
-  "this port may be open in Vara Terminal or another app — close it and
-  reconnect." Reported by Adam KJ5MIW on 2026-05-14 (Panasonic FZ-G1 +
-  Digirig CP2105).
-- Changed: PTT settings dialog hint — now explicitly warns that only one
-  program can hold the serial port at a time, and that on CP2105
-  dual-port devices (some Digirig models) PTT is on the Standard port,
-  not the Enhanced port.
-- Changed: Defensive pyserial flags — PTTController.open() now passes
-  rtscts=False, dsrdtr=False, xonxoff=False so pyserial doesn't
-  auto-toggle RTS/DTR as flow control on driver versions that do so by
-  default.
-
-0.12.0-beta (2026-05-07)
-- Added: Splash screen — shown both by the PyInstaller bootloader
-  (visible immediately on Windows .exe launch, before Python loads)
-  and by an in-Python QSplashScreen while MainWindow constructs.
-  Together these cover the slow first-run launch on Windows. Splash
-  image (qtc_splash.png) is generated from scratch by a new
-  make_splash.py Pillow script that reads APP_VERSION so the version
-  line always matches the installed release.
-- Added: "Save Log..." button in the Debug view — writes the verbose
-  session monitor buffer to a plain-text .log file via a save dialog.
-  Useful for capturing RF transfer traces.
-- Changed: terminal "Get File" button relabeled to "File Download -
-  YAPP" and widened to make the function obvious to both old-school
-  and new amateur radio operators (YAPP has been the BBS file-transfer
-  standard since Jeff Jacobsen WA7MBL published the RFC in 1986).
-- Fixed: YAPP file download left LinBPQ stuck in transfer mode — file
-  saved correctly but the next user command was rejected with
-  "Unexpected message during YAPP Transfer. Transfer cancelled". Root
-  cause: LinBPQ ends a YAPP session by sending a second SOH header
-  with the same filename and size=0 as a YAPP-C batch end-of-session
-  sentinel, not [EOT] as the prior implementation expected.
-  YappReceiver now parses that sentinel and replies with NAK (0x15),
-  releasing the BBS cleanly so subsequent commands work.
-- Fixed: BBS prompt "de KC9MTP>" not shown in the terminal view after
-  a successful YAPP download — read_until(">") in download_file()'s
-  finally block consumed the prompt for protocol cleanup without
-  re-emitting it; the prompt is now logged as [RX] so it appears in
-  the terminal view the same way as after any other command.
-
-0.10.10-beta (2026-04-14)
-- Fixed: messages lost between sessions when running as exe — data_dir
-  relative path resolved against working directory instead of
-  %APPDATA%\qtc; now always anchored to _APP_DIR
-
-0.10.9-beta (2026-04-14)
-- Windows exe release — PyInstaller one-folder build; no Python required on
-  target machine
-- Fixed: app icon not found when running as frozen exe — sys.frozen guard
-  replaces __file__-based icon path lookup
-
-0.10.8-beta (2026-03-28)
-- Fixed: outbox send cancelled immediately — LinBPQ splits "Enter Title
-  (only):" across two TCP packets; previous fix matched on "nter " which
-  fired on the first packet before "Title" arrived, hit the failure
-  branch, and sent a bare Enter cancelling the message; fixed by waiting
-  for "itle" which only matches once the full title prompt has arrived;
-  simplified send_message to always expect title-then-body (LinBPQ
-  always follows this sequence for SP CALL)
-
-0.10.7-beta (2026-03-28)
-- Fixed: outbox send failed silently — terminal monitor thread was
-  consuming BBS prompts before send_message could read them; fixed by
-  pausing the monitor in _run_send before calling send_message
-- Fixed: second queued message sent into wrong BBS state when first
-  send failed mid-compose — send_message now sends a bare Enter to
-  cancel at the title prompt and restore the BBS > prompt
-- Fixed: send_message now handles both LinBPQ prompt styles:
-  "Enter Title (only):" and "Enter Message Text..." by waiting for
-  "nter " and branching on content
-
-0.10.6-beta (2026-03-28)
-- Fixed: outbox send hung at "Enter Title (only):" — send_message was
-  waiting for bare ":" which matched too early on the "Address @HOMEBBS
-  added from HomeBBS" line LinBPQ emits before the title prompt; now
-  waits for "itle" to ensure the correct prompt is consumed first
-- Fixed: _expect("Enter Message") was case-sensitive; LinBPQ sends
-  lowercase "Enter message"; changed to match "nter message"
-
-0.10.5-beta (2026-03-28)
-- Fixed: bulletin dialog never appeared on first connect —
-  _process_ll_bulletins called self.sig_log.emit() but sig_log lives
-  on the worker, not the main window; the silent AttributeError aborted
-  the function before the dialog could show; fixed by using
-  self.worker.sig_log.emit()
-- Fixed: spurious [BULL] No new bulletins. on returning connects when
-  no mail was found — bulletin check was firing regardless of whether
-  check_on_connect was enabled or subscriptions were configured
-- First connect via Telnet now uses LL 50 (was LL 20); VARA remains LL 20
-
-0.10.4-beta (2026-03-28)
-- Bulletin check on connect no longer sends L> CATEGORY for each
-  subscription — bulletins are now extracted directly from the LL N /
-  L watermark- scan already performed on connect; sig_ll_ready now
-  carries the filtered bulletin list alongside the personal mail lists;
-  _process_ll_bulletins() applies tombstone/exists filtering and feeds
-  the existing selection dialog; L> is still used for the manual
-  mid-session Refresh path where the scan data is stale
-
-0.10.3-beta (2026-03-28)
-- Fixed: message download hang/scramble when downloading via the new
-  LL/L watermark path — _run_download was not pausing the terminal
-  monitor thread before calling download_message, causing a race
-  condition where both threads read from the same socket simultaneously;
-  fixed by adding set_terminal_mode(False) / flush_input() guard around
-  the download loop in _run_download, matching the pattern used by
-  _run_check_bulletins and _run_mail_check
-- Reverted: spurious post-read flush added in 0.10.2
-
-0.10.2-beta (2026-03-28)
-- Fixed: message download hang on messages with quoted/forwarded content
-  — LinBPQ delivers trailing buffered data after [End of Message] and the
-  BBS prompt in the same TCP burst; read_until returned on the prompt
-  match but left that data in the buffer, poisoning the next _expect;
-  fixed by flushing the buffer after each message download
-
-0.10.1-beta (2026-03-28)
-- Fixed: "No new personal mail" shown incorrectly when choosing PN+PY
-  on first connect — personal mail lists were set on the worker thread
-  object but read from the main window object; replaced shared attributes
-  with sig_ll_ready signal for safe cross-thread delivery
-- Fixed: Telnet auto-disconnect not firing after mail check — "no new
-  mail" paths in _on_first_visit were not calling _prompt_outbox()
-- Fixed: Bulletins not checked on returning connect with no new personal
-  mail — returning-visit "no mail" branch now triggers bulletin check
-  before _prompt_outbox(), mirroring _on_mail_summary logic
-
-0.10.0-beta (2026-03-28)
-- Watermark-based mail check — replaces LM with LL N on first connect
-  and L watermark- on subsequent connects; only personal mail addressed
-  to mycall (type P, status N) is auto-downloaded; skips PF, PY,
-  TO=SYSOP, FROM=SYSTEM
-- bbs_watermarks table added to database; tracks highest seen message
-  number per callsign/BBS pair; migrates automatically on first run
-- Bulletin filter updated to accept BN (status N) and B$ (forwarded,
-  status $) — was previously limited to status N only
-
-0.9.11-beta (2026-03-25)
-- Fixed: Telnet login on non-standard LinBPQ nodes — QtC now drains all
-  trailing node status lines after sending the bbs command before declaring
-  login complete, and properly detects both "de N0CALL>" and plain ">"
-  BBS prompt styles; resolves mail retrieval failure on multi-hop nodes
-  where circuit status lines arrive after the initial prompt
-
-0.9.10-beta (2026-03-24)
-- Fixed: Windows install.ps1 version header check failing on machines where
-  PowerShell reads UTF-8 files with em-dash characters as mojibake — header
-  check now uses Python to read the first line, bypassing PowerShell encoding
-
-0.9.9-beta (2026-03-24)
-- Bulletin first-connect backlog management — on first visit to a BBS, all
-  but the 2 newest bulletins per category are auto-tombstoned; no more giant
-  download backlog on a new install
-- Bulletins skipped in the selection dialog are tombstoned immediately and
-  will not reappear on future connects
-- My Station -> Home BBS hint updated to hierarchical address format
-  (e.g. K5DAT.#NEWI.WI.USA.NOAM)
-
-0.9.8-beta (2026-03-22)
-- Fixed: Windows installer fails to detect Python when installed via the
-  Python Launcher (py.exe) — install.ps1 now tries py first, then falls
-  back to python; fixes Python 3.11+ installs that do not add python to PATH
-
-0.9.7-beta (2026-03-22)
-- Multi-select delete — Ctrl+click or Shift+click to select multiple messages
-  or bulletins; Delete button shows count; confirm dialog names quantity and type
-
-0.9.6-beta (2026-03-21)
-- Fixed: Telnet Terminal View frozen after login
-- Fixed: Telnet Mail View not downloading messages
-- Fixed: Toolbar status text hard-clipped — now elides with ...
-- Telnet auto-disconnect after mail check and outbox send
-
-0.9.5-beta (2026-03-18)
-- Fixed: Message download body bleeding — two-stage read waits for
-  [End of Message] before BBS prompt
-- Fixed: BBS List edit crash
-- Fixed: Telnet flush_input crash
-- Bulletin tombstone 120-day cleanup on every launch
-
-0.9.4-beta (2026-03-17)
-- Bulletin support — subscribe to categories, browse in folder panel,
-  selection dialog with size estimates
-- Search highlight — amber highlight on matched terms in message preview
-
-0.9.3-beta (2026-03-17)
-- Message search — real-time filter with scope dropdown
-- Dark mode and font size in Settings -> App
-- Fixed: VARA reconnect after BBS idle timeout
-
-0.9.1-beta
-- Fixed: Windows crash on missing or corrupt config.json
-- GPL-3 headers, qtc_icon.ico for Windows
-
-0.9.0-beta (2026-03-16)
-- Fixed: VARA Error 111 on reconnect
-- Mark All Read, VARA link stats, inbox column widths
+Every release and what changed in it is in the VERSION file that
+ships beside this one, newest first. This README describes what QtC
+does today; VERSION is the only place that records how it got here.
 
 ------------------------------------------------------------------------
 

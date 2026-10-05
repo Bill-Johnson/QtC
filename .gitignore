@@ -42,4 +42,10 @@ desktop.ini
 # Test/scratch files
 scratch/
 test_*.py
+# ...but the QA harness IS tracked. It is development-only (excluded from
+# the release tarball and QtC.spec), and without this exception the blanket
+# test_*.py rule above silently drops every harness.
+!tests/
+!tests/test_*.py
+!tests/run_all.py
 CLAUDE.md
