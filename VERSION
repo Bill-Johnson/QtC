@@ -1,0 +1,389 @@
+QtC — version history
+Bill Johnson, KC9MTP — Valparaiso, Indiana
+GPL-3 — https://github.com/Bill-Johnson/QtC
+
+Newest first. The README describes what QtC does today; this file is the
+only place that records what changed and when.
+
+
+========================================================================
+0.15.0-beta  (2026-10-04)
+========================================================================
+
+WHAT THIS RELEASE IS
+  The last beta before v1.0.0. It adds AX.25 packet through Direwolf and
+  UZ7HO SoundModem / QtSoundModem, changes how QtC asks a BBS for mail so
+  a long absence never floods the air, and clears out a list of rough
+  edges found in live use on HF, VHF and Telnet. If nothing critical
+  comes back from beta testers, this same code becomes v1.0.0 with a
+  version bump and nothing else.
+
+NEW: AX.25 PACKET — DIREWOLF AND SOUNDMODEM
+  * Two new transports in the BBS entry dialog and the toolbar Mode
+    list: Direwolf and (Qt)SoundModem. QtC talks to the modem's AGW
+    port, and the modem keys the radio. Tested at 300 baud HF and 1200
+    baud VHF, on Linux and Windows, including SoundModem running on a
+    separate Windows PC.
+
+  * A packet entry has Host, AGW Port and Channel. Host is filled in
+    with 127.0.0.1 for a modem on the same computer. Channel uses the
+    modem's own word for it — Direwolf's CHANNEL, SoundModem's modem
+    A / B — and stays at 0 for one radio.
+
+  * Everything works over packet: mail, bulletins, sending, Mail-Call,
+    the Terminal view and YAPP file downloads.
+
+  * A message is handed to the modem as one block, so it goes out in
+    full frames — a long message takes far fewer frames and much less
+    airtime than sending it line by line. QtC waits for the modem to
+    finish transmitting before it starts timing the BBS's answer.
+
+  * When the link drops — the modem runs out of retries, the BBS hangs
+    up, or the modem is closed — the session ends at once with a plain
+    message, instead of sitting out a long timeout.
+
+  * Settings warns you when Mail-Call is pointed at a modem that is not
+    answering. Nothing is transmitted to check.
+
+HOW QtC ASKS THE BBS FOR MAIL
+  * The old "list everything since last time" sweep is gone. After a
+    couple of weeks away from a busy node it put hundreds of header
+    lines on the air before a single byte of your own mail moved. Every
+    listing is now bounded by something you control: LM for your own
+    mailbox, LC for the category list (Home BBS, every 30 days), and one
+    page of L> CATEGORY for each bulletin category you subscribe to.
+
+  * QtC sets the BBS page length (OP — Settings -> App, 20 by default)
+    so long output pauses instead of streaming, and answers the pauses
+    itself: it keeps going inside a message you asked for, and closes a
+    bulletin listing once it has what it needs. Unattended Mail-Call
+    reads straight from the page menu, saving a round trip per category.
+
+  * OP is only treated as set when the BBS actually confirms it. A
+    refused value used to be recorded as confirmed and not retried for
+    30 days. Settings no longer offers a page limit the BBS will refuse:
+    1 to 9 snaps up to 10, LinBPQ's floor. 0 still means no paging.
+
+  * Outgoing message lines are wrapped at 72 columns. Words are never
+    split, and lines that are already short — tables, ASCII art, quoted
+    text — are left exactly as typed.
+
+HALF-DUPLEX RF: NEVER TALK OVER THE BBS
+  * Every wait for a BBS reply now times out on silence, not total
+    time: while text is still arriving, QtC keeps listening. A slow page
+    at 300 baud used to run past the old limit, QtC moved on, and the
+    BBS was left stuck at a page prompt.
+
+  * QtC no longer mistakes a node's welcome text for the BBS prompt,
+    which had put every later command one reply out of step. Page
+    prompts that arrive split across several frames are read whole.
+
+  * A BBS left holding a listing by an earlier session that dropped is
+    released with a single A at login, on RF and on Telnet.
+
+  * QtC never sends its sign-off into a page prompt, which used to leave
+    the BBS session open after QtC had gone.
+
+VIEWS, SEND / RECEIVE AND THE TERMINAL
+  * Connecting from the Terminal or Debug view is now a plain terminal:
+    QtC brings up the link (and answers a Telnet login) and then sends
+    nothing you did not type. Connecting from Mail view, or a Mail-Call,
+    runs the full session. The view you are in when you press Connect
+    decides; switching views afterwards changes nothing.
+
+  * "Send Outbox Now" is now Send / Receive, available for the whole
+    session on every transport: it sends anything queued, then checks
+    and downloads your personal mail. Switching to Mail view with mail
+    queued no longer transmits on its own.
+
+  * One hang-up rule: a session QtC drove hangs up when its work is
+    done, on every transport. A Terminal session is yours to end.
+
+  * The Terminal and Debug toggle buttons are now one View dropdown,
+    which also gives the toolbar the Mail entry it never had. F2 / F3 /
+    F4 and the View menu work as before.
+
+  * Enter on an empty line sends a bare carriage return, so a listing
+    stopped at the page limit can be continued from the Terminal. New
+    CR and A quick buttons — the only two answers a page prompt takes.
+    The Read button explains that it takes a file name from the Files
+    area.
+
+  * The quick buttons no longer keep keyboard focus. After clicking one,
+    pressing Enter could send that command again instead of what was in
+    the input box.
+
+  * KM asks before it is sent, defaults to Cancel, and the button is
+    shown in red. KM deletes the messages you have already read from the
+    BBS (your copies stay in the QtC Inbox); it helps keep later
+    connections short.
+
+ABORT
+  * The Stop button is now Abort, after BPQ's own A command. It stops a
+    mail or bulletin download that QtC is running and returns the BBS to
+    its command prompt; you stay connected.
+
+  * It is greyed out during a YAPP file download, which cannot be
+    stopped, and in the Terminal view, where the A quick button does the
+    same job.
+
+YAPP FILE DOWNLOADS
+  * A completed transfer no longer hangs the session. QtC used to
+    acknowledge every data block, which the YAPP protocol never asks
+    for; on a slow link the extra acknowledgements backed up and the BBS
+    kept answering them after the file was done. Transfers now close the
+    way the protocol describes, and the session is ready again as soon
+    as the file is saved.
+
+  * A file download cannot be stopped once it starts — the BBS has
+    already committed the whole file to the link. Over RF, QtC says so
+    and asks before the radio keys. Telnet is instant and does not ask.
+
+  * When the far end cancels a transfer, QtC answers the way the YAPP
+    protocol requires instead of dropping it.
+
+VARA
+  * When a VARA link drops in the middle of a session — including while
+    logging in — QtC now notices at once and says so. It used to wait
+    out a timeout, and could report "Login failed" late, on top of the
+    next session.
+
+  * If VARA is started after QtC, QtC now links to it quietly in the
+    background, so VARA's TUNE button works without restarting QtC.
+
+MAIL-CALL
+  * Always runs the full session, whichever view is open, and hangs up
+    when it is done, on every transport.
+
+  * A Mail-Call session that loses its link leaves a Notifications entry
+    instead of a popup nobody is there to close.
+
+  * After a slot that used up all its retries, the next connect you make
+    yourself is treated as yours — it no longer runs as a Mail-Call.
+
+  * The RF responsibility notice now mentions 97.221. Unattended
+    automatic operation is limited to certain segments, QtC cannot see
+    your dial frequency, and checking it is the operator's job.
+
+MAIL
+  * The "Body: nn" line LinBPQ puts at the top of every message is no
+    longer shown — it is the BBS's stored byte count, not part of the
+    message. The R: routing lines are kept.
+
+  * Both progress counters were one behind. The number now names the
+    message on the air right now, and the bar shows the work finished
+    behind it. Each step is also written to the Debug view, so a saved
+    log shows which message was in flight.
+
+  * The Outbox shows each message's size in bytes, in place of a Status
+    column that could only ever say "Pending".
+
+  * Dismissing the first-visit "All or New only?" prompt with Escape or
+    the window X no longer crashes QtC; it means "new only".
+
+  * A message that failed to send no longer stalls the rest of the
+    batch.
+
+WINDOWS AND SETTINGS
+  * Opening Settings no longer keys the radio for a moment on Windows.
+    The PTT tab built its port list by opening every COM port in turn,
+    and opening a port raises the PTT line on a Digirig. The PTT port
+    for a session is now opened with its lines already set low, too.
+
+  * Closing QtC while connected hangs up properly before it exits, so
+    the BBS is not left repeating its disconnect on the air. A second
+    close quits at once.
+
+  * Three settings that never did anything are gone: "Send immediately
+    on next connection to any BBS" (Compose), "Auto-download new
+    personal mail on connect" and "Max message size (KB)" (Settings ->
+    App). Each was saved and read back into its own box and consulted
+    nowhere else. Old config.json files still load; the keys are
+    ignored. The Address Book's "Send Mode" column went with the first.
+
+HOUSEKEEPING
+  * The version history moved out of both READMEs into this file.
+
+  * A sweep removed controls and code that nothing reached, including a
+    hidden Refresh button that had quietly become the app's "am I logged
+    in?" flag. That is now a plain flag, and Send / Receive is the one
+    button for "get my mail".
+
+========================================================================
+Earlier releases
+========================================================================
+
+0.14.0-beta (2026-06-23)
+- Added: Notifications folder — alerts QtC itself generates land in
+  their own folder instead of the Inbox, and never count toward unread
+  radio mail.
+- Added: "Get categories from BBS..." in Settings -> Bulletins lists
+  every category the BBS carries, with counts, to pick subscriptions
+  from. A newly appeared category leaves a Notifications entry.
+- Added: The first-visit bulletin cap depends on the transport — 2 per
+  category over VARA HF, 3 over VARA FM and Telnet.
+- Added: Character-set selector (Settings -> App) — UTF-8, CP437 or
+  CP850, so DOS box-drawing bulletins display correctly.
+- Added: Keyboard navigation and a shortcut cheat sheet (F1) — move
+  between panes, switch views with F2 / F3 / F4, and act on messages
+  with single keys or Ctrl shortcuts.
+- Added: Stop button — stops a download in progress and returns the BBS
+  to its command prompt.
+
+0.13.2-beta (2026-05-24)
+- Added: Mail-Call downloads new bulletins and sends the outbox without
+  stopping to ask. Manual connects still show the selection dialog.
+- Added: Mail-Call can only be turned on once your Home BBS has been
+  visited by hand, so the first unattended session is not a full
+  mailbox over RF.
+- Added: The BBS List shows each entry's type in its own column, with
+  the fields that don't apply to that transport marked as such.
+- Added: VARA FM bandwidth — NARROW / WIDE in place of HF's 500 / 2300,
+  in the BBS entry and on the toolbar.
+- Fixed: The Address Book, the BBS List and the FM bandwidth boxes
+  opened too narrow to show their contents.
+- Fixed: The connection banner showed the FM bandwidth with a stray
+  "BW" in front of it.
+
+0.13.1-beta (2026-05-19)
+- Fixed: New-user registration was skipped on BBSes whose name prompt
+  ends in ">", leaving the new user at a command prompt the BBS did not
+  expect.
+- Fixed: Missing characters, ghost lines and duplicate text in the
+  Terminal view. Two parts of QtC were reading the same connection at
+  once; one reader now owns it, and a line split across radio frames is
+  shown whole.
+
+0.12.1-beta (2026-05-15)
+- Fixed: YAPP downloads gave up mid-file on weak HF links. QtC now keeps
+  waiting as long as data is still arriving.
+- Fixed: Giving up on a YAPP transfer left the BBS sending the rest of
+  the file into the terminal. QtC now cancels the transfer properly.
+- Fixed: New-user registration sent QTH, ZIP and Home BBS as bare
+  values, which the BBS rejected.
+- Fixed: PTT failed silently when the serial port could not be opened.
+  QtC now says so, and suggests another program may have the port.
+- Changed: The PTT settings hint explains that only one program can use
+  the serial port, and which port carries PTT on dual-port Digirigs.
+- Changed: The PTT port is opened with flow control off, so the serial
+  driver cannot toggle RTS / DTR on its own.
+
+0.12.0-beta (2026-05-07)
+- Added: Splash screen while QtC starts.
+- Added: "Save Log..." in the Debug view writes the session log to a
+  file.
+- Changed: The Terminal's file button is now "File Download - YAPP".
+- Fixed: After a YAPP download the BBS stayed in transfer mode and
+  rejected the next command.
+- Fixed: The BBS prompt was not shown in the Terminal after a YAPP
+  download.
+
+0.10.10-beta (2026-04-14)
+- Fixed: Messages were lost between sessions when running the Windows
+  exe from a different folder.
+
+0.10.9-beta (2026-04-14)
+- Added: Windows exe release — no Python needed.
+- Fixed: The app icon was missing in the exe.
+
+0.10.8-beta (2026-03-28)
+- Fixed: Sending from the Outbox could cancel the message when the BBS's
+  title prompt arrived in two pieces.
+
+0.10.7-beta (2026-03-28)
+- Fixed: Sending from the Outbox failed silently.
+- Fixed: When one queued message failed, the next was sent into the
+  wrong BBS state.
+
+0.10.6-beta (2026-03-28)
+- Fixed: Sending from the Outbox hung at the title prompt.
+
+0.10.5-beta (2026-03-28)
+- Fixed: The bulletin dialog did not appear on a first connect.
+- Fixed: A spurious "No new bulletins" when bulletin checks were off.
+- Changed: A first connect over Telnet lists 50 messages (VARA stays at
+  20).
+
+0.10.4-beta (2026-03-28)
+- Changed: Bulletins are picked out of the mail listing already taken
+  on connect, instead of a separate listing per category.
+
+0.10.3-beta (2026-03-28)
+- Fixed: Message downloads could hang or come out scrambled.
+
+0.10.2-beta (2026-03-28)
+- Fixed: Downloads hung on messages with quoted or forwarded content.
+
+0.10.1-beta (2026-03-28)
+- Fixed: "No new personal mail" shown wrongly after choosing all
+  personal mail on a first connect.
+- Fixed: Telnet did not disconnect after the mail check.
+- Fixed: Bulletins were not checked on a returning connect with no new
+  personal mail.
+
+0.10.0-beta (2026-03-28)
+- Changed: Mail check lists the newest messages on a first connect and
+  only newer ones after that, downloading only new personal mail
+  addressed to you.
+- Changed: Bulletins already forwarded by the BBS are offered too.
+
+0.9.11-beta (2026-03-25)
+- Fixed: Telnet login on nodes that send extra status lines after the
+  BBS command.
+
+0.9.10-beta (2026-03-24)
+- Fixed: The Windows installer's version check failed on some machines.
+
+0.9.9-beta (2026-03-24)
+- Bulletin first-connect backlog management — on first visit to a BBS, all
+  but the 2 newest bulletins per category are auto-tombstoned; no more giant
+  download backlog on a new install
+- Bulletins skipped in the selection dialog are tombstoned immediately and
+  will not reappear on future connects
+- My Station -> Home BBS hint updated to hierarchical address format
+  (e.g. CALL.#REGION.ST.USA.NOAM)
+
+0.9.8-beta (2026-03-22)
+- Fixed: The Windows installer did not find Python when installed
+  through the Python Launcher.
+
+0.9.7-beta (2026-03-22)
+- Multi-select delete — Ctrl+click or Shift+click to select multiple messages
+  or bulletins; Delete button shows count; confirm dialog names quantity and type
+
+0.9.6-beta (2026-03-21)
+- Fixed: Telnet Terminal View frozen after login
+- Fixed: Telnet Mail View not downloading messages
+- Fixed: Toolbar status text hard-clipped — now elides with ...
+- Telnet auto-disconnect after mail check and outbox send
+
+0.9.5-beta (2026-03-18)
+- Fixed: Message download body bleeding — two-stage read waits for
+  [End of Message] before BBS prompt
+- Fixed: BBS List edit crash
+- Fixed: Telnet flush_input crash
+- Bulletin tombstone 120-day cleanup on every launch
+
+0.9.4-beta (2026-03-17)
+- Bulletin support — subscribe to categories, browse in folder panel,
+  selection dialog with size estimates
+- Search highlight — amber highlight on matched terms in message preview
+
+0.9.3-beta (2026-03-17)
+- Message search — real-time filter with scope dropdown
+- Dark mode and font size in Settings -> App
+- Fixed: VARA reconnect after BBS idle timeout
+
+0.9.1-beta
+- Fixed: Windows crash on missing or corrupt config.json
+- GPL-3 headers, qtc_icon.ico for Windows
+
+0.9.0-beta (2026-03-16)
+- Fixed: VARA Error 111 on reconnect
+- Mark All Read, VARA link stats, inbox column widths
+
+
+------------------------------------------------------------------------
+
+73 de KC9MTP — Bill Johnson — Valparaiso, IN
+GPL-3 — https://github.com/Bill-Johnson/QtC

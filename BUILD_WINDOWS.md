@@ -1,133 +1,149 @@
 # BUILD_WINDOWS.md — Building the QtC Windows exe
 <!-- Copyright (C) 2025-2026 Bill Johnson, KC9MTP -->
 
-Builds `QtC.exe` on Windows using PyInstaller.
+Builds `QtC.exe` on Windows with PyInstaller, straight from a git clone of
+the repo, and zips it for the GitHub Release.
 
-**Throughout this doc, "build folder" means exactly `C:\build\QtC\`** — never
-`C:\build\`. Every command below shows the cwd you must be in before running it.
+**Throughout this doc, the build folder is the repo itself: `C:\Ham\QtC\`.**
+Nothing is copied by hand. Every command below shows the folder you must be
+in before running it. Commands are for **PowerShell**.
 
 ---
 
 ## Prerequisites (one-time setup)
 
-Open PowerShell and run:
+Python 3.10 or newer and Git for Windows, then in PowerShell:
 ```
-pip install pyinstaller pillow
+pip install pyinstaller pillow pyqt6 pyserial
 ```
-(PyQt6 and pyserial should already be installed.)
+
+If `C:\Ham\QtC\` does not exist yet, clone it and switch to the `windows`
+branch — a fresh clone starts on `main`, which has the wrong `QtC.spec`:
+
+**Be at:** `C:\Ham\`
+```
+git clone https://github.com/Bill-Johnson/QtC.git
+cd C:\Ham\QtC
+git checkout windows
+```
 
 ---
 
-## Step 1 — Populate the build folder
+## Step 1 — Get the latest source
 
-**Be at:** `C:\` (or anywhere — this step creates the folder)
-
+**Be at:** `C:\Ham\QtC\`
 ```
-mkdir C:\build\QtC
-cd C:\build\QtC
+git checkout windows
+git pull origin windows
+git branch --show-current
+git status --short
 ```
 
-**Copy these files into `C:\build\QtC\`:**
+`git branch --show-current` must print **windows**. `git status --short`
+should print nothing — if it lists changed files, ask before going on.
 
-| File | Source |
-|---|---|
-| `main_window.py`  | from repo |
-| `bbs_session.py`  | from repo |
-| `transport.py`    | from repo |
-| `database.py`     | from repo |
-| `ptt.py`          | from repo |
-| `make_splash.py`  | from repo |
-| `QtC.spec`        | from repo (windows branch) |
-| `qtc_icon.svg`    | from repo |
-| `qtc_icon.ico`    | from repo (or generate — see Appendix A) |
+Check the spec is the windows one:
+```
+Select-String -Path QtC.spec -SimpleMatch "Bootloader splash intentionally NOT used"
+```
+If that prints nothing, you are building from the wrong spec — stop and fix
+the branch first. The `main` branch's spec produces a stuck double splash.
 
-That's **6 .py files + spec + 2 icons = 9 files**. Do NOT skip `make_splash.py`.
+(Work not yet pushed to GitHub can be brought over as a git bundle instead
+of `git pull` — Claude does that over SSH.)
 
 ---
 
-## Step 2 — Generate the splash PNG
+## Step 2 — Close QtC
 
-**Be at:** `C:\build\QtC\`
+If QtC is running on this machine, close it. PyInstaller cannot replace
+`dist\QtC\` while the exe in it is open.
 
+---
+
+## Step 3 — Generate the splash PNG
+
+**Be at:** `C:\Ham\QtC\`
 ```
 python make_splash.py
 ```
 
-**Result:** `C:\build\QtC\qtc_splash.png` is created.
-This pulls the current `APP_VERSION` out of `main_window.py`, so re-run it
-every time you change versions.
-
-After this step, your build folder contains **10 files**.
+Writes `qtc_splash.png` with the version from `main_window.py`, so it always
+matches the build.
 
 ---
 
-## Step 3 — Run PyInstaller
+## Step 4 — Run PyInstaller
 
-**Be at:** `C:\build\QtC\`
-
+**Be at:** `C:\Ham\QtC\`
 ```
-pyinstaller QtC.spec
-```
-
-**Result:** PyInstaller writes two new subfolders:
-```
-C:\build\QtC\build\          ← intermediate junk, ignore
-C:\build\QtC\dist\QtC\       ← the distributable folder
-C:\build\QtC\dist\QtC\QtC.exe
+python -m PyInstaller --clean --noconfirm QtC.spec
 ```
 
-If PyInstaller errors with "Unable to find QtC.spec", you are NOT in
-`C:\build\QtC\`. Run `cd C:\build\QtC` and retry.
+`--clean` throws away the previous build's leftovers; `--noconfirm` replaces
+the old `dist\QtC\` without asking. Result:
+```
+C:\Ham\QtC\build\           ← intermediate files, ignore
+C:\Ham\QtC\dist\QtC\        ← the folder that gets zipped
+C:\Ham\QtC\dist\QtC\QtC.exe
+```
+Both folders are ignored by git.
 
 ---
 
-## Step 4 — Test the exe
+## Step 5 — Zip it
 
-**Be at:** `C:\build\QtC\`
+**Be at:** `C:\Ham\QtC\`
+```
+Compress-Archive -Path dist\QtC -DestinationPath dist\QtC-X.Y.Z-beta-windows.zip -Force
+```
 
+Use the version being built in place of `X.Y.Z`. The zip lands next to the
+`QtC` folder, in `C:\Ham\QtC\dist\`, and contains one top-level `QtC\`
+folder with the exe and everything it needs. Make a zip on every build, so
+the latest exe is always ready to hand over. Only the release build's zip
+goes up to GitHub.
+
+---
+
+## Step 6 — Put the splash back
+
+**Be at:** `C:\Ham\QtC\`
 ```
-dist\QtC\QtC.exe
+git checkout -- qtc_splash.png
+git status --short
 ```
+
+Step 3 rewrote a tracked file. This puts it back so the repo stays clean;
+the exe already has its own copy. `git status --short` should print nothing.
+
+---
+
+## Step 7 — Test the exe
+
+Double-click `C:\Ham\QtC\dist\QtC\QtC.exe`.
 
 Verify:
-- [ ] App launches (no console window)
-- [ ] Icon appears in title bar and taskbar
-- [ ] Splash shows briefly while loading
-- [ ] Settings dialog opens — enter your callsign
-- [ ] BBS list works — add/edit/remove an entry
-- [ ] PTT tab shows COM ports
-- [ ] Telnet connect works (if local node available)
-- [ ] VARA connect works (if VARA HF running)
-- [ ] Config persists at `%APPDATA%\qtc\config.json`
+- [ ] Splash shows once, icon in title bar and taskbar
+- [ ] Settings opens (and the radio does not key); PTT tab lists the COM ports
+- [ ] Telnet connect works (if a local node is available)
+- [ ] VARA connect keys the radio (if VARA is running)
+- [ ] Direwolf / SoundModem connect works (if a modem is running)
+- [ ] Config persists in `%APPDATA%\qtc\config.json` after close and reopen
 - [ ] SmartScreen popup — click "More info" → "Run anyway"
 
----
-
-## Step 5 — Zip the distributable
-
-**Be at:** `C:\build\QtC\dist\`
-
-```
-cd C:\build\QtC\dist
-powershell Compress-Archive -Path QtC -DestinationPath QtC-0.14.0-beta-windows.zip
-```
-
-**Result:** `C:\build\QtC\dist\QtC-0.14.0-beta-windows.zip`
-
-> The `-Path QtC` argument refers to the **folder** `C:\build\QtC\dist\QtC\`,
-> not the exe. The zip will contain a top-level `QtC\` folder with the exe
-> and all bundled files inside.
+Upload `C:\Ham\QtC\dist\QtC-X.Y.Z-beta-windows.zip` to the existing GitHub
+Release as its second asset. Do not create a separate release.
 
 ---
 
 ## Troubleshooting
 
 **"Unable to find QtC.spec"**
-You are not in `C:\build\QtC\`. Run `cd C:\build\QtC` and retry Step 3.
+You are not in `C:\Ham\QtC\`, or not on the `windows` branch. Redo Step 1.
 
-**"Cannot find qtc_splash.png" or "qtc_icon.svg"**
-You skipped Step 2 or didn't copy the icon in Step 1. Confirm with
-`dir C:\build\QtC\` — you should see all 10 files before running pyinstaller.
+**"PermissionError" / "Access is denied" removing dist\QtC**
+QtC is still running. Close it (Step 2) and rerun Step 4.
 
 **App icon or splash missing at runtime (exe runs but plain window)**
 Data files landed inside `dist\QtC\_internal\` instead of next to the exe.
@@ -135,21 +151,22 @@ This is a PyInstaller 6 layout issue — tell Claude and we'll patch the spec
 or the runtime `sys._MEIPASS` lookup.
 
 **App crashes immediately on launch**
-Open a console and run the exe so you can see the traceback:
+Run the exe from a console so you can see the traceback:
+
+**Be at:** `C:\Ham\QtC\dist\QtC\`
 ```
-cd C:\build\QtC\dist\QtC
-QtC.exe
+.\QtC.exe
 ```
 
 **"Failed to execute script" error**
-Missing hidden import. Add the module to `hiddenimports` in `QtC.spec`,
-delete `C:\build\QtC\dist\` and `C:\build\QtC\build\`, rebuild.
+Missing hidden import. Add the module to `hiddenimports` in `QtC.spec` and
+rerun Step 4 (`--clean` already clears the old build).
 
 **PyQt6 platform plugin error**
 ```
 pip install pyinstaller --upgrade
 ```
-Then rebuild.
+Then rerun Step 4.
 
 **Antivirus flags the exe**
 Expected for unsigned executables. Add a Windows Security exclusion or
@@ -157,49 +174,23 @@ submit to Microsoft at https://www.microsoft.com/en-us/wdsi/filesubmission
 
 ---
 
-## Starting over with a clean build
-
-If folders get out of whack, nuke and restart:
-
-**Be at:** `C:\`
-```
-rmdir /s /q C:\build\QtC
-mkdir C:\build\QtC
-cd C:\build\QtC
-```
-Then re-copy the 9 source files from the USB stick / repo and go back to Step 2.
-
----
-
 ## Branch Notes
 
 This doc lives on **both** `main` and `windows` so a fresh clone of `main`
-can find it. `QtC.spec` lives on the `windows` branch only — that's where
-PyInstaller actually runs.
-
-To build a new release on the HP Win11 box, always:
-
-```
-git checkout windows
-git pull origin windows
-```
-
-A fresh clone of the repo defaults to `main`, which doesn't contain
-`QtC.spec`. Building from `main` will fail to find the spec, or worse —
-if `QtC.spec` happens to be present from an earlier checkout, you may
-end up building with the wrong (pre-0.13.2) spec that produced the
-double-splash bug.
+can find it. `QtC.spec` differs between the two branches; the `windows`
+one is the only one to build with.
 
 After every new `main` release, merge it into `windows` so the windows
 branch carries the updated `.py` sources:
 
+**Be at:** the repo on the Linux machine (`~/vara_bbs_client/QtC`)
 ```
 git checkout windows
 git merge main
 git push origin windows
 ```
 
-Then rebuild from Step 2 (regenerate splash for the new version).
+Then build from Step 1.
 
 ---
 
@@ -207,7 +198,7 @@ Then rebuild from Step 2 (regenerate splash for the new version).
 
 The repo already contains `qtc_icon.ico`. Only do this if it's missing.
 
-**Be at:** `C:\build\QtC\`
+**Be at:** `C:\Ham\QtC\`
 
 ```
 python -c "

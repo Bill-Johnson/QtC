@@ -1,4 +1,4 @@
-# QtC v0.14.0-beta — main_window.py  (built 2026-06-21)
+# QtC v0.15.0-beta — main_window.py  (built 2026-10-01)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,12 +13,12 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
-APP_VERSION = "0.14.0-beta"  # keep in sync with header comment
+APP_VERSION = "0.15.0-beta"  # keep in sync with header comment
 """
 QtC — Main Window (PyQt6)
 v0.2 — Quick-connect bar, auto-download, terminal swap button
 """
-import sys, json, os, copy, time
+import sys, json, os, copy, time, threading
 from datetime import datetime, timedelta
 
 from PyQt6.QtWidgets import (
@@ -39,9 +39,18 @@ from PyQt6.QtGui import (QFont, QColor, QTextCursor, QPalette, QAction, QPixmap,
                          QShortcut, QKeySequence)
 
 from transport import TelnetTransport
+
+# AX.25 packet modems reached over AGW — transport key -> display name.
+AGW_MODEMS = {"direwolf": "Direwolf", "soundmodem": "(Qt)SoundModem"}
+AGW_DEFAULT_PORT = 8000   # Direwolf and QtSoundModem both default here
 from bbs_session import BBSSession, BBSMailSummary, DownloadAborted
 
 from database import MessageDatabase, ContactsDB
+
+# Carried on sig_yapp_error to mean "the user pressed Abort", which is not
+# a failure and must not raise an error box. A sentinel rather than a second
+# signal, so nothing downstream of the worker had to change.
+_YAPP_ABORTED = "__user_aborted__"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -91,7 +100,7 @@ def _write_default_config():
         "vara": {"hf_host": "127.0.0.1",
                  "hf_cmd_port": 8300, "hf_data_port": 8301},
         "ptt": {"mode": "none", "port": "COM3", "signal": "rts"},
-        "app": {"auto_check_mail": True}
+        "app": {"page_limit": 20}
     }
     os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
     with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -115,7 +124,6 @@ class SessionWorker(QThread):
     sig_download_done = pyqtSignal(int)
     sig_send_result   = pyqtSignal(bool, str)
     sig_error         = pyqtSignal(str)
-    sig_first_visit   = pyqtSignal(str)   # emits bbs callsign — GUI shows dialog
     sig_ll_ready      = pyqtSignal(str, object, object, object)  # bbs_call, new_only, all_personal, bulletins
     sig_progress      = pyqtSignal(str, int, int, str)  # op, current, total, detail
     sig_bulletin_check = pyqtSignal(object)   # {category: [BBSMessage]} — show dialog
@@ -133,28 +141,62 @@ class SessionWorker(QThread):
         self.session   = None
         self._task     = None
         import queue as _queue
+        import threading as _threading
         self._queue    = _queue.Queue()
+        # Guards _task and _busy — see _submit()
+        self._task_lock = _threading.Lock()
+        self._busy      = False
+
+    def _submit(self, task=None):
+        """Hand a task to the worker thread and make sure it actually runs.
+
+        The GUI chains session steps off this thread's own signals: LM
+        finishes, sig_ll_ready fires, and 200 ms later the GUI asks for the
+        bulletin sweep. That request can land while run() is still on its
+        way out. The old `if not self.isRunning(): self.start()` then
+        skipped the start, the task sat in _task forever, and the session
+        hung with the link up until the BBS timed it out (08:00 Mail-Call,
+        2026-09-11: LM done, no `l> BDN`, BBS hung up 15 minutes later).
+
+        run() now loops until nothing is left, and only stops after
+        clearing _busy under the same lock taken here — so a task stored
+        here is always either picked up by the running loop or starts a
+        fresh one.
+        """
+        with self._task_lock:
+            if task is not None:
+                self._task = task
+            if self._busy:
+                return          # the running loop picks it up
+            self._busy = True
+        # run() may have just decided to stop without the thread having
+        # finished yet, and start() on a running QThread is ignored.
+        self.wait()
+        self.start()
 
     def _enqueue(self, task):
         """Add task to queue and start thread if not running."""
         self._queue.put(task)
-        if not self.isRunning():
-            self.start()
+        self._submit()
 
-    def do_connect_and_check(self):
-        self._task = ("connect_check",)
-        if not self.isRunning(): self.start()
+    def do_connect_and_check(self, login_only: bool = False):
+        """login_only=True (Terminal / Debug view): log in, then stop."""
+        self._submit(("connect_check", login_only))
 
     def do_download(self, messages):
-        self._task = ("download", messages)
-        if not self.isRunning(): self.start()
+        self._submit(("download", messages))
 
-    def do_send(self, to_call, subject, body, msg_type, at_bbs):
-        self._enqueue(("send", to_call, subject, body, msg_type, at_bbs))
+    def do_send(self, to_call, subject, body, msg_type, at_bbs,
+                index: int = 1, total: int = 1):
+        """index/total are this message's place in the batch. The GUI hands
+        every queued message over at once, so only the worker knows when
+        one actually starts going out — which is when the counter has to
+        move (Bill, 2026-09-23)."""
+        self._enqueue(("send", to_call, subject, body, msg_type, at_bbs,
+                       index, total))
 
     def do_disconnect(self):
-        self._task = ("disconnect",)
-        if not self.isRunning(): self.start()
+        self._submit(("disconnect",))
 
     def do_abort(self):
         """Stop an in-progress download immediately (called from the GUI
@@ -168,25 +210,23 @@ class SessionWorker(QThread):
             s.transport.request_abort()
 
     def do_terminal_send(self, cmd: str):
-        self._task = ("terminal_send", cmd)
-        if not self.isRunning(): self.start()
+        self._submit(("terminal_send", cmd))
 
     def do_mail_check(self, new_only: bool = True):
-        self._task = ("mail_check", new_only)
-        if not self.isRunning(): self.start()
+        self._submit(("mail_check", new_only))
 
-    def do_check_bulletins(self, subscriptions: list):
-        self._task = ("check_bulletins", subscriptions)
-        if not self.isRunning(): self.start()
+    def do_check_bulletins(self, subscriptions: list,
+                           unattended: bool = False):
+        """unattended=True (Mail-Call) reads each category's bulletins as
+        soon as its listing pauses, with no selection dialog in between."""
+        self._submit(("check_bulletins", subscriptions, unattended))
 
     def do_yapp_download(self, filename: str, save_dir: str):
-        self._task = ("yapp_download", filename, save_dir)
-        if not self.isRunning(): self.start()
+        self._submit(("yapp_download", filename, save_dir))
 
     def do_download_bulletins(self, messages_by_cat: dict):
         """messages_by_cat = {category: [BBSMessage, ...]}"""
-        self._task = ("download_bulletins", messages_by_cat)
-        if not self.isRunning(): self.start()
+        self._submit(("download_bulletins", messages_by_cat))
 
     def do_list_categories(self, open_dialog: bool = False):
         """Run LC on the active session, persist known_categories +
@@ -197,36 +237,40 @@ class SessionWorker(QThread):
         `open_dialog` is retained on the signal signature for
         forward-compat but is currently unused — all subscription
         editing happens offline in the checkable category list."""
-        self._task = ("list_categories", open_dialog)
-        if not self.isRunning(): self.start()
+        self._submit(("list_categories", open_dialog))
 
     def run(self):
-        try:
-            t = self._task
-            self._task = None   # clear immediately so re-entry never re-runs connect
-            if t is None:
-                pass  # nothing to do — was started only for queued sends
-            elif t[0] == "connect_check": self._run_connect_and_check()
-            elif t[0] == "download":      self._run_download(t[1])
-            elif t[0] == "disconnect":    self._run_disconnect()
-            elif t[0] == "mail_check":    self._run_mail_check(t[1])
-            elif t[0] == "terminal_send": self._run_terminal_send(t[1])
-            elif t[0] == "send":          self._run_send(*t[1:])
-            elif t[0] == "check_bulletins":    self._run_check_bulletins(t[1])
-            elif t[0] == "download_bulletins": self._run_download_bulletins(t[1])
-            elif t[0] == "list_categories":    self._run_list_categories(t[1])
-            elif t[0] == "yapp_download":      self._run_yapp_download(t[1], t[2])
-            # Drain any queued send tasks
-            import queue as _queue
-            while True:
-                try:
-                    qt = self._queue.get_nowait()
-                    if qt[0] == "send":
-                        self._run_send(*qt[1:])
-                except _queue.Empty:
-                    break
-        except Exception as e:
-            self.sig_error.emit(str(e))
+        import queue as _queue
+        # Keep going until nothing is waiting: a step finishing here usually
+        # makes the GUI ask for the next one before this thread has exited.
+        while True:
+            with self._task_lock:
+                t = self._task
+                self._task = None   # clear immediately so re-entry never re-runs connect
+                if t is None:
+                    try:
+                        t = self._queue.get_nowait()   # queued sends
+                    except _queue.Empty:
+                        self._busy = False
+                        return
+            try:
+                # A Terminal / Debug connect never ran the login that finds
+                # the BBS prompt — pick it up before a button's step runs.
+                if (self.session and t[0] not in
+                        ("connect_check", "disconnect", "terminal_send")):
+                    self.session.learn_prompt()
+                if   t[0] == "connect_check": self._run_connect_and_check(*t[1:])
+                elif t[0] == "download":      self._run_download(t[1])
+                elif t[0] == "disconnect":    self._run_disconnect()
+                elif t[0] == "mail_check":    self._run_mail_check(t[1])
+                elif t[0] == "terminal_send": self._run_terminal_send(t[1])
+                elif t[0] == "send":          self._run_send(*t[1:])
+                elif t[0] == "check_bulletins":    self._run_check_bulletins(*t[1:])
+                elif t[0] == "download_bulletins": self._run_download_bulletins(t[1])
+                elif t[0] == "list_categories":    self._run_list_categories(t[1])
+                elif t[0] == "yapp_download":      self._run_yapp_download(t[1], t[2])
+            except Exception as e:
+                self.sig_error.emit(str(e))
 
     def _make_session(self):
         e         = self.bbs_entry
@@ -302,6 +346,35 @@ class SessionWorker(QThread):
             s = BBSSession(t, mycall=mycall, user_info=user_info)
             s._rf_connected_cb = lambda: self.sig_rf_connected.emit()
 
+        elif transport in AGW_MODEMS:
+            from transport import AGWTransport
+            mycall      = self.config["user"]["callsign"]
+            target_call = e.get("callsign", "")
+            if not target_call:
+                raise ValueError("No BBS callsign set for packet connection.")
+            t = AGWTransport(
+                host=e.get("host") or "127.0.0.1",
+                port=e.get("agw_port") or AGW_DEFAULT_PORT,
+                mycall=mycall,
+                target_call=target_call,
+                radio_port=e.get("agw_radio_port", 0),
+                modem_name=AGW_MODEMS[transport],
+                # QtSoundModem sends each 'D' frame as ONE I-frame with no
+                # PACLEN split of its own, so QtC's chunk is the on-air
+                # frame size. Direwolf re-splits to its PACLEN either way.
+                max_frame_data=128 if transport == "soundmodem" else 256,
+            )
+            t._log = lambda d, txt: self.sig_log.emit(f"[{d}] {txt.strip()}")
+            # BBS or modem ended the link — update the GUI like VARA does
+            t._on_disconnected_cb = lambda: self.sig_disconnected.emit()
+            # No PTTController here: the modem keys the radio itself, or
+            # VOX does. AGW has no PTT ON/OFF message for QtC to act on.
+
+            user_info = {k: self.config["user"].get(k, "")
+                         for k in ("name", "qth", "zip", "home_bbs")}
+            s = BBSSession(t, mycall=mycall, user_info=user_info)
+            s._rf_connected_cb = lambda: self.sig_rf_connected.emit()
+
         else:
             raise ValueError(f"Unknown transport: {transport}")
 
@@ -315,8 +388,105 @@ class SessionWorker(QThread):
         s._log = lambda d, txt: self.sig_log.emit(f"[{d}] {txt.strip()}")
         return s
 
-    def _run_connect_and_check(self):
+    # ── Paging (OP) ───────────────────────────────────────────────
+    OP_REFRESH_DAYS = 30
+
+    def _maybe_set_page_length(self, mycall_bbs: str):
+        """
+        Send `OP n` if this BBS has never been told, the number changed in
+        Settings, or the last one is older than OP_REFRESH_DAYS.
+
+        The BBS stores this in the user record, so it is one line on the
+        wire every 30 days — not every connect. See
+        feedback_rf_airtime_politeness: recurring TX is gated by a time
+        delta, never by "every connect".
+        """
+        import datetime as _dt
+        want = int(self.config.get("app", {}).get("page_limit", 20))
+        store = self.config.setdefault("bbs_paging", {})
+        rec   = store.get(mycall_bbs) or {}
+
+        due = True
+        if rec.get("value") == want and rec.get("set_at"):
+            try:
+                last = _dt.datetime.strptime(
+                    str(rec["set_at"]).replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
+                due = (_dt.datetime.utcnow() - last) >= \
+                      _dt.timedelta(days=self.OP_REFRESH_DAYS)
+            except (ValueError, TypeError):
+                due = True   # unreadable stamp — treat as never set
+
+        if not due:
+            self.session.page_length = want
+            self.sig_log.emit(
+                f"[SYS] Page limit already set on this BBS (OP {want}) "
+                f"— not resending")
+            return
+
+        self.sig_log.emit(f"[SYS] Setting BBS page limit — OP {want}")
+        result = self.session.set_page_length(want)
+
+        if result == "refused":
+            # The value is out of range for this BBS, so paging is still
+            # at whatever it was. Do NOT record it: recording would mean
+            # not trying again for OP_REFRESH_DAYS, and the user has not
+            # had a chance to correct the setting yet.
+            self.sig_log.emit(
+                f"[SYS] BBS refused OP {want} — the page limit in "
+                f"Settings → App is below what this BBS accepts "
+                f"(LinBPQ wants {BBSSession.PAGE_MIN} or more, or 0 for "
+                f"no paging). Nothing recorded; QtC will try again.")
+            return
+
+        store[mycall_bbs] = {
+            "value":  want,
+            "set_at": _dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        save_config(self.config)
+        if result != "confirmed":
+            self.sig_log.emit(
+                f"[SYS] BBS did not confirm OP {want} — it may not support "
+                f"paging. QtC handles either case.")
+
+    def _bump_watermark(self, mycall_bbs: str, messages):
+        """
+        Keep bbs_watermarks current from whatever we listed this session.
+
+        Nothing reads it any more — the LM / L> scheme does not need it.
+        It is maintained so a future Advanced mode can offer the old
+        BBS-wide `L <watermark>-` sweep without needing a catch-up
+        connect first. See CLAUDE.md → ARCHITECTURE NOTES.
+        """
+        if not messages:
+            return
+        high = max(m.msg_number for m in messages)
+        prev = self.db.get_watermark(mycall_bbs) or 0
+        if high > prev:
+            self.db.set_watermark(mycall_bbs, high)
+
+    def _run_terminal_connect(self):
+        """Terminal / Debug view: a dumb terminal (Bill, 2026-09-13). Bring
+        up the link, stream whatever the BBS sends, and stop — no OP, no LM,
+        no login script. The one exception is Telnet's username and password
+        (BBSSession.connect_only). The `bbs` command, registration answers
+        and a parked page menu are the user's to type.
+        Buttons still work: the worker picks up the BBS prompt from what
+        was shown (BBSSession.learn_prompt), and OP is caught up before a
+        bulletin sweep (_run_check_bulletins)."""
+        t = self.session.transport
+        if hasattr(t, "set_terminal_mode"):
+            t.set_terminal_mode(True)     # before connect, so the banner shows
+        self.session.connect_only()
+        self.sig_connected.emit()
+        self.sig_log.emit(
+            "[SYS] Terminal connect — from here nothing is sent or read "
+            "until you type it")
+
+    def _run_connect_and_check(self, login_only: bool = False):
         self.session = self._make_session()
+        if login_only:
+            self._run_terminal_connect()
+            return
         if not self.session.connect_and_login():
             self.sig_error.emit("Login failed — check callsign and BBS address.")
             return
@@ -329,57 +499,39 @@ class SessionWorker(QThread):
         bbs_call  = self.bbs_entry.get("callsign", "").upper()
         mycall_bbs = f"{mycall}@{bbs_call}"
 
-        # Pause terminal monitor for LL / L list commands
+        # Pause the terminal monitor for the whole OP / LM sequence
         if hasattr(self.session.transport, "set_terminal_mode"):
             self.session.transport.set_terminal_mode(False)
         self.session.transport.flush_input()
 
-        watermark = self.db.get_watermark(mycall_bbs)
+        try:
+            # ── Page limit — first connect here, or every 30 days ──
+            self._maybe_set_page_length(mycall_bbs)
 
-        if watermark is None:
-            # ── First connect: no watermark yet ─────────────────────
-            # Use LL 30 (VARA HF) or LL 20 (Telnet/VARA FM) to get a
-            # manageable slice of recent messages and set the watermark.
-            from transport import VaraTransport
-            n = 20 if isinstance(self.session.transport, VaraTransport) else 50
-            self.sig_log.emit(f"[SYS] First connect — sending LL {n}")
-            messages = self.session.list_last(n)
+            # ── Personal mail: LM, and only LM ─────────────────────
+            # LM lists just the messages addressed to this callsign, so
+            # its size tracks YOUR mailbox and not the BBS's traffic.
+            # The old scheme listed the whole BBS from a watermark
+            # (`L 279-`), which after a fortnight away from a busy node
+            # meant hundreds or thousands of header lines on the air
+            # before a single byte of your own mail moved.
+            self.sig_log.emit("[SYS] Checking personal mail — sending LM")
+            summary  = self.session.check_mail(new_only=False)
+            messages = summary.all_messages
+        finally:
+            if hasattr(self.session.transport, "set_terminal_mode"):
+                self.session.transport.set_terminal_mode(True)
 
-            # Derive watermark from highest msg_number seen
-            if messages:
-                new_watermark = max(m.msg_number for m in messages)
-                self.db.set_watermark(mycall_bbs, new_watermark)
-                self.sig_log.emit(
-                    f"[SYS] Watermark set to {new_watermark} "
-                    f"({len(messages)} msgs scanned)")
-            else:
-                self.sig_log.emit("[SYS] LL returned no messages — watermark not set")
-                messages = []
+        self._bump_watermark(mycall_bbs, messages)
 
-        else:
-            # ── Subsequent connect: watermark exists ─────────────────
-            self.sig_log.emit(
-                f"[SYS] Returning connect — sending L {watermark}-")
-            messages = self.session.list_since(watermark)
+        # LM already guarantees "addressed to me", so the filtering here is
+        # only about type and origin. Match on the base callsign so mail to
+        # an SSID of ours (N0CALL-1) is not thrown away.
+        mybase = mycall.split("-")[0]
 
-            # Update watermark to highest number seen (even if no personal mail)
-            if messages:
-                new_watermark = max(m.msg_number for m in messages)
-                if new_watermark > watermark:
-                    self.db.set_watermark(mycall_bbs, new_watermark)
-                    self.sig_log.emit(
-                        f"[SYS] Watermark updated {watermark} → {new_watermark}")
-
-        if hasattr(self.session.transport, "set_terminal_mode"):
-            self.session.transport.set_terminal_mode(True)
-
-        # Build personal mail lists from the full message scan.
-        # LL N and L N- return every message on the BBS with no filtering —
-        # all types and statuses are present, so we can build both lists here.
-        # Skip TO=SYSOP and FROM=SYSTEM regardless of status.
         def _is_my_personal(m):
             return (m.msg_type == "P"
-                    and m.to_call == mycall
+                    and m.to_call.split("-")[0] == mybase
                     and m.to_call != "SYSOP"
                     and m.from_call != "SYSTEM")
 
@@ -387,32 +539,37 @@ class SessionWorker(QThread):
         new_only = [
             m for m in messages if _is_my_personal(m) and m.status == "N"
         ]
-        # PN + PY — all personal mail including already-read (first-visit "All" choice)
+        # PN + PY — all personal mail (first-visit "All" choice)
         all_personal = [
             m for m in messages if _is_my_personal(m)
         ]
-        # Bulletin candidates — BN and B$ from the scan
-        # Tombstone/exists filtering happens in _process_ll_bulletins on the GUI thread
-        bull_cfg = self.config.get("bulletins", {})
-        subs     = [s.upper().strip() for s in bull_cfg.get("subscriptions", [])]
-        if bull_cfg.get("check_on_connect", False) and subs:
-            bulletins = [
-                m for m in messages
-                if m.msg_type == "B"
-                and m.status in ("N", "$")
-                and m.to_call.upper() in subs
-            ]
-        else:
-            bulletins = []
 
-        # Emit all three lists via signal — safe cross-thread delivery
-        self.sig_ll_ready.emit(bbs_call, new_only, all_personal, bulletins)
+        self.sig_log.emit(
+            f"[SYS] LM: {len(messages)} listed, "
+            f"{len(new_only)} new personal, "
+            f"{len(all_personal)} personal total")
+
+        # Bulletins are no longer scraped out of a BBS-wide listing — they
+        # get their own bounded `L> CATEGORY` sweep after the mail stage,
+        # so the third list is always empty here. The signal signature is
+        # unchanged so nothing downstream had to move.
+        self.sig_ll_ready.emit(bbs_call, new_only, all_personal, [])
 
     def _run_mail_check(self, new_only: bool):
-        # Disable data streaming while _expect handles the LM response
+        # Disable data streaming while _expect handles the LM response,
+        # then always hand the monitor back — _run_download turns it off
+        # again itself if there is anything to fetch.
         if hasattr(self.session.transport, "set_terminal_mode"):
             self.session.transport.set_terminal_mode(False)
-        self.sig_mail_summary.emit(self.session.check_mail(new_only=new_only))
+        # Whatever was typed and answered in the Terminal is still in the
+        # receive buffer — LM would match the first stale prompt in it.
+        self.session.transport.flush_input()
+        try:
+            summary = self.session.check_mail(new_only=new_only)
+        finally:
+            if hasattr(self.session.transport, "set_terminal_mode"):
+                self.session.transport.set_terminal_mode(True)
+        self.sig_mail_summary.emit(summary)
 
     def _run_terminal_send(self, cmd: str):
         """
@@ -452,7 +609,9 @@ class SessionWorker(QThread):
             for i, msg in enumerate(messages, 1):
                 if not self.db.message_exists(msg.msg_number, bbs_id):
                     detail = f"msg #{msg.msg_number} · ~{msg.size} bytes"
-                    self.sig_progress.emit("downloading", i - 1, total, detail)
+                    # 1-based: this is the message going over the air now,
+                    # not the count already finished. See _on_progress.
+                    self.sig_progress.emit("downloading", i, total, detail)
                     self.sig_log.emit(
                         f"[SYS] Downloading message {i} of {total} "
                         f"(#{msg.msg_number}, ~{msg.size} bytes)")
@@ -462,16 +621,25 @@ class SessionWorker(QThread):
                     self.db.save_to_inbox(msg, bbs_id)
                     count += 1
         except DownloadAborted:
-            # User hit Stop: read was already interrupted; tell the BBS to
+            # User hit Abort: read was already interrupted; tell the BBS to
             # stop sending ('A') and resync to the prompt. Stay connected.
             self.session._abort_to_prompt()
         finally:
+            # Hand back a session that is at the command prompt, whatever
+            # happened above. A no-op unless the last read left us parked
+            # at a page menu; _abort_to_prompt has already cleared it on
+            # the abort path.
+            self.session.resync_to_prompt("downloads finished")
             if hasattr(self.session.transport, "set_terminal_mode"):
                 self.session.transport.set_terminal_mode(True)
         self.sig_progress.emit("done", 0, 0, "")
         self.sig_download_done.emit(count)
 
-    def _run_send(self, to_call, subject, body, msg_type, at_bbs):
+    def _run_send(self, to_call, subject, body, msg_type, at_bbs,
+                  index: int = 1, total: int = 1):
+        # Emitted here, before a byte goes out, so "Sending 2 of 3" means
+        # the one on the air right now.
+        self.sig_progress.emit("sending", index, total, f"to {to_call}")
         if hasattr(self.session.transport, "set_terminal_mode"):
             self.session.transport.set_terminal_mode(False)
         self.session.transport.flush_input()
@@ -488,61 +656,159 @@ class SessionWorker(QThread):
             self.session = None
         self.sig_disconnected.emit()
 
-    def _run_check_bulletins(self, subscriptions: list):
-        """Run L> for each subscription, emit results for GUI to show dialog."""
+    def _run_check_bulletins(self, subscriptions: list,
+                             unattended: bool = False):
+        """
+        Sweep each subscribed category with `L> CATEGORY`.
+
+        Bounded by category, not by BBS traffic: with OP 20 one page is
+        the 20 newest bulletins in that category — roughly three weeks of
+        a daily bulletin. Anything older simply is not offered, which is
+        the deal we make to keep a long absence off the air.
+
+        Status flags (N / Y / $ / F / D) are ignored throughout. They
+        record what the BBS's forwarding and housekeeping have done with a
+        bulletin, not what this user has read. The only test is "do we
+        already have it" — the messages table plus the tombstone table.
+
+        unattended=True (a Mail-Call session) reads each category's wanted
+        bulletins the moment the listing pauses, sending `R <msg#>`
+        straight to the page menu. That both ends the listing and starts
+        the read, saving an 'A' round trip per category. The interactive
+        path cannot do that: it shows one selection dialog covering every
+        category, so each listing has to be closed before the next one
+        starts, and we must never hold the BBS at a page prompt while a
+        modal window waits on the user.
+        """
         import time as _time
         if hasattr(self.session.transport, "set_terminal_mode"):
             self.session.transport.set_terminal_mode(False)
-        # Flush stale bytes and settle before sending L> commands
+        if hasattr(self.session.transport, "clear_abort"):
+            self.session.transport.clear_abort()
         self.session.transport.flush_input()
         _time.sleep(0.5)
-        results = self.session.check_bulletins(subscriptions)
-        # Terminal mode stays OFF — download_bulletins will re-enable it after
 
-        # Build bbs_id for tombstone/exists checks
-        bbs_id = (f"{self.config.get('user',{}).get('callsign','NOCALL').upper()}"
-                  f"@{self.bbs_entry['callsign']}")
+        mycall   = self.config.get("user", {}).get("callsign", "NOCALL").upper()
+        bbs_call = self.bbs_entry["callsign"]
+        bbs_id   = f"{mycall}@{bbs_call}"
+        bull_key = f"bulletins_seen@{bbs_call}"
 
-        # ── First bulletin connect — auto-tombstone all but N newest ──────
-        # Detect first time bulletins have been checked on this BBS by looking
-        # for a "bulletins_seen" key in visited_bbs. If absent, tombstone all
-        # but the N most recent per category so the user doesn't see a huge
-        # backlog on first connect. N is transport-aware: VARA HF is slow,
-        # so cap tighter (2 per category); VARA FM and Telnet have more
-        # headroom, so allow 3 per category.
-        mycall    = self.config.get("user", {}).get("callsign", "NOCALL").upper()
-        visit_key = f"{mycall}@{self.bbs_entry['callsign']}"
-        bull_key  = f"bulletins_seen@{self.bbs_entry['callsign']}"
-        visited   = self.config.get("visited_bbs", {})
+        # A Terminal / Debug connect skips OP, and `L> CATEGORY` is only held
+        # to one page once OP is on — catch it up first. Sends nothing when
+        # this BBS already has it and it isn't OP_REFRESH_DAYS old.
+        if not self.session.page_length:
+            self._maybe_set_page_length(f"{mycall}@{bbs_call.upper()}")
+        visited  = self.config.get("visited_bbs", {})
+
+        # First bulletin connect to this BBS — keep only the newest few per
+        # category and tombstone the rest, so a new user is not handed a
+        # backlog. VARA HF and packet are slow, so cap tighter there.
+        first_connect = bull_key not in visited
         first_keep = 2 if self.bbs_entry.get(
-            "transport", "vara_hf") == "vara_hf" else 3
+            "transport", "vara_hf") in ("vara_hf", *AGW_MODEMS) else 3
 
-        if bull_key not in visited:
-            # First time — tombstone everything except N newest per category
-            for cat, msgs in results.items():
-                # msgs are already newest-first from L> (descending)
-                to_keep     = msgs[:first_keep]
-                to_tombstone = msgs[first_keep:]
-                if to_tombstone:
-                    self.db.add_bulletin_tombstones_batch(to_tombstone, bbs_id)
+        def _already_have(m):
+            return (self.db.bulletin_exists(m.msg_number, bbs_id)
+                    or self.db.bulletin_tombstone_exists(m.msg_number, bbs_id))
+
+        results   = {}
+        listed    = []
+        dl_count  = 0
+        try:
+            for cat in subscriptions:
+                cat = cat.upper().strip()
+                if not cat:
+                    continue
+                msgs, parked = self.session.list_category(cat)
+                bulls = [m for m in msgs if m.msg_type == "B"]
+                listed.extend(bulls)
+
+                if first_connect and bulls:
+                    newest = sorted(bulls, key=lambda m: m.msg_number,
+                                    reverse=True)
+                    stale = newest[first_keep:]
+                    if stale:
+                        self.db.add_bulletin_tombstones_batch(stale, bbs_id)
+                        self.sig_log.emit(
+                            f"[SYS] First bulletin connect — tombstoned "
+                            f"{len(stale)} old {cat} bulletins, keeping "
+                            f"{len(newest[:first_keep])} newest")
+
+                wanted = [m for m in bulls if not _already_have(m)]
+
+                if unattended and wanted:
+                    # Parked at the page prompt — `R <msg#>` answers the
+                    # menu directly, so no 'A' is needed first.
+                    dl_count += self._download_bulletins_now(
+                        cat, wanted, bbs_id)
+                    continue
+
+                if parked:
+                    self.session.end_listing(
+                        "nothing wanted" if not wanted
+                        else f"{len(wanted)} wanted, dialog first")
+                if wanted:
+                    results[cat] = wanted
                     self.sig_log.emit(
-                        f"[SYS] First bulletin connect — tombstoned "
-                        f"{len(to_tombstone)} old {cat} bulletins, "
-                        f"keeping {len(to_keep)} newest")
-            # Mark bulletins as seen so we never do this again
+                        f"[SYS] Bulletins: {len(wanted)} wanted in {cat}")
+                else:
+                    self.sig_log.emit(f"[SYS] Bulletins: nothing new in {cat}")
+        except DownloadAborted:
+            self.session._abort_to_prompt()
+        finally:
+            # Always hand the terminal monitor back. _run_download_bulletins
+            # turns it off again itself if the user picks something, so this
+            # is safe on every path — and it stops the terminal view going
+            # dead for the rest of the session when a sweep finds nothing.
+            if hasattr(self.session.transport, "set_terminal_mode"):
+                self.session.transport.set_terminal_mode(True)
+
+        if first_connect:
             self.config.setdefault("visited_bbs", {})[bull_key] = True
             save_config(self.config)
 
-        # Filter out already downloaded and tombstoned
-        filtered = {}
-        for cat, msgs in results.items():
-            new_msgs = [m for m in msgs
-                        if not self.db.bulletin_exists(m.msg_number, bbs_id)
-                        and not self.db.bulletin_tombstone_exists(
-                            m.msg_number, bbs_id)]
-            if new_msgs:
-                filtered[cat] = new_msgs
-        self.sig_bulletin_check.emit(filtered)
+        self._bump_watermark(bbs_id, listed)
+
+        if unattended:
+            self.sig_progress.emit("done", 0, 0, "")
+            self.sig_bulletin_done.emit(dl_count)
+        else:
+            self.sig_bulletin_check.emit(results)
+
+    def _download_bulletins_now(self, cat: str, wanted: list,
+                                bbs_id: str) -> int:
+        """Read and save one category's bulletins immediately.
+
+        Used by the unattended sweep, where the first `R <msg#>` is the
+        reply to the listing's page prompt. Returns how many were saved.
+        """
+        import re as _re
+        import time as _time
+        total = len(wanted)
+        saved = 0
+        for i, msg in enumerate(wanted, 1):
+            if getattr(self.session.transport, "abort_requested",
+                       lambda: False)():
+                raise DownloadAborted()
+            self.sig_progress.emit(
+                "downloading", i - 1, total,
+                f"{cat} #{msg.msg_number} · ~{msg.size} bytes")
+            self.sig_log.emit(
+                f"[SYS] Downloading bulletin {i}/{total} "
+                f"{cat} #{msg.msg_number} ~{msg.size} bytes")
+            msg.body = self.session.download_message(
+                msg.msg_number, size_hint=msg.size)
+            bid_m = _re.search(r'Bid:\s*(\S+)', msg.body, _re.I)
+            self.db.save_bulletin(msg, bbs_id,
+                                  bid=bid_m.group(1) if bid_m else "")
+            saved += 1
+            _time.sleep(0.3)
+        # The last `R <msg#>` answered the page menu, so BPQ has returned
+        # to that menu rather than to the command prompt. Close it before
+        # the sweep moves on — the next category's `l> CAT` (or the `b` at
+        # the end of the session) would otherwise be typed into the menu.
+        self.session.resync_to_prompt(f"{cat} downloads finished")
+        return saved
 
     def _run_download_bulletins(self, messages_by_cat: dict):
         """Download selected bulletins and save to database."""
@@ -563,7 +829,7 @@ class SessionWorker(QThread):
                 for msg in msgs:
                     i += 1
                     detail = f"{cat} #{msg.msg_number} · ~{msg.size} bytes"
-                    self.sig_progress.emit("downloading", i - 1, total, detail)
+                    self.sig_progress.emit("downloading", i, total, detail)
                     self.sig_log.emit(
                         f"[SYS] Downloading bulletin {i}/{total} "
                         f"{cat} #{msg.msg_number} ~{msg.size} bytes")
@@ -578,10 +844,15 @@ class SessionWorker(QThread):
                     count += 1
                     _time.sleep(0.3)   # brief pause between bulletins
         except DownloadAborted:
-            # User hit Stop: read was already interrupted; tell the BBS to
+            # User hit Abort: read was already interrupted; tell the BBS to
             # stop sending ('A') and resync to the prompt. Stay connected.
             self.session._abort_to_prompt()
         finally:
+            # Hand back a session that is at the command prompt, whatever
+            # happened above. A no-op unless the last read left us parked
+            # at a page menu; _abort_to_prompt has already cleared it on
+            # the abort path.
+            self.session.resync_to_prompt("downloads finished")
             if hasattr(self.session.transport, "set_terminal_mode"):
                 self.session.transport.set_terminal_mode(True)
         self.sig_progress.emit("done", 0, 0, "")
@@ -673,6 +944,12 @@ class SessionWorker(QThread):
                 filename, save_dir, progress_cb=_progress)
             import os as _os
             self.sig_yapp_done.emit(save_path, _os.path.basename(save_path))
+        except DownloadAborted:
+            # The user pressed Abort. The receiver has already sent CN and
+            # drained the wire, and download_file's finally block has put
+            # the BBS back at its prompt — nothing is wrong, so don't
+            # report it as an error.
+            self.sig_yapp_error.emit(_YAPP_ABORTED)
         except Exception as e:
             self.sig_yapp_error.emit(str(e))
 
@@ -691,7 +968,7 @@ class AddressBookDialog(QDialog):
         self.cdb = contacts_db
         self.select_mode = select_mode   # True when opened from Compose
         self.setWindowTitle("Address Book")
-        # Sized to fit a full HA Home BBS address ("KC9MTP.#NWIN.IN.USA.NOAM")
+        # Sized to fit a full HA Home BBS address ("N0CALL.#REGION.ST.USA.NOAM")
         # without horizontal scrolling, plus the Edit/Delete action cell.
         self.setMinimumSize(880, 480)
         self.resize(960, 560)
@@ -720,20 +997,19 @@ class AddressBookDialog(QDialog):
 
         # ── Contact list ──────────────────────────────────────────
         self.table = QTableWidget()
-        self.table.setColumnCount(6)
+        self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(
-            ["Call", "Name", "City / State", "Home BBS", "Send Mode", ""])
+            ["Call", "Name", "City / State", "Home BBS", ""])
         self.table.horizontalHeader().setStretchLastSection(False)
         # City/State stretches to soak up extra width. Home BBS is sized
-        # to fit a typical HA address ("KC9MTP.#NWIN.IN.USA.NOAM") in
+        # to fit a typical HA address ("N0CALL.#REGION.ST.USA.NOAM") in
         # full. Action column fits Edit + Delete buttons side-by-side.
         self.table.horizontalHeader().setSectionResizeMode(
             2, self.table.horizontalHeader().ResizeMode.Stretch)
         self.table.setColumnWidth(0, 80)    # Call
         self.table.setColumnWidth(1, 110)   # Name
         self.table.setColumnWidth(3, 230)   # Home BBS — full HA address
-        self.table.setColumnWidth(4, 110)   # Send Mode
-        self.table.setColumnWidth(5, 140)   # Actions (Edit / Delete)
+        self.table.setColumnWidth(4, 140)   # Actions (Edit / Delete)
         self.table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(
@@ -761,8 +1037,6 @@ class AddressBookDialog(QDialog):
             self.table.setItem(r, 1, QTableWidgetItem(c.get("name") or ""))
             self.table.setItem(r, 2, QTableWidgetItem(c.get("qth") or ""))
             self.table.setItem(r, 3, QTableWidgetItem(c.get("home_bbs") or ""))
-            mode = "Immediate" if c.get("send_now", 1) else "Home BBS only"
-            self.table.setItem(r, 4, QTableWidgetItem(mode))
             # Action buttons cell
             cell = QWidget()
             hb = QHBoxLayout(cell)
@@ -781,7 +1055,7 @@ class AddressBookDialog(QDialog):
             dlt.setFixedHeight(24)
             dlt.clicked.connect(lambda _, cs=c["callsign"]: self._on_delete(cs))
             hb.addWidget(dlt)
-            self.table.setCellWidget(r, 5, cell)
+            self.table.setCellWidget(r, 4, cell)
         self.table.resizeRowsToContents()
         n = len(contacts)
         self._hint.setText(
@@ -842,13 +1116,11 @@ class _ContactEditDialog(QDialog):
         self.e_name     = QLineEdit(c.get("name", ""))
         self.e_qth      = QLineEdit(c.get("qth", ""))
         self.e_home_bbs = QLineEdit(c.get("home_bbs", ""))
-        self.chk_send   = QCheckBox("Send immediately on next connection to any BBS")
-        self.chk_send.setChecked(bool(c.get("send_now", 1)))
 
-        self.e_call.setPlaceholderText("e.g. KD8NOA")
+        self.e_call.setPlaceholderText("e.g. N0CALL")
         self.e_name.setPlaceholderText("e.g. Bob Novak")
         self.e_qth.setPlaceholderText("e.g. Flint, MI")
-        self.e_home_bbs.setPlaceholderText("e.g. KD8NOA.MI.USA.NOAM")
+        self.e_home_bbs.setPlaceholderText("e.g. N0CALL.ST.USA.NOAM")
 
         if contact:
             self.e_call.setReadOnly(True)   # can't change callsign on edit
@@ -857,7 +1129,6 @@ class _ContactEditDialog(QDialog):
         form.addRow("Name:",     self.e_name)
         form.addRow("City/St:",  self.e_qth)
         form.addRow("Home BBS:", self.e_home_bbs)
-        form.addRow("",          self.chk_send)
         layout.addLayout(form)
 
         btns = QDialogButtonBox(
@@ -879,7 +1150,6 @@ class _ContactEditDialog(QDialog):
             "name":     self.e_name.text().strip(),
             "qth":      self.e_qth.text().strip(),
             "home_bbs": self.e_home_bbs.text().strip().upper(),
-            "send_now": self.chk_send.isChecked(),
         }
 
 
@@ -928,16 +1198,19 @@ class ComposeDialog(QDialog):
         self.type_combo   = QComboBox()
         self.type_combo.addItems(["Personal (P)", "Bulletin (B)"])
         self.at_bbs_edit.setPlaceholderText(
-            "e.g. KD8NOA.MI.USA.NOAM  (leave blank if unknown)")
+            "e.g. N0CALL.ST.USA.NOAM  (leave blank if unknown)")
         form.addRow("@ Home BBS:",  self.at_bbs_edit)
         form.addRow("Subject:",     self.subject_edit)
         form.addRow("Type:",        self.type_combo)
 
-        self.chk_send_now = QCheckBox(
-            "Send immediately on next connection to any BBS")
-        self.chk_send_now.setChecked(True)
-        form.addRow("Send mode:", self.chk_send_now)
-        self.at_bbs_edit.textChanged.connect(self._on_at_bbs_changed)
+        # "Send immediately on next connection to any BBS" was here, and
+        # it never controlled anything: _on_send_outbox sends every pending
+        # row to whichever BBS is connected and has never consulted the
+        # flag. Unticking it did not hold a message back. Removed rather
+        # than implemented — the Outbox now means one thing, "these go on
+        # the next Send / Receive", and that is one less decision per
+        # message (Bill, 2026-09-23). The send_now columns stay in the
+        # database so existing rows still load.
 
         self.save_link = QPushButton("+ save to address book")
         self.save_link.setFlat(True)
@@ -998,7 +1271,6 @@ class ComposeDialog(QDialog):
     def _fill_from_contact(self, c: dict):
         self.to_edit.setText(c["callsign"])
         self.at_bbs_edit.setText(c.get("home_bbs") or "")
-        self.chk_send_now.setChecked(bool(c.get("send_now", 1)))
         self.save_link.setVisible(False)
         self.subject_edit.setFocus()
 
@@ -1008,18 +1280,11 @@ class ComposeDialog(QDialog):
             contact = self.cdb.get_by_callsign(text)
             if contact:
                 self.at_bbs_edit.setText(contact.get("home_bbs") or "")
-                self.chk_send_now.setChecked(bool(contact.get("send_now", 1)))
                 self.save_link.setVisible(False)
             else:
                 self.save_link.setVisible(True)
         else:
             self.save_link.setVisible(False)
-
-    def _on_at_bbs_changed(self, text):
-        has_bbs = bool(text.strip())
-        self.chk_send_now.setEnabled(has_bbs)
-        if not has_bbs:
-            self.chk_send_now.setChecked(True)
 
     def _open_address_book(self):
         if not self.cdb:
@@ -1038,8 +1303,7 @@ class ComposeDialog(QDialog):
             return
         dlg = _ContactEditDialog(
             contact={"callsign": call,
-                     "home_bbs": self.at_bbs_edit.text().strip().upper(),
-                     "send_now": self.chk_send_now.isChecked()},
+                     "home_bbs": self.at_bbs_edit.text().strip().upper()},
             parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             v = dlg.get_values()
@@ -1056,7 +1320,6 @@ class ComposeDialog(QDialog):
             "subject":  self.subject_edit.text().strip(),
             "body":     self.body_edit.toPlainText(),
             "msg_type": "P" if self.type_combo.currentIndex() == 0 else "B",
-            "send_now": self.chk_send_now.isChecked(),
         }
 # ─────────────────────────────────────────────────────────────────────────────
 # Terminal Widget
@@ -1083,6 +1346,7 @@ class TerminalWidget(QWidget):
         hdr_label = QLabel("📟  Terminal — Raw BBS Session")
         hdr_label.setStyleSheet("font-weight:bold; font-size:13px;")
         self.get_file_btn = QPushButton("📁 File Download - YAPP")
+        self.get_file_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.get_file_btn.setFixedWidth(190)
         self.get_file_btn.setToolTip(
             "Download a file from the BBS using YAPP.\n"
@@ -1091,6 +1355,7 @@ class TerminalWidget(QWidget):
         self.get_file_btn.clicked.connect(self.sig_get_file.emit)
 
         self.clear_btn = QPushButton("Clear")
+        self.clear_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.clear_btn.setFixedWidth(60)
         self.clear_btn.clicked.connect(self._clear)
         hdr.addWidget(hdr_label)
@@ -1124,6 +1389,13 @@ class TerminalWidget(QWidget):
 
         send_btn = QPushButton("Send")
         send_btn.setFixedWidth(64)
+        # No button in the Terminal may hold keyboard focus. On GNOME /
+        # Wayland, Enter PRESSES whichever button has focus, so clicking the
+        # LL 20 quick button and then pressing Enter at the page prompt sent
+        # LL 20 again instead of a bare CR (J5, 2026-09-28, VARA HF — the
+        # BBS log shows both). Offscreen Qt does not do this, so the test
+        # harness never saw it. Typing always stays in the input box.
+        send_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         send_btn.clicked.connect(self._send)
 
         il.addWidget(prompt)
@@ -1134,21 +1406,44 @@ class TerminalWidget(QWidget):
         # Quick-command buttons
         ql = QHBoxLayout()
         ql.addWidget(QLabel("Quick:"))
-        for label, cmd in [
-            ("L",      "L"),
-            ("LM",     "LM"),
-            ("LL 20",  "LL 20"),
-            ("RM",     "RM"),
-            ("KM",     "KM"),
-            ("I",      "I"),
-            ("?",      "?"),
-            ("B",      "B"),
-            ("Files",  "files"),
-            ("Read",   "read "),
+        for label, cmd, tip in [
+            ("L",      "L",      "L — new messages since your last L"),
+            ("LM",     "LM",     "LM — list the messages addressed to you"),
+            ("LL 20",  "LL 20",  "LL 20 — list the last 20 messages"),
+            ("RM",     "RM",     "RM — read your new messages"),
+            ("KM",     "KM",     ""),          # set below, it needs the warning
+            ("I",      "I",      "I — information about this BBS"),
+            ("?",      "?",      "? — the BBS command list"),
+            ("B",      "B",      "B — say goodbye and disconnect"),
+            ("Files",  "files",  "FILES — list the files available for download"),
+            ("Read",   "read ",  "READ <name> — read a text file from the Files "
+                                 "area,\ne.g.  read a_file_name.txt\n"
+                                 "Click FILES first to see what is there. For "
+                                 "binary files\nuse the YAPP button instead."),
+            # The two answers a paged listing will accept. Without these the
+            # only way out of an OP page prompt was to know that a bare CR
+            # continues and A aborts (Bill, 2026-09-23).
+            ("⏎ CR",   "",       "Send a bare carriage return — answers the "
+                                 "BBS page prompt\n<CR> Continue, and is what "
+                                 "Enter on an empty box sends."),
+            ("A",      "A",      "A — abort the BBS output while it is paging, "
+                                 "and get\nback to the command prompt."),
         ]:
             b = QPushButton(label)
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # see send_btn
             b.setFixedHeight(26)
             b.setFixedWidth(54)
+            if tip:
+                b.setToolTip(tip)
+            if cmd.strip().upper() == "KM":
+                # Destructive — don't let it sit here looking like L or LM.
+                # MainWindow._confirm_destructive also asks before it goes.
+                b.setStyleSheet("QPushButton { color:#ffcccc; "
+                                "background-color:#5a2a2a; "
+                                "border:1px solid #aa4444; }")
+                b.setToolTip("KM — Kill Mine: kills your \"read\" "
+                             "messages ON THE BBS.\nAsks first. Your mail "
+                             "is still in the QtC Inbox.")
             if cmd.endswith(" "):
                 # Commands that need a filename: put them in the input box
                 # so the user can complete the name before sending
@@ -1178,20 +1473,39 @@ class TerminalWidget(QWidget):
         self.output.clear()
 
     def _send(self):
+        """Send what is typed — including nothing at all.
+
+        An empty box used to return here, which meant there was no way to
+        answer BPQ's page prompt: `<A>bort, <CR> Continue..>` takes only A
+        or a bare CR, and Enter on an empty line was being swallowed. A
+        listing that hit the OP limit could not be continued from the
+        Terminal at all (Bill, 2026-09-23). session._send("") already puts
+        a bare CR on the air — the paging code answers page prompts with
+        exactly that."""
         cmd = self.input_line.text().strip()
-        if not cmd:
-            return
         self.input_line.clear()
+        self.input_line.setFocus()   # the next Enter belongs to the box
         self.sig_send_cmd.emit(cmd)
 
     def _quick(self, cmd: str):
         self.input_line.setText(cmd)
         self._send()
 
+    # Shown in the terminal when a prefilled command is waiting for an
+    # argument. The input box has the command in it, so its placeholder
+    # text can never appear — the hint has to go on screen instead.
+    _PREFILL_HINTS = {
+        "read ": "[Type the file name after READ, e.g.  read a_file_name.txt "
+                 "— click FILES to see what is there]",
+    }
+
     def _prefill(self, cmd: str):
         """Put cmd in the input box and focus it — user adds filename then sends."""
         self.input_line.setText(cmd)
         self.input_line.setFocus()
+        hint = self._PREFILL_HINTS.get(cmd)
+        if hint:
+            self.append(f"\n{hint}\n", "#888888")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1405,11 +1719,17 @@ class MailView(QWidget):
         self.btn_delete = QPushButton("🗑  Delete")
         self.btn_search = QPushButton("🔍  Search")
         self.btn_mark_all_read = QPushButton("✓  Mark All Read")
-        self.btn_send_outbox = QPushButton("📤  Send Outbox Now")
+        self.btn_send_outbox = QPushButton("🔄  Send / Receive")
 
         self.btn_reply.setEnabled(False)
         self.btn_delete.setEnabled(False)
+        # Enabled whenever a session is up (MainWindow._on_connected), not
+        # only when the outbox has something — it receives as well as sends.
         self.btn_send_outbox.setEnabled(False)
+        self.btn_send_outbox.setToolTip(
+            "Send anything waiting in the Outbox, then check for new mail "
+            "(LM) and download it.\nBulletins are not included — those run "
+            "on a Mail view connect.")
 
         self.btn_new.clicked.connect(self.sig_new_message)
         self.btn_reply.clicked.connect(self.sig_reply)
@@ -1815,17 +2135,23 @@ class MailView(QWidget):
         self.msg_table.resizeRowsToContents()
 
     def _fill_outbox(self, rows):
+        # Size replaced a "Status" column that could only ever read
+        # "Pending" — the outbox folder shows pending rows and nothing
+        # else, so it never told anyone anything (Bill, 2026-09-23).
+        # Bytes, counted the same way mark_sent() counts them, so the
+        # number does not change when the message moves to Sent.
         self.msg_table.setHorizontalHeaderLabels(
-            ["", "To", "Subject", "Queued", "Status"])
+            ["", "To", "Subject", "Queued", "Size"])
         for rd in rows:
             r = self.msg_table.rowCount()
             self.msg_table.insertRow(r)
             dot = QTableWidgetItem("📤")
             dot.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.msg_table.setItem(r, 0, dot)
+            size_str = str(len((rd.get("body") or "").encode("utf-8")))
             for c, v in enumerate(
                     [rd["to_call"], rd["subject"] or "",
-                     (rd["created_at"] or "")[:16], "Pending"], start=1):
+                     (rd["created_at"] or "")[:16], size_str], start=1):
                 it = QTableWidgetItem(v)
                 it.setData(Qt.ItemDataRole.UserRole, rd["id"])
                 self.msg_table.setItem(r, c, it)
@@ -2140,13 +2466,13 @@ class SettingsDialog(QDialog):
         self.e_password    = QLineEdit(u.get("password", ""))
         self.e_password.setEchoMode(QLineEdit.EchoMode.Password)
 
-        self.e_callsign.setPlaceholderText("e.g. KC9MTP")
+        self.e_callsign.setPlaceholderText("e.g. N0CALL")
         self.e_name.setPlaceholderText("e.g. Bill  (sent on first BBS registration)")
-        self.e_qth.setPlaceholderText("e.g. Valparaiso IN  (optional)")
-        self.e_zip.setPlaceholderText("e.g. 46383  (optional)")
+        self.e_qth.setPlaceholderText("e.g. Anytown ST  (optional)")
+        self.e_zip.setPlaceholderText("e.g. 12345  (optional)")
         self.e_home_bbs.setPlaceholderText(
-            "e.g. KC9MTP.#NWIN.IN.USA.NOAM  (hierarchical routing address)")
-        self.e_telnet_user.setPlaceholderText("e.g. kc9mtp  (lowercase, case-sensitive)")
+            "e.g. N0CALL.#REGION.ST.USA.NOAM  (hierarchical routing address)")
+        self.e_telnet_user.setPlaceholderText("e.g. n0call  (lowercase, case-sensitive)")
         self.e_password.setPlaceholderText("Telnet sysop password (blank for radio)")
 
         self.chk_show_pw = QCheckBox("Show")
@@ -2190,8 +2516,7 @@ class SettingsDialog(QDialog):
         "vara_hf":    "VARA HF",
         "vara_fm":    "VARA FM",
         "telnet":     "Telnet",
-        "direwolf":   "Direwolf",
-        "soundmodem": "Soundmodem",
+        **AGW_MODEMS,
     }
     _BBS_NA = "—"   # em-dash placeholder for inapplicable cells
 
@@ -2206,7 +2531,7 @@ class SettingsDialog(QDialog):
         # Fixed-ish widths for type/callsign/freq/bw/port; Name and Host
         # share whatever's left, Notes stretches. Widths picked so the
         # widest plausible content fits without truncation: "VARA HF"
-        # in Type, "NARROW" in BW, "10.0.0.177" in Host, "8110" in Port.
+        # in Type, "NARROW" in BW, "192.168.1.50" in Host, "8110" in Port.
         hdr = self.bbs_table.horizontalHeader()
         self.bbs_table.setColumnWidth(0, 85)    # Type
         hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
@@ -2254,18 +2579,20 @@ class SettingsDialog(QDialog):
         for idx, e in enumerate(self._cfg.get("bbs_list", [])):
             transport = e.get("transport", "telnet")
             is_vara   = transport in ("vara_hf", "vara_fm")
-            is_telnet = transport == "telnet"
+            is_agw    = transport in AGW_MODEMS
+            has_host  = transport == "telnet" or is_agw   # Host/Port apply
             type_lbl  = self._BBS_TRANSPORT_LABEL.get(transport, transport)
-            port_val  = e.get("telnet_port", "")
+            port_val  = (e.get("agw_port", AGW_DEFAULT_PORT) if is_agw
+                         else e.get("telnet_port", ""))
             cells = [
                 type_lbl,
                 e.get("name", ""),
                 e.get("callsign", ""),
                 e.get("freq", "") if is_vara else self._BBS_NA,
                 e.get("bw", "")   if is_vara else self._BBS_NA,
-                e.get("host", "") if is_telnet else self._BBS_NA,
-                str(port_val)     if is_telnet and port_val != "" else
-                                       (self._BBS_NA if not is_telnet else ""),
+                e.get("host", "") if has_host else self._BBS_NA,
+                str(port_val)     if has_host and port_val != "" else
+                                       (self._BBS_NA if not has_host else ""),
                 e.get("notes", ""),
             ]
             r = self.bbs_table.rowCount()
@@ -2597,7 +2924,7 @@ class SettingsDialog(QDialog):
         first_connect_note = QLabel(
             "<i><b>First-time connects to your Home BBS:</b> the very "
             "first bulletin check is kept short on purpose — 2 newest "
-            "per category on VARA HF, 3 on VARA FM or Telnet. Sorry, "
+            "per category on VARA HF or packet, 3 on VARA FM or Telnet. Sorry, "
             "RF just isn't 1 Gb/s fiber, and both the BBS and the "
             "frequency are shared with other ops.</i>")
         first_connect_note.setStyleSheet(
@@ -2622,13 +2949,15 @@ class SettingsDialog(QDialog):
         return getattr(p, "worker", None) if p else None
 
     def _is_connected_for_bulletins(self) -> bool:
-        """True when the parent main window is currently connected to a BBS.
-        Mirrors btn_refresh's enabled state (set in _on_connected, cleared
-        in _on_disconnected) — that's the simplest is-actively-connected
-        signal exposed by MainWindow."""
+        """True when the parent main window is connected AND logged in.
+
+        Gates the "📡 Get categories from BBS…" button, which sends LC —
+        so the gate has to mean logged in, not just "a session object
+        exists". Until v0.15.0 this read a hidden Refresh button's enabled
+        flag through getattr, which would have failed silently (button
+        gone -> permanently "not connected") rather than loudly."""
         p = self.parent()
-        return bool(p and getattr(p, "btn_refresh", None)
-                    and p.btn_refresh.isEnabled())
+        return bool(p is not None and getattr(p, "_logged_in", False))
 
     def _bull_format_last_lc(self, ts) -> str:
         if not ts:
@@ -2810,6 +3139,11 @@ class SettingsDialog(QDialog):
     # Bump this when the RF responsibility text below materially changes —
     # users who accepted an older version will be re-prompted on next enable.
     # Telnet connections do not require acceptance (no RF safety concerns).
+    # Bump ONLY for a change an operator who already accepted must see
+    # again — _validate() stops firing RF Mail-Call until the current
+    # version is accepted, so a bump silently disables scheduled sessions
+    # until the user reopens Settings. The §97.221 line added in v0.15.0
+    # did not bump it for exactly that reason.
     MAILCALL_RESPONSIBILITY_VERSION = 1
 
     MAILCALL_RESPONSIBILITY_HTML_RF = (
@@ -2824,6 +3158,10 @@ class SettingsDialog(QDialog):
         "reliable</li>"
         "<li>Your RF output power being set sensibly, <b>not</b> at "
         "maximum</li>"
+        "<li>Your Mail-Call frequency meeting <b>§97.221</b> — unattended "
+        "automatic operation is limited to certain segments. Please verify "
+        "before you enable it. QtC cannot see your dial frequency and does "
+        "not check</li>"
         "<li>Watching for failures the software <b>cannot</b> detect — "
         "stuck PTT, bumped VFO knob, antenna falls, coax failure, radio "
         "fault, software hang with PTT still asserted</li>"
@@ -3126,10 +3464,10 @@ class SettingsDialog(QDialog):
         BBS hierarchical addressing (HA) lets other BBSes route mail to
         you via your home BBS. Examples of what this normalizes:
 
-          'KC9MTP.#NWIN.IN.USA.NOAM'  →  'KC9MTP'   (My Station home_bbs,
+          'N0CALL.#REGION.ST.USA.NOAM'  →  'N0CALL'   (My Station home_bbs,
                                                      contact home_bbs)
-          'KC9MTP-1'                  →  'KC9MTP'   (bbs_list.callsign)
-          'KC9MTP'                    →  'KC9MTP'   (bare call)
+          'N0CALL-1'                  →  'N0CALL'   (bbs_list.callsign)
+          'N0CALL'                    →  'N0CALL'   (bare call)
 
         So Mail-Call can find every bbs_list entry that belongs to the
         user's home BBS station, regardless of which form was typed.
@@ -3175,12 +3513,15 @@ class SettingsDialog(QDialog):
             "vara_hf": "VARA HF",
             "vara_fm": "VARA FM",
             "telnet":  "Telnet",
+            **AGW_MODEMS,
         }
         tname = transport_map.get(entry.get("transport", ""),
                                    entry.get("transport", "?"))
         host = entry.get("host", "")
         if entry.get("transport") == "telnet":
             port = entry.get("telnet_port", "")
+        elif entry.get("transport") in AGW_MODEMS:
+            port = entry.get("agw_port", AGW_DEFAULT_PORT)
         else:
             port = entry.get("vara_cmd_port", "")
         location = f"{host}:{port}" if host and port else (host or "?")
@@ -3361,8 +3702,14 @@ class SettingsDialog(QDialog):
 
         a = self._cfg.get("app", {})
 
-        self.chk_auto_dl = QCheckBox("Auto-download new personal mail on connect")
-        self.chk_auto_dl.setChecked(bool(a.get("auto_check_mail", True)))
+        # "Auto-download new personal mail on connect" lived here. It was
+        # written to config and read back into itself and was never
+        # consulted anywhere else — unticking it changed nothing, because
+        # what actually decides is whether the session came from Mail view
+        # or from Terminal (see _on_mail_summary). Removed rather than
+        # renamed: a control that does nothing is worse than no control
+        # (Bill, 2026-09-23). The config key is left alone so an older
+        # config.json still loads.
 
         self.chk_dark_mode = QCheckBox("Dark mode  (takes effect on next launch)")
         self.chk_dark_mode.setChecked(bool(a.get("dark_mode", False)))
@@ -3385,15 +3732,43 @@ class SettingsDialog(QDialog):
         self._font_preview.setPlainText(
             "The quick brown fox jumped over the lazy dog.\n"
             "Pack my box with five dozen liquor jugs.\n"
-            "de KC9MTP>")
+            "de N0CALL>")
         self.spin_font.valueChanged.connect(
             lambda v: self._font_preview.setFont(QFont("Courier New", v)))
 
         self.e_data_dir = QLineEdit(a.get("data_dir", "data"))
         self.e_data_dir.setPlaceholderText("data")
 
-        self.e_max_size = QLineEdit(str(a.get("max_message_size_kb", 50)))
-        self.e_max_size.setFixedWidth(70)
+        # "Max message size (KB)" was here. Nothing ever checked a message
+        # against it — no send path, no download path, nowhere. Removed in
+        # v0.15.0 with the rest of the dead controls. Worth building for
+        # real one day: 50 KB at 300 baud is half an hour of airtime.
+
+        # Page limit — the BBS "OP" command. Sets how many lines the BBS
+        # sends before it stops and waits for us. Low is good RF manners:
+        # it stops a month of daily bulletins arriving as one enormous
+        # uninterruptible listing that ties up the frequency.
+        self.spin_page_limit = QSpinBox()
+        self.spin_page_limit.setRange(0, 255)
+        self.spin_page_limit.setValue(int(a.get("page_limit", 20)))
+        self.spin_page_limit.setFixedWidth(70)
+        self.spin_page_limit.setSuffix(" lines")
+        self.spin_page_limit.setToolTip(
+            "Sent to the BBS as \"OP n\" on your first connect to each BBS,\n"
+            f"then refreshed every 30 days. 0 turns BBS paging off.\n"
+            f"LinBPQ refuses anything from 1 to "
+            f"{BBSSession.PAGE_MIN - 1} — it wants "
+            f"{BBSSession.PAGE_MIN} or more.")
+        # 1–9 is a value LinBPQ answers with "Page Length n is too short",
+        # and the spinner used to offer them (Bill, 2026-09-23: "OP 10 is
+        # the shortest you can pick"). Snap up rather than refuse to type:
+        # 0 still means no paging.
+        self.spin_page_limit.valueChanged.connect(
+            lambda v: self.spin_page_limit.setValue(BBSSession.PAGE_MIN)
+            if 0 < v < BBSSession.PAGE_MIN else None)
+        page_row = QHBoxLayout()
+        page_row.addWidget(self.spin_page_limit)
+        page_row.addStretch()
 
         # Character-set selector (issue #2). utf-8 default; cp437/cp850 let
         # DOS-art bulletins in the TECH area render their box-drawing graphics
@@ -3415,13 +3790,27 @@ class SettingsDialog(QDialog):
         codec_row.addWidget(self.combo_codec)
         codec_row.addStretch()
 
-        form.addRow("", self.chk_auto_dl)
         form.addRow("", self.chk_dark_mode)
         form.addRow("Message font size:", font_row)
         form.addRow("", self._font_preview)
         form.addRow("Character set:", codec_row)
         form.addRow("Data directory:", self.e_data_dir)
-        form.addRow("Max message size (KB):", self.e_max_size)
+        form.addRow("Page limit  (OP):", page_row)
+
+        page_note = QLabel(
+            "<i>How many lines the BBS sends before it pauses. QtC sends "
+            "<b>OP 20</b> on your first connect to each BBS and refreshes it "
+            "every 30 days.<br>"
+            "Keeping this low is good RF manners — it stops a month of daily "
+            "bulletins from arriving as one long listing that ties up the "
+            "frequency for everyone else. QtC reads past the pause "
+            "automatically when it needs to.<br>"
+            "<b>Default 20.</b> 0 turns BBS paging off entirely and the BBS "
+            "sends everything in one go. Change only if you are sure of the "
+            "result.</i>")
+        page_note.setStyleSheet(f"color: {self._note_color}; font-size:11px;")
+        page_note.setWordWrap(True)
+        form.addRow("", page_note)
 
         note = QLabel(
             "<i>Data directory stores the local SQLite database.<br>"
@@ -3452,13 +3841,11 @@ class SettingsDialog(QDialog):
 
         # App tab
         self._cfg.setdefault("app", {})
-        self._cfg["app"]["auto_check_mail"]      = self.chk_auto_dl.isChecked()
         self._cfg["app"]["dark_mode"]            = self.chk_dark_mode.isChecked()
         self._cfg["app"]["font_size"]            = self.spin_font.value()
         self._cfg["app"]["data_dir"]             = self.e_data_dir.text().strip() or "data"
         self._cfg["app"]["text_codec"]           = self.combo_codec.currentData()
-        sz = self.e_max_size.text().strip()
-        self._cfg["app"]["max_message_size_kb"]  = int(sz) if sz.isdigit() else 50
+        self._cfg["app"]["page_limit"]           = self.spin_page_limit.value()
 
         # Bulletins tab — single master switch gates LC seeding +
         # bulletin check; subscriptions are derived from the checkable
@@ -3526,7 +3913,7 @@ class SettingsDialog(QDialog):
             if self._mc_transport_class(selected_entry) == "rf" \
                     and not self._mc_already_accepted_rf():
                 QMessageBox.warning(self, "Mail-Call !!!",
-                    "You have selected an RF (VARA) connection but have not "
+                    "You have selected an RF (VARA or packet) connection but have not "
                     "accepted the RF responsibility text.\n\n"
                     "Toggle the Enable checkbox off, then back on, to see "
                     "the RF responsibility prompt.")
@@ -3587,10 +3974,10 @@ class _BBSEntryDialog(QDialog):
         ("VARA HF",      "vara_hf"),
         ("VARA FM",      "vara_fm"),
         ("Telnet",       "telnet"),
-        ("Direwolf",     "direwolf"),    # future
-        ("Soundmodem",   "soundmodem"),  # future
+        ("Direwolf",     "direwolf"),
+        ("(Qt)SoundModem", "soundmodem"),
     ]
-    FUTURE = {"direwolf", "soundmodem"}
+    FUTURE = set()
 
     def __init__(self, entry: dict = None, parent=None):
         super().__init__(parent)
@@ -3615,21 +4002,11 @@ class _BBSEntryDialog(QDialog):
         self.e_name     = QLineEdit(e.get("name", ""))
         self.e_name.setPlaceholderText("e.g. Home Node")
         self.e_callsign = QLineEdit(e.get("callsign", ""))
-        self.e_callsign.setPlaceholderText("e.g. KC9MTP-1")
+        self.e_callsign.setPlaceholderText("e.g. N0CALL-1")
         self.e_notes    = QLineEdit(e.get("notes", ""))
 
         form.addRow("Name:",      self.e_name)
         form.addRow("Callsign:",  self.e_callsign)
-
-        # ── Terminal/Debug prompt option ───────────────
-        self.chk_no_terminal_prompt = QCheckBox(
-            "Never prompt for mail download in Terminal / Debug view")
-        self.chk_no_terminal_prompt.setChecked(
-            bool(e.get("no_terminal_prompt", False)))
-        self.chk_no_terminal_prompt.setToolTip(
-            "When checked, connecting in Terminal or Debug view will always "
-            "act as a pure dumb terminal — no mail download dialog.")
-        form.addRow("", self.chk_no_terminal_prompt)
 
         # ── Transport selector ─────────────────────────
         self.transport_combo = QComboBox()
@@ -3687,6 +4064,54 @@ class _BBSEntryDialog(QDialog):
         telnet_form.addRow("Port:", self.e_port)
         layout.addWidget(self.telnet_group)
 
+        # ── Packet (AGW modem) fields panel ────────────
+        self.agw_group = QFrame()
+        self.agw_group.setFrameShape(QFrame.Shape.StyledPanel)
+        agw_form = QFormLayout(self.agw_group)
+        agw_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        agw_form.setVerticalSpacing(8)
+        agw_form.setContentsMargins(12, 10, 12, 10)
+
+        is_agw_entry = e.get("transport") in AGW_MODEMS
+        self.e_agw_host = QLineEdit(
+            (e.get("host", "") if is_agw_entry else "") or "127.0.0.1")
+        self.e_agw_host.setPlaceholderText("127.0.0.1")
+        self.e_agw_host.setToolTip(
+            "Computer running the modem — 127.0.0.1 when it's this one")
+        self.e_agw_port = QLineEdit(str(e.get("agw_port", AGW_DEFAULT_PORT)))
+        self.e_agw_port.setPlaceholderText(str(AGW_DEFAULT_PORT))
+        self.e_agw_port.setFixedWidth(70)
+        self.e_agw_port.setToolTip(
+            f"The modem's AGW port (AGWPORT in direwolf.conf, or the AGW "
+            f"port in QtSoundModem's Setup) — default {AGW_DEFAULT_PORT}")
+        self.e_agw_radio = QSpinBox()
+        self.e_agw_radio.setRange(0, 15)
+        self.e_agw_radio.setValue(int(e.get("agw_radio_port", 0)))
+        self.e_agw_radio.setFixedWidth(60)
+        # Labelled in the modem's own words, not AGW's "radio port" — a new
+        # Direwolf user will look for the word in direwolf.conf and find
+        # CHANNEL there (Bill, 2026-09-29). Text is set per modem in
+        # _on_transport_changed.
+        self.l_agw_radio = QLabel()
+        self.l_agw_radio_hint = QLabel()
+        self.l_agw_radio_hint.setStyleSheet(
+            f"color: {self._note_color}; font-size:11px;")
+        agw_radio_row = QHBoxLayout()
+        agw_radio_row.setSpacing(8)
+        agw_radio_row.addWidget(self.e_agw_radio)
+        agw_radio_row.addWidget(self.l_agw_radio_hint, 1)
+
+        agw_form.addRow("Host:",       self.e_agw_host)
+        agw_form.addRow("AGW Port:",   self.e_agw_port)
+        agw_form.addRow(self.l_agw_radio, agw_radio_row)
+        agw_note = QLabel(
+            "Packet length, retries and PTT are set in the modem's "
+            "own configuration.")
+        agw_note.setStyleSheet(f"color: {self._note_color}; font-size:11px;")
+        agw_note.setWordWrap(True)
+        agw_form.addRow("", agw_note)
+        layout.addWidget(self.agw_group)
+
         # ── Future transport placeholder ───────────────
         self.future_group = QFrame()
         self.future_group.setFrameShape(QFrame.Shape.StyledPanel)
@@ -3724,15 +4149,48 @@ class _BBSEntryDialog(QDialog):
     }
     _VARA_BW_DEFAULT = {"vara_hf": "500", "vara_fm": "NARROW"}
 
+    # What each AGW modem calls the "radio port" field in its own config.
+    _AGW_CHANNEL_WORDS = {
+        "direwolf": (
+            "Channel:",
+            "CHANNEL in direwolf.conf — leave at 0 for one radio",
+            "The CHANNEL number from direwolf.conf. 0 is the first radio; "
+            "1 is the second (right audio channel with ACHANNELS 2)."),
+        "soundmodem": (
+            "Channel:",
+            "0 = Modem A in QtSoundModem — leave at 0 for one radio",
+            "AGW port number in QtSoundModem: 0 is Modem A (left audio), "
+            "1 is Modem B (right audio), and so on."),
+    }
+
     def _on_transport_changed(self, index: int):
         _, key = self.TRANSPORTS[index]
         is_vara    = key in ("vara_hf", "vara_fm")
         is_telnet  = key == "telnet"
         is_future  = key in self.FUTURE
+        is_agw     = key in AGW_MODEMS and not is_future
 
         self.vara_group.setVisible(is_vara)
         self.telnet_group.setVisible(is_telnet)
+        self.agw_group.setVisible(is_agw)
         self.future_group.setVisible(is_future)
+
+        if is_agw:
+            label, hint, tip = self._AGW_CHANNEL_WORDS.get(
+                key, self._AGW_CHANNEL_WORDS["direwolf"])
+            self.l_agw_radio.setText(label)
+            self.l_agw_radio_hint.setText(hint)
+            self.e_agw_radio.setToolTip(tip)
+
+        if is_agw and not self.e_host.text().strip():
+            # A modem nearly always runs on the same machine as QtC, and
+            # the connect code already falls back to 127.0.0.1 for a blank
+            # host — but the dialog never said so, leaving a new Direwolf
+            # entry with an empty Host box and a placeholder reading only
+            # "IP address or hostname" (found running B1, 2026-09-20).
+            # Only filled when blank, so a host typed for Telnet and then
+            # switched over is never clobbered.
+            self.e_host.setText("127.0.0.1")
 
         if is_vara:
             # Repopulate the BW dropdown with the right options for this
@@ -3755,8 +4213,9 @@ class _BBSEntryDialog(QDialog):
 
         if is_future:
             label_map = {
-                "direwolf":   "Direwolf / AX.25 packet support is planned for a future release.",
-                "soundmodem": "Soundmodem support is planned for a future release.",
+                "soundmodem": "(Qt)SoundModem support is planned for a future "
+                              "release — it will use the same AGW connection "
+                              "as Direwolf.",
             }
             self.future_label.setText(label_map.get(key, "Coming soon."))
 
@@ -3770,11 +4229,20 @@ class _BBSEntryDialog(QDialog):
         if key == "telnet" and not self.e_host.text().strip():
             QMessageBox.warning(self, "Missing Field", "Host cannot be blank for Telnet.")
             return
+        if key in AGW_MODEMS and key not in self.FUTURE:
+            p = self.e_agw_port.text().strip()
+            if not (p.isdigit() and 0 < int(p) < 65536):
+                QMessageBox.warning(self, "Invalid Port",
+                    f"AGW Port must be a number from 1 to 65535 "
+                    f"(default {AGW_DEFAULT_PORT}).")
+                return
         self.accept()
 
     def get_entry(self) -> dict:
         _, key = self.TRANSPORTS[self.transport_combo.currentIndex()]
         port = self.e_port.text().strip()
+        agw_port = self.e_agw_port.text().strip()
+        is_agw = key in AGW_MODEMS
         return {
             "name":        self.e_name.text().strip(),
             "callsign":    self.e_callsign.text().strip().upper(),
@@ -3782,11 +4250,14 @@ class _BBSEntryDialog(QDialog):
             "vara_type":   ("hf" if key == "vara_hf" else
                             "fm" if key == "vara_fm" else None),
             "freq":        self.e_freq.text().strip(),
-            "bw":          self.e_bw.currentText(),
-            "host":        self.e_host.text().strip(),
+            "bw":          "" if is_agw else self.e_bw.currentText(),
+            # Telnet and packet both keep their address in "host"
+            "host":        ((self.e_agw_host.text().strip() or "127.0.0.1")
+                            if is_agw else self.e_host.text().strip()),
             "telnet_port": int(port) if port.isdigit() else 8010,
+            "agw_port":    int(agw_port) if agw_port.isdigit() else AGW_DEFAULT_PORT,
+            "agw_radio_port": self.e_agw_radio.value(),
             "notes":       self.e_notes.text().strip(),
-            "no_terminal_prompt": self.chk_no_terminal_prompt.isChecked(),
         }
 
 
@@ -4026,6 +4497,20 @@ class MainWindow(QMainWindow):
         )
         self._vara_ctrl.open()   # silent — ok if VARA not running yet
 
+        # Quiet re-link. VARA takes one client, and until QtC holds its
+        # port VARA's TUNE button refuses ("link VARA with RMS Express…").
+        # open() above only ran at startup, so starting VARA after QtC left
+        # it unlinked until the dropdown changed or a session ended (Bill,
+        # 2026-09-28). Every few seconds, while a VARA entry is selected
+        # and QtC is idle, try again — off the GUI thread, since a dead
+        # remote host takes the full 2 s connect timeout.
+        self._vara_relink_busy = False
+        self._vara_was_linked  = self._vara_ctrl.is_open
+        self._vara_relink_timer = QTimer(self)
+        self._vara_relink_timer.setInterval(5000)
+        self._vara_relink_timer.timeout.connect(self._vara_relink_tick)
+        self._vara_relink_timer.start()
+
         mycall = self.config.get("user", {}).get("callsign", "").upper()
         self.setWindowTitle(f"QtC - {mycall}" if mycall else "QtC")
         self.setMinimumSize(920, 620)
@@ -4035,9 +4520,19 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_central()
         self._build_statusbar()
-        self._rx_buf = ""   # buffer for partial RX lines across VARA frames
-        self._pending_summary = None
         self._pending_summary = None   # held summary waiting for Mail view switch
+        # Connected AND logged in — not merely "a session object exists".
+        # worker.session is set the moment the session is constructed,
+        # before connect_and_login() runs, so it is NOT the same thing and
+        # cannot stand in for this. Written in exactly four places:
+        # _on_connected (True), _on_disconnected / _on_error / the VARA
+        # recovery timer (False). Until v0.15.0 this state was carried by
+        # the enabled flag of a permanently hidden Refresh button, read
+        # back through getattr — so deleting that button would have left
+        # the Bulletins tab quietly believing it was never connected.
+        self._logged_in = False
+        self._login_only_connect = False   # last Connect was from Terminal/Debug
+        self._sr_active       = False   # a Send / Receive round trip is running
         self._pending_outbox  = False   # outbox ready, waiting for Mail view switch
         self._send_total      = 0
         self._send_current    = 0
@@ -4084,6 +4579,13 @@ class MainWindow(QMainWindow):
         # auto-download all new bulletins). _mc_active_entry is too narrow
         # — it clears on connect success, before bulletins are even seen.
         self._mc_session_owned  = False
+        # _on_disconnected clears _mc_session_owned, but when the link drops
+        # mid-session the worker's sig_error can land just after it (the
+        # modem reader and the worker are different threads). This keeps
+        # "that session was Mail-Call's" until the next connect, so
+        # _on_error can still send the drop to Notifications, not a popup.
+        self._mc_owned_at_disconnect = False
+        self._mc_drop_noted          = False   # one notification per drop
         self._mc_retry_timer = QTimer(self)
         self._mc_retry_timer.setInterval(1000)   # 1s status countdown tick
         self._mc_retry_timer.timeout.connect(self._mc_retry_tick)
@@ -4127,7 +4629,7 @@ class MainWindow(QMainWindow):
         act_markall.setShortcut(QKeySequence("Ctrl+Shift+M"))
         act_markall.triggered.connect(
             lambda: self.mail_view.btn_mark_all_read.click())
-        act_outbox = QAction("📤  Send &Outbox Now", self)
+        act_outbox = QAction("🔄  Send / &Receive", self)
         act_outbox.setShortcut(QKeySequence("Ctrl+Shift+O"))
         act_outbox.triggered.connect(
             lambda: self.mail_view.btn_send_outbox.click())
@@ -4194,20 +4696,23 @@ class MainWindow(QMainWindow):
 
         vara_layout.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["VARA HF", "VARA FM"])
-        self.mode_combo.setFixedWidth(88)
-        self.mode_combo.setToolTip("VARA modem type")
+        self.mode_combo.addItems(["VARA HF", "VARA FM", *AGW_MODEMS.values()])
+        self.mode_combo.setFixedWidth(
+            self.mode_combo.fontMetrics().horizontalAdvance("(Qt)SoundModem") + 36)
+        self.mode_combo.setToolTip(
+            "RF modem — VARA, or Direwolf / (Qt)SoundModem for AX.25 packet")
         self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
         vara_layout.addWidget(self.mode_combo)
 
         vara_layout.addWidget(QLabel("  Call:"))
         self.call_edit = QLineEdit()
         self.call_edit.setFixedWidth(88)
-        self.call_edit.setPlaceholderText("KC9MTP-1")
-        self.call_edit.setToolTip("BBS callsign to connect to via VARA")
+        self.call_edit.setPlaceholderText("N0CALL-1")
+        self.call_edit.setToolTip("BBS callsign to connect to over RF")
         vara_layout.addWidget(self.call_edit)
 
-        vara_layout.addWidget(QLabel("  BW:"))
+        self.bw_label = QLabel("  BW:")   # hidden with bw_combo for packet
+        vara_layout.addWidget(self.bw_label)
         self.bw_combo = QComboBox()
         # Populated lazily by _toolbar_bw_set_for_mode — HF starts with
         # 500/2300 kHz options, FM swaps in NARROW/WIDE when picked.
@@ -4229,7 +4734,7 @@ class MainWindow(QMainWindow):
         telnet_layout.addWidget(QLabel("Call:"))
         self.telnet_call_edit = QLineEdit()
         self.telnet_call_edit.setFixedWidth(88)
-        self.telnet_call_edit.setPlaceholderText("KC9MTP-1")
+        self.telnet_call_edit.setPlaceholderText("N0CALL-1")
         self.telnet_call_edit.setToolTip("BBS callsign")
         telnet_layout.addWidget(self.telnet_call_edit)
 
@@ -4271,11 +4776,11 @@ class MainWindow(QMainWindow):
         # Stop a slow download without dropping the link: interrupts the
         # read and sends 'A' to the BBS to return to the command prompt.
         # Hidden until a download is actually running (see _on_progress).
-        self.btn_abort = QPushButton("⏹ Stop")
-        self.btn_abort.setToolTip(
-            "Stop the current download and return to the BBS command "
-            "prompt.\nSends 'A' to the BBS; you stay connected so you can "
-            "disconnect\ncleanly or carry on.")
+        # "Abort" is what the BBS itself calls this — `A` is BPQ's
+        # abort-paged-output command (Bill, 2026-09-23). Naming the button
+        # after the command means the button and the command list agree.
+        self.btn_abort = QPushButton("⏹ Abort")
+        self.btn_abort.setToolTip(self._ABORT_TIP)
         self.btn_abort.setStyleSheet(
             "QPushButton { background-color:#5a2a2a; color:#ffcccc; "
             "border:1px solid #aa4444; }"
@@ -4288,13 +4793,13 @@ class MainWindow(QMainWindow):
         self.btn_abort.setEnabled(False)
         tb.addWidget(self.btn_abort)
 
-        self.btn_refresh = QPushButton("🔄 Refresh")
-        self.btn_refresh.setToolTip(
-            "Check for new mail now (LM) — choose PN only or PN+PY")
-        self.btn_refresh.setEnabled(False)
-        self.btn_refresh.setVisible(False)   # hidden until tested in the field
-        self.btn_refresh.clicked.connect(self._on_refresh)
-        tb.addWidget(self.btn_refresh)
+        # A hidden "🔄 Refresh" button lived here. It was made invisible on
+        # 2026-09-20 — in Terminal / Debug view you type `lm` yourself, and
+        # asking QtC to fetch mail is what Mail view is for — but it stayed
+        # in the toolbar because its enabled flag had become the app's
+        # is-logged-in state. That state is now self._logged_in, and the
+        # button is gone with its handler (Bill, 2026-09-23). Send / Receive
+        # is the one button for "get my mail".
 
         tb.addSeparator()
 
@@ -4316,25 +4821,20 @@ class MainWindow(QMainWindow):
 
         # Progress shown in conn_label during operations (no separate widget needed)
 
-        self.btn_terminal = QPushButton("💻  Terminal")
-        self.btn_terminal.setCheckable(True)
-        self.btn_terminal.setToolTip("Clean terminal view — readable BBS text only")
-        self.btn_terminal.setStyleSheet(
-            "QPushButton:checked { background-color: #2a5a2a; color: #00ff88; "
-            "border: 1px solid #00aa44; }")
-        self.btn_terminal.clicked.connect(
-            lambda: self._switch_view(self.VIEW_TERMINAL))
-        tb.addWidget(self.btn_terminal)
-
-        self.btn_debug = QPushButton("🔬  Debug")
-        self.btn_debug.setCheckable(True)
-        self.btn_debug.setToolTip("Debug view — verbose session monitoring output")
-        self.btn_debug.setStyleSheet(
-            "QPushButton:checked { background-color: #1a1a4a; color: #8888ff; "
-            "border: 1px solid #4444aa; }")
-        self.btn_debug.clicked.connect(
-            lambda: self._switch_view(self.VIEW_DEBUG))
-        tb.addWidget(self.btn_debug)
+        # View picker — one dropdown in place of the old Terminal and Debug
+        # toggle buttons (Bill, 2026-09-23). It also gives the toolbar a Mail
+        # entry it never had: before this, the only way back to Mail view was
+        # F2 or the View menu. Index == VIEW_* constant, so no mapping table.
+        self.view_combo = QComboBox()
+        self.view_combo.setFixedWidth(132)
+        self.view_combo.setToolTip(
+            "Switch the main view\n"
+            "Mail (F2) · Terminal (F3) · Debug (F4)")
+        self.view_combo.addItem("📬  Mail",     self.VIEW_MAIL)
+        self.view_combo.addItem("💻  Terminal", self.VIEW_TERMINAL)
+        self.view_combo.addItem("🔬  Debug",    self.VIEW_DEBUG)
+        self.view_combo.currentIndexChanged.connect(self._on_view_combo)
+        tb.addWidget(self.view_combo)
 
         # Populate fields from first entry (or last used)
         last_idx = self.config.get("app", {}).get("last_bbs_index", 0)
@@ -4353,7 +4853,7 @@ class MainWindow(QMainWindow):
         self.mail_view.sig_new_message.connect(self._on_new_message)
         self.mail_view.sig_reply.connect(self._on_reply)
         self.mail_view.sig_delete.connect(self._on_delete)
-        self.mail_view.sig_send_outbox.connect(self._on_send_outbox)
+        self.mail_view.sig_send_outbox.connect(self._on_send_receive)
         self.mail_view.sig_mark_all_read.connect(self._on_mark_all_read)
         self.mail_view.sig_search.connect(self._on_search)
         self.mail_view.sig_folder_changed.connect(self._on_folder_changed)
@@ -4414,10 +4914,31 @@ class MainWindow(QMainWindow):
 
     # ── View switching ────────────────────────────────────────────
 
+    VIEW_NAMES = {0: "Mail", 1: "Terminal", 2: "Debug"}
+
+    def _on_view_combo(self, idx: int):
+        """Dropdown chose a view. F2/F3/F4 and the View menu still call
+        _switch_view directly — this is only the combo's way in."""
+        view = self.view_combo.itemData(idx)
+        if view is not None:
+            self._switch_view(view)
+
     def _switch_view(self, view: int):
+        # Log every view change. Sessions can finish in a few seconds, so
+        # without this the log cannot say what was on screen when something
+        # happened — which is exactly what D10b needed (Bill, 2026-09-20).
+        # Never affects what goes on the air.
+        if view != self.stack.currentIndex():
+            # Straight to the debug view, not through _on_log — that would put
+            # the line in the status bar over the connection text.
+            self.debug_view.append(
+                f"[SYS] View: {self.VIEW_NAMES.get(view, view)}\n", "#8888ff")
         self.stack.setCurrentIndex(view)
-        self.btn_terminal.setChecked(view == self.VIEW_TERMINAL)
-        self.btn_debug.setChecked(view == self.VIEW_DEBUG)
+        # Reflect the change without re-entering through the combo's signal.
+        if self.view_combo.currentIndex() != view:
+            self.view_combo.blockSignals(True)
+            self.view_combo.setCurrentIndex(view)
+            self.view_combo.blockSignals(False)
         # Enable data streaming when in Terminal/Debug view
         self._set_transport_terminal_mode(view in (self.VIEW_TERMINAL, self.VIEW_DEBUG))
         if view == self.VIEW_TERMINAL:
@@ -4432,13 +4953,32 @@ class MainWindow(QMainWindow):
             self._pending_summary = None
             self._on_mail_summary(summary)
         elif view == self.VIEW_MAIL and self._pending_outbox:
-            # User switched to Mail view with outbox ready to send
+            # Outbox is waiting. Light up Send / Receive and say so — do
+            # NOT start transmitting just because a view changed. Switching
+            # views is not consent to key the radio (2026-09-20 flow audit;
+            # see feedback_rf_airtime_politeness). The user presses the
+            # button when they are ready.
             self._pending_outbox = False
-            self._on_send_outbox()
+            self.mail_view.enable_send_outbox(True)
+            self._set_status(
+                "Outbox ready — press Send / Receive when you are.",
+                connected=bool(self.worker and self.worker.session))
 
-    def _on_terminal_toggle(self):
-        # Legacy — kept for any menu wiring, routes to terminal view
-        self._switch_view(self.VIEW_TERMINAL)
+    def _hands_on_view(self) -> bool:
+        """True when a person is driving the BBS by hand: Terminal or Debug
+        view is open AND this is not a Mail-Call session. Checked once, at
+        Connect: a Connect from these views is a dumb terminal — link up,
+        nothing sent or read automatically (Bill, 2026-09-13).
+
+        Mail-Call is unattended, so it always does its full run — LM,
+        bulletins, outbox, then `b` — whatever view happened to be left
+        open (Bill, 2026-09-12). Before this, a Mail-Call that fired with
+        Terminal view up logged in, ran LM, and then sat there as a dumb
+        terminal until the BBS timed it out. Switching views after Connect
+        changes nothing."""
+        return (self.stack.currentIndex() in (self.VIEW_TERMINAL,
+                                              self.VIEW_DEBUG)
+                and not self._mc_session_owned)
 
     def showEvent(self, event):
         """On first show, seed keyboard focus into the mail panes (the default
@@ -4475,7 +5015,8 @@ class MainWindow(QMainWindow):
             self.host_edit.setText(entry.get("host", ""))
             self.port_edit.setText(str(entry.get("telnet_port", 8010)))
         else:
-            mode_str = "VARA HF" if transport == "vara_hf" else "VARA FM"
+            mode_str = {"vara_hf": "VARA HF",
+                        **AGW_MODEMS}.get(transport, "VARA FM")
             self.mode_combo.blockSignals(True)
             self.mode_combo.setCurrentText(mode_str)
             self.mode_combo.blockSignals(False)
@@ -4501,7 +5042,13 @@ class MainWindow(QMainWindow):
         (e.g. the saved bw on a BBS entry); otherwise the previous combo
         text is kept if still valid, else the mode default.
         """
-        opts, default = self._TB_VARA_BW.get(mode_str, (["500", "2300"], "500"))
+        is_vara = mode_str in self._TB_VARA_BW
+        # Packet has no bandwidth on QtC's side — hide the control
+        self.bw_label.setVisible(is_vara)
+        self.bw_combo.setVisible(is_vara)
+        if not is_vara:
+            return
+        opts, default = self._TB_VARA_BW[mode_str]
         current = self.bw_combo.currentText()
         pick = (preferred if preferred in opts else
                 current if current in opts else
@@ -4532,7 +5079,11 @@ class MainWindow(QMainWindow):
         if not ok:
             return
         mode_str = self.mode_combo.currentText() if not is_telnet else "Telnet"
-        transport_map = {"VARA HF": "vara_hf", "VARA FM": "vara_fm", "Telnet": "telnet"}
+        transport_map = {"VARA HF": "vara_hf", "VARA FM": "vara_fm",
+                         "Telnet": "telnet",
+                         **{v: k for k, v in AGW_MODEMS.items()}}
+        is_agw   = transport_map[mode_str] in AGW_MODEMS
+        active   = self._get_active_bbs_entry()
         port_str = self.port_edit.text().strip()
         new_entry = {
             "name":        name.strip(),
@@ -4542,8 +5093,12 @@ class MainWindow(QMainWindow):
             "transport":   transport_map[mode_str],
             "vara_type":   ("hf" if mode_str == "VARA HF" else
                             "fm" if mode_str == "VARA FM" else None),
-            "bw":          self.bw_combo.currentText() if not is_telnet else "",
-            "host":        self.host_edit.text().strip() if is_telnet else "",
+            "bw":          (self.bw_combo.currentText()
+                            if not (is_telnet or is_agw) else ""),
+            "host":        (self.host_edit.text().strip() if is_telnet else
+                            active.get("host") or "127.0.0.1" if is_agw else ""),
+            "agw_port":    active.get("agw_port", AGW_DEFAULT_PORT),
+            "agw_radio_port": active.get("agw_radio_port", 0),
             "telnet_port": int(port_str) if port_str.isdigit() else 8010,
             "notes":       ""
         }
@@ -4559,7 +5114,7 @@ class MainWindow(QMainWindow):
         if not home:
             return True   # no home BBS set — allow bulletins anywhere
         connected = self._get_active_bbs_entry().get("callsign", "").upper().strip()
-        # Home BBS may be in hierarchical form e.g. KC9MTP.#NWIN.IN.USA.NOAM
+        # Home BBS may be in hierarchical form e.g. N0CALL.#REGION.ST.USA.NOAM
         # Match on the first segment (node callsign) only
         home_call = home.split(".")[0].split("-")[0]
         conn_call = connected.split(".")[0].split("-")[0]
@@ -4581,10 +5136,22 @@ class MainWindow(QMainWindow):
         else:
             mode_str = self.mode_combo.currentText()
             call     = self.call_edit.text().strip().upper()
-            entry["transport"] = "vara_hf" if mode_str == "VARA HF" else "vara_fm"
-            entry["vara_type"] = "hf"      if mode_str == "VARA HF" else "fm"
             entry["callsign"]  = call or entry.get("callsign", "")
-            entry["bw"]        = self.bw_combo.currentText()
+            agw_key = {v: k for k, v in AGW_MODEMS.items()}.get(mode_str)
+            if agw_key:
+                if base.get("transport") != agw_key:
+                    # Selected entry is VARA/Telnet or the other modem —
+                    # its host/port aren't this modem's
+                    entry["host"]           = "127.0.0.1"
+                    entry["agw_port"]       = AGW_DEFAULT_PORT
+                    entry["agw_radio_port"] = 0
+                entry["transport"] = agw_key
+                entry["vara_type"] = None
+                entry["bw"]        = ""
+            else:
+                entry["transport"] = "vara_hf" if mode_str == "VARA HF" else "vara_fm"
+                entry["vara_type"] = "hf"      if mode_str == "VARA HF" else "fm"
+                entry["bw"]        = self.bw_combo.currentText()
         return entry
 
     # ── VARA pre-session control ──────────────────────────────────
@@ -4596,10 +5163,40 @@ class MainWindow(QMainWindow):
         Called on BBS dropdown change and BW combo change so the
         waterfall markers always reflect the selected entry.
         """
+        if self.mode_combo.currentText() not in self._TB_VARA_BW:
+            return   # packet mode — nothing to tell VARA
         if not self._vara_ctrl.is_open:
             self._vara_ctrl.open()
         if self._vara_ctrl.is_open:
             self._vara_ctrl.set_bandwidth(bw)
+
+    def _vara_relink_tick(self):
+        """Re-link VaraControl to VARA if it is not held. GUI thread.
+
+        Idle only: Connect enabled means no session, no connect in
+        progress and no post-error VARA recovery — the times QtC has
+        deliberately let go of the port for VaraTransport."""
+        linked = self._vara_ctrl.is_open
+        if linked and not self._vara_was_linked:
+            # Just linked (by this timer or anywhere else): put the
+            # selected entry's bandwidth on VARA's waterfall.
+            self.debug_view.append("[SYS] Linked to VARA\n", "#888888")
+            self._vara_set_bw(self.bw_combo.currentText())
+        self._vara_was_linked = linked
+        if (linked or self._vara_relink_busy
+                or (self._get_active_bbs_entry() or {}).get("transport")
+                    not in ("vara_hf", "vara_fm")
+                or not self.btn_connect.isEnabled() or self._logged_in):
+            return
+        self._vara_relink_busy = True
+        gen = self._vara_ctrl.gen
+
+        def _try():
+            try:
+                self._vara_ctrl.open(gen=gen)
+            finally:
+                self._vara_relink_busy = False
+        threading.Thread(target=_try, name="VaraRelink", daemon=True).start()
 
     # ── Connection ────────────────────────────────────────────────
 
@@ -4616,9 +5213,16 @@ class MainWindow(QMainWindow):
 
         self.btn_connect.setEnabled(False)
         self.btn_disconnect.setEnabled(True)
+        self._mc_owned_at_disconnect = False
+        self._mc_drop_noted          = False
 
         if transport == "telnet":
             conn_desc = f"{entry['host']}:{entry['telnet_port']}"
+        elif transport in AGW_MODEMS:
+            conn_desc = (f"{AGW_MODEMS[transport]}  "
+                         f"{entry.get('host') or '127.0.0.1'}:"
+                         f"{entry.get('agw_port') or AGW_DEFAULT_PORT}  "
+                         f"channel {entry.get('agw_radio_port', 0)}")
         else:
             is_hf = (entry.get("vara_type") == "hf")
             mode_label = "VARA HF" if is_hf else "VARA FM"
@@ -4641,7 +5245,6 @@ class MainWindow(QMainWindow):
         self.worker.sig_download_done.connect(self._on_download_done)
         self.worker.sig_send_result.connect(self._on_send_result)
         self.worker.sig_error.connect(self._on_error)
-        self.worker.sig_first_visit.connect(self._on_first_visit)
         self.worker.sig_ll_ready.connect(self._on_ll_ready)
         self.worker.sig_progress.connect(self._on_progress)
         self.worker.sig_bulletin_check.connect(self._on_bulletin_check)
@@ -4674,35 +5277,22 @@ class MainWindow(QMainWindow):
         self.config.setdefault("app", {})["last_bbs_index"] = self.bbs_combo.currentIndex()
         save_config(self.config)
 
-        self.worker.do_connect_and_check()
+        # Connecting from Terminal / Debug view is a dumb terminal. Decided
+        # here, at Connect — switching views afterwards doesn't change it.
+        self._login_only_connect = self._hands_on_view()
+        # Record the decision, not just the view: this one line explains
+        # everything the session does or doesn't do afterwards, however the
+        # views get switched later (Bill, 2026-09-20).
+        self.debug_view.append(
+            f"[SYS] Connect from {self.VIEW_NAMES.get(self.stack.currentIndex(), '?')} "
+            f"view — {'dumb terminal, QtC drives nothing' if self._login_only_connect else 'QtC drives this session'}\n",
+            "#8888ff")
+        self.worker.do_connect_and_check(login_only=self._login_only_connect)
 
     def _on_disconnect(self):
         if self.worker:
             self.worker.do_disconnect()
         self._set_status("Disconnecting…", connecting=True)
-
-    def _on_refresh(self):
-        """Manual mail check — ask PN only or PN+PY, then run LM."""
-        if not self.worker or not self.worker.session:
-            QMessageBox.warning(self, "Not Connected",
-                "Connect to a BBS first.")
-            return
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Check Mail")
-        msg.setIcon(QMessageBox.Icon.Question)
-        msg.setText("<b>Check for mail now?</b><br><br>"
-                    "Choose which messages to list:")
-        btn_new = msg.addButton(
-            "⚡  New messages only (PN)", QMessageBox.ButtonRole.NoRole)
-        btn_all = msg.addButton(
-            "📥  All personal messages (PN + PY)", QMessageBox.ButtonRole.YesRole)
-        msg.addButton(QMessageBox.StandardButton.Cancel)
-        msg.exec()
-        clicked = msg.clickedButton()
-        if clicked == btn_new:
-            self.worker.do_mail_check(new_only=True)
-        elif clicked == btn_all:
-            self.worker.do_mail_check(new_only=False)
 
     def _set_transport_terminal_mode(self, enabled: bool):
         """Enable/disable background data streaming on the active transport."""
@@ -4733,6 +5323,8 @@ class MainWindow(QMainWindow):
         transport  = entry.get("transport", "")
         if transport == "telnet":
             detail = entry.get("host", "")
+        elif transport in AGW_MODEMS:
+            detail = f"{AGW_MODEMS[transport]}  AX.25"
         elif transport == "vara_hf":
             bw = entry.get("bw", "500")
             detail = f"VARA HF  BW{bw}"
@@ -4743,7 +5335,11 @@ class MainWindow(QMainWindow):
         self._set_status(
             f"Connected  ·  {entry['callsign']}  ({detail})",
             connected=True)
-        self.btn_refresh.setEnabled(True)
+        self._logged_in = True
+        # Send / Receive is available for the whole session, on any
+        # transport — it is how a Terminal connect asks QtC to do a mail
+        # round trip. _on_disconnected turns it off again.
+        self.mail_view.enable_send_outbox(True)
         self.terminal.set_connected(True)
 
         # If Mail-Call owns this slot, the connect succeeded — clear all
@@ -4756,44 +5352,52 @@ class MainWindow(QMainWindow):
                 f"{self._mc_tries_used}/{self.MC_MAX_TRIES} — slot complete")
             self._mc_end_retry()
 
+        if self._login_only_connect:
+            self._set_status("Terminal mode — type commands manually.",
+                             connected=True)
+            self._check_outbox_for_terminal()
+
     def _check_outbox_for_terminal(self):
         """In Terminal/Debug view with no mail check running, still notify
         user if there are outbox messages ready to send for this BBS."""
         pending = self.db.get_pending_outbox()
         if not pending:
             return
-        connected_bbs = self._get_active_bbs_entry().get("callsign", "").upper()
-        sendable = [r for r in pending
-                    if bool(r.get("send_now", 1))
-                    or not r.get("at_bbs", "")
-                    or r.get("at_bbs","").upper().startswith(connected_bbs)]
+        # Everything pending is sendable: Send / Receive sends the lot.
+        # The old filter here counted only the send_now rows, so the notice
+        # could say "1 message ready" when three were about to go.
+        sendable = pending
         if sendable:
             self._pending_outbox = True
             self.mail_view.enable_send_outbox(True)
-            notice = (f"\n[MAIL] {len(sendable)} message(s) ready "
-                      f"to send — switch to Mail View to send.\n")
+            notice = (f"\n[MAIL] {len(sendable)} message(s) ready to send "
+                      f"— Mail view → Send / Receive when you are ready.\n")
             self.terminal.append(notice, "#ffff00")
             self.debug_view.append(notice, "#ffff00")
             self._set_status(
                 f"{len(sendable)} message(s) in outbox — "
-                f"switch to Mail View to send.",
+                f"Mail view → Send / Receive.",
                 connected=True)
 
     def _on_ll_ready(self, bbs_call: str, new_only: list, all_personal: list,
                      bulletins: list):
         """
-        Receives filtered mail and bulletin lists from _run_connect_and_check
-        via sig_ll_ready — safe GUI-thread delivery, no shared worker attributes.
-        Stores all three lists on self then dispatches to _on_first_visit.
+        Receives the filtered personal-mail lists from
+        _run_connect_and_check via sig_ll_ready — safe GUI-thread
+        delivery, no shared worker attributes. Stores them on self then
+        dispatches to _on_first_visit.
         """
         self._ll_new_only     = new_only       # PN — status N, to mycall
         self._ll_all_personal = all_personal   # PN + PY — all personal to mycall
-        self._ll_bulletins    = bulletins      # BN / B$ matching subscriptions
+        # `bulletins` is always empty now — bulletins get their
+        # own bounded `L> CATEGORY` sweep in _start_bulletin_stage() rather
+        # than being scraped out of a BBS-wide listing. The signal keeps
+        # its shape so the Terminal/Mail dispatch below did not have to move.
         self._on_first_visit(bbs_call)
 
     def _on_first_visit(self, bbs_callsign: str):
         """
-        Called by _on_ll_ready after login and LL/L scan.
+        Called by _on_ll_ready after login and the LM mail check.
         Both mail lists are on self._ll_new_only and self._ll_all_personal,
         delivered safely on the GUI thread by _on_ll_ready.
 
@@ -4801,14 +5405,13 @@ class MainWindow(QMainWindow):
           - First visit: ask All / New only → marks BBS visited
           - Return visit: auto-download PN new only
 
-        Terminal / Debug View:
-          - First visit: ask Skip / New only / All → Skip does NOT mark visited
-          - Return visit: pure dumb terminal, no download at all
+        Only a Mail-view Connect gets here: a Terminal / Debug Connect is a
+        dumb terminal and never runs the mail check. Switching to Terminal
+        to watch doesn't change what happens.
         """
         mycall       = self.config.get("user", {}).get("callsign", "NOCALL").upper()
         visit_key    = f"{mycall}@{bbs_callsign}"
         visited      = self.config.get("visited_bbs", {})
-        view         = self.stack.currentIndex()
         new_only     = getattr(self, "_ll_new_only",     [])
         all_personal = getattr(self, "_ll_all_personal", [])
 
@@ -4818,71 +5421,12 @@ class MainWindow(QMainWindow):
             self.config["visited_bbs"] = visited
             save_config(self.config)
 
-        # ── Terminal / Debug view ──────────────────────────────────
-        if view in (self.VIEW_TERMINAL, self.VIEW_DEBUG):
-            no_prompt = self._get_active_bbs_entry().get("no_terminal_prompt", False)
-            if no_prompt:
-                self._set_status("Terminal mode — type commands manually.",
-                                 connected=True)
-                self._set_transport_terminal_mode(True)
-                self._check_outbox_for_terminal()
-                return
-            if visit_key in visited:
-                self._set_status("Terminal mode — type commands manually.",
-                                 connected=True)
-                self._set_transport_terminal_mode(True)
-                self._check_outbox_for_terminal()
-                return
-            # First visit — offer Skip / New / All
-            msg = QMessageBox(self)
-            msg.setWindowTitle(f"First visit to {bbs_callsign}")
-            msg.setIcon(QMessageBox.Icon.Question)
-            msg.setText(
-                f"<b>First visit to {bbs_callsign} as {mycall}</b><br><br>"
-                f"Would you like to download any messages, or skip and use "
-                f"the terminal manually?<br><br>"
-                f"<i>Choosing Skip will not mark this BBS as visited — "
-                f"you will be asked again next time you connect from Mail View.<br><br>"
-                f"To disable this prompt permanently, go to "
-                f"<b>File → Settings → BBS List → Edit</b> and check "
-                f"'Never prompt for mail download in Terminal / Debug view'.</i>"
-            )
-            btn_skip = msg.addButton(
-                "⏭  Skip — pure terminal", QMessageBox.ButtonRole.RejectRole)
-            btn_new  = msg.addButton(
-                "⚡  New messages only (PN)", QMessageBox.ButtonRole.NoRole)
-            btn_all  = msg.addButton(  # noqa: F841
-                "📥  All personal messages (PN + PY)", QMessageBox.ButtonRole.YesRole)
-            msg.exec()
-
-            clicked = msg.clickedButton()
-            if clicked == btn_skip:
-                self._set_status("Terminal mode — type commands manually.",
-                                 connected=True)
-                self._set_transport_terminal_mode(True)
-                self._check_outbox_for_terminal()
-                return
-            elif clicked == btn_new:
-                self.config.setdefault("visited_bbs", {})[visit_key] = True
-                save_config(self.config)
-                if new_only:
-                    QTimer.singleShot(50, lambda p=new_only: self.worker.do_download(p))
-                else:
-                    self._set_status("No new personal mail.", connected=True)
-                    self._prompt_outbox()
-            else:  # All
-                self.config.setdefault("visited_bbs", {})[visit_key] = True
-                save_config(self.config)
-                if all_personal:
-                    QTimer.singleShot(50, lambda p=all_personal: self.worker.do_download(p))
-                else:
-                    self._set_status("No personal mail.", connected=True)
-                    self._prompt_outbox()
-            return
-
         # ── Mail View ─────────────────────────────────────────────
         if visit_key not in visited:
             # First visit — ask All / New only
+            self.debug_view.append(
+                f"[SYS] First visit to {bbs_callsign} — asking All (PN+PY) "
+                f"or New only (PN); waiting for the operator\n", "#ffff00")
             msg = QMessageBox(self)
             msg.setWindowTitle(f"First visit to {bbs_callsign}")
             msg.setIcon(QMessageBox.Icon.Question)
@@ -4898,11 +5442,24 @@ class MainWindow(QMainWindow):
                 f"On every future visit, only new unread personal messages (PN) "
                 f"will be downloaded automatically.</i>"
             )
-            msg.addButton("📥  All personal messages (PN + PY)", QMessageBox.ButtonRole.YesRole)
-            msg.addButton("⚡  New messages only (PN)", QMessageBox.ButtonRole.NoRole)
+            btn_all = msg.addButton("📥  All personal messages (PN + PY)",
+                                    QMessageBox.ButtonRole.YesRole)
+            btn_new = msg.addButton("⚡  New messages only (PN)",
+                                    QMessageBox.ButtonRole.NoRole)
+            # Neither role makes Qt pick an escape button on its own, so
+            # Escape / the window X left clickedButton() as None and
+            # `.text()` on it crashed — on the FIRST connect to any new
+            # BBS (2026-09-20 flow audit). Name the escape button, and
+            # still treat None as the quiet choice: new mail only, the
+            # least airtime and what every later visit does anyway.
+            msg.setEscapeButton(btn_new)
             msg.exec()
 
-            full = (msg.clickedButton().text().startswith("📥"))
+            clicked = msg.clickedButton()
+            if clicked is None:
+                self._on_log("[SYS] First-visit prompt dismissed — "
+                             "fetching new messages only")
+            full = (clicked is btn_all)
 
             self.config.setdefault("visited_bbs", {})[visit_key] = True
             save_config(self.config)
@@ -4927,17 +5484,20 @@ class MainWindow(QMainWindow):
                 QTimer.singleShot(50, lambda p=new_only: self.worker.do_download(p))
             else:
                 self._set_status("No new personal mail.", connected=True)
-                # Check bulletins from LL/L scan — no extra L> commands needed
-                bull_cfg = self.config.get("bulletins", {})
-                subs = bull_cfg.get("subscriptions", [])
-                if (bull_cfg.get("check_on_connect", False)
-                        and subs and self._is_home_bbs()):
-                    QTimer.singleShot(200, self._process_ll_bulletins)
-                    return
-                self._prompt_outbox()
+                self._start_bulletin_stage()
 
     def _on_progress(self, op: str, current: int, total: int, detail: str):
-        """Update toolbar pill and status bar progress during operations."""
+        """Update toolbar pill and status bar progress during operations.
+
+        `current` is the 1-based item being worked on RIGHT NOW — the one
+        on the air, not the number already finished. Both counters used to
+        pass the finished count while labelling it "Downloading {n} of
+        {total}", so a run of three read "1 of 3" while the second was
+        still going out, and started at "0 of 3" (Bill, 2026-09-23).
+
+        The bar stays on completed work, (current - 1) / total, so it
+        reaches 100% only when everything really has gone. Text says what
+        is happening; the bar says how much is behind you."""
         # The Stop/abort button only makes sense while we're RECEIVING — it
         # tells the BBS to quit sending. Show it during a download, hide it
         # otherwise (sending/outbox or done).
@@ -4949,49 +5509,70 @@ class MainWindow(QMainWindow):
             self.status_label.setVisible(True)
             # conn_label will be updated by next _set_status call
             return
-        pct = int(current / total * 100)
+        pct = int(max(0, current - 1) / total * 100)
         op_label = "downloading" if op == "downloading" else "sending"
         # Update conn_label to show progress — always visible in toolbar
         self.conn_label.setText(f"  {current} / {total}  {op_label}")
         # Status bar: hide plain label, show detail + progress bar
         self.status_label.setVisible(False)
-        if op == "downloading":
-            self._prog_detail.setText(
-                f"Downloading {current} of {total} · {detail}")
-        else:
-            self._prog_detail.setText(
-                f"Sending {current} of {total} · {detail}")
+        verb = "Downloading" if op == "downloading" else "Sending"
+        line = f"{verb} {current} of {total} · {detail}"
+        self._prog_detail.setText(line)
         self._prog_detail.setVisible(True)
         self._prog_bar.setValue(pct)
         self._prog_bar.setVisible(True)
+        self.debug_view.append(f"[SYS] {line}\n", "#8888ff")
+
+    # Abort covers mail and bulletins only. File downloads cannot be
+    # stopped: LinBPQ commits the whole file to the link the moment the
+    # transfer starts, so a cancel saved nothing but the partial file —
+    # the J7 runs (2026-09-23) cost minutes of airtime per try, and the
+    # session was unusable until the rest had arrived anyway. Greyed out
+    # with this reason for the whole of a YAPP transfer (Bill, 2026-09-28).
+    _ABORT_TIP = (
+        "Abort the mail or bulletin download in progress and return to\n"
+        "the BBS command prompt (sends 'A' to the BBS). You stay connected,\n"
+        "so you can disconnect cleanly or carry on.\n\n"
+        "File downloads cannot be aborted.")
+    _ABORT_TIP_YAPP = (
+        "File downloads cannot be aborted.\n\n"
+        "Once a file transfer starts, the BBS has already committed the\n"
+        "whole file to the link and keeps sending it whatever QtC does.\n"
+        "Stopping early would only throw away the part received so far.")
 
     def _on_abort(self):
-        """Stop button — bail out of a slow download without dropping the
-        link. Interrupts the worker's blocked read immediately; the session
-        then sends 'A' to the BBS and resyncs to the command prompt."""
+        """Abort button — bail out of a slow mail or bulletin download
+        without dropping the link. Interrupts the worker's blocked read
+        immediately; the download path then sends 'A' to the BBS and
+        resyncs to the command prompt, and the session stays up.
+
+        Never live during a YAPP file transfer — see _ABORT_TIP_YAPP."""
         if self.worker:
             self.worker.do_abort()
         # Disable so a second click doesn't queue another abort; the progress
         # 'done' update hides it once the resync finishes.
         self.btn_abort.setEnabled(False)
-        self.terminal.append("\n[stopping download — returning to BBS prompt]\n",
+        self.terminal.append("\n[aborting — returning to BBS prompt]\n",
                              "#ffaa55")
-        self._set_status("Stopping download…", connected=True)
+        self._set_status("Aborting…", connected=True)
 
     def _on_disconnected(self):
         self.btn_connect.setEnabled(True)
         self.btn_disconnect.setEnabled(False)
-        self.btn_refresh.setEnabled(False)
+        self._logged_in = False
         self.mail_view.enable_send_outbox(False)
         self._set_status("Disconnected", connected=False)
         self.terminal.append("\n=== Disconnected ===\n", "#ff8844")
         self.debug_view.append("\n=== Disconnected ===\n", "#ff8844")
         self.terminal.set_connected(False)
-        self._rx_buf = ""
         self._pending_summary = None
         self._pending_outbox  = False
         self._send_total      = 0
         self._send_current    = 0
+        self._send_done       = 0
+        # A link that drops mid Send / Receive must not leave the flag set,
+        # or the next one would be refused as "already running".
+        self._sr_active       = False
         self._prog_bar.setVisible(False)
         self._prog_detail.setVisible(False)
         self.status_label.setVisible(True)
@@ -5003,6 +5584,7 @@ class MainWindow(QMainWindow):
         # Mail-Call session (if any) is now over — any subsequent connect
         # from the toolbar must be treated as manual until the scheduler
         # claims another slot.
+        self._mc_owned_at_disconnect = self._mc_session_owned
         self._mc_session_owned = False
         # Reclaim the VaraControl socket for pre-session BW commands
         self._vara_ctrl.open()
@@ -5093,12 +5675,43 @@ class MainWindow(QMainWindow):
                 "to display it as plain text.")
             return
 
+        # A file transfer runs to completion once it starts — there is no
+        # Abort for it (see _ABORT_TIP_YAPP), and over RF that is real
+        # airtime: 5 KB is about 7 minutes at 300 baud (F2, 2026-09-28).
+        # Say so before the radio keys, not after. Telnet is instant, so
+        # it gets no dialog.
+        transport = self._get_active_bbs_entry().get("transport", "")
+        if transport != "telnet":
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("Start file download?")
+            box.setText(
+                f"<b>A file download cannot be stopped once it starts.</b>"
+                f"<br><br>The BBS sends the whole of <b>{filename}</b>, and "
+                f"the session cannot be used until it has finished. On a "
+                f"slow link that can be many minutes of airtime — about 7 "
+                f"minutes for a 5 KB file at 300 baud.<br><br>"
+                f"Download <b>{filename}</b>?")
+            go = box.addButton("Download", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(go)
+            box.exec()
+            if box.clickedButton() is not go:
+                self.terminal.append(
+                    "\n[YAPP] Download cancelled — nothing sent.\n", "#ffaa55")
+                self.debug_view.append(
+                    "[YAPP] Download cancelled before it started\n", "#ffaa55")
+                return
+
         self.terminal.append(
             f"\n[YAPP] Requesting '{filename}'…\n", "#00ccff")
+        self.btn_abort.setEnabled(False)
+        self.btn_abort.setToolTip(self._ABORT_TIP_YAPP)
         self.worker.do_yapp_download(filename, save_dir)
 
     def _on_yapp_progress(self, done: int, total: int, filename: str):
-        """Update terminal with YAPP transfer progress."""
+        """Update terminal with YAPP transfer progress. Abort stays greyed
+        out — a file transfer cannot be stopped (see _ABORT_TIP_YAPP)."""
         if total > 0:
             pct = int(done / total * 100)
             self.terminal.append(
@@ -5109,19 +5722,33 @@ class MainWindow(QMainWindow):
 
     def _on_yapp_done(self, save_path: str, display_name: str):
         """Show completion notice in terminal."""
-        self.terminal.append(
-            f"[YAPP] ✓ Saved: {save_path}\n", "#00ff88")
+        self.btn_abort.setEnabled(False)
+        self.btn_abort.setToolTip(self._ABORT_TIP)
+        line = f"[YAPP] ✓ Saved: {save_path}\n"
+        self.terminal.append(line, "#00ff88")
+        self.debug_view.append(line, "#00ff88")
         self._set_status(f"File saved: {display_name}", connected=True)
 
     def _on_yapp_error(self, msg: str):
-        """Show YAPP error in terminal."""
-        self.terminal.append(f"[YAPP] Error: {msg}\n", "#ff4444")
+        """Show YAPP error in terminal — or a plain note when the user is
+        the one who stopped it, which is not an error."""
+        self.btn_abort.setEnabled(False)
+        self.btn_abort.setToolTip(self._ABORT_TIP)
+        if msg == _YAPP_ABORTED:
+            line = "[YAPP] Transfer aborted — partial file discarded.\n"
+            self.terminal.append(line, "#ffaa55")
+            self.debug_view.append(line, "#ffaa55")
+            self._set_status("File download aborted", connected=True)
+            return
+        line = f"[YAPP] Error: {msg}\n"
+        self.terminal.append(line, "#ff4444")
+        self.debug_view.append(line, "#ff4444")
         self._set_status("YAPP transfer failed", connected=True)
 
     def _on_error(self, msg: str):
         self.btn_connect.setEnabled(False)   # briefly disabled while VARA recovers
         self.btn_disconnect.setEnabled(False)
-        self.btn_refresh.setEnabled(False)
+        self._logged_in = False
         self._set_status(f"Error: {msg}", connected=False)
         self.terminal.append(f"\n[ERROR] {msg}\n", "#ff4444")
         self.debug_view.append(f"\n[ERROR] {msg}\n", "#ff4444")
@@ -5133,8 +5760,18 @@ class MainWindow(QMainWindow):
         # long since re-enabled.
         if self._mc_active_entry is not None:
             self._mc_handle_connect_failure(msg)
+        elif self._mc_link_dropped():
+            # Mail-Call had connected and the link went mid-session —
+            # nobody is at the radio to click a popup away.
+            self._mc_notify_link_drop(msg)
         else:
             QMessageBox.critical(self, "Connection Error", msg)
+
+        if self._get_active_bbs_entry().get("transport") in AGW_MODEMS:
+            # Packet modems have no TCP listener to reset — the next
+            # connect can go straight away.
+            self.btn_connect.setEnabled(True)
+            return
 
         # Give VARA a moment to reset its TCP listener before allowing reconnect
         # and reclaiming VaraControl — a failed RF connect can take ~10-15s to recover
@@ -5145,7 +5782,7 @@ class MainWindow(QMainWindow):
         """Called ~8s after a connection error to re-enable connect and reclaim VARA."""
         self._vara_ctrl.open()
         self.btn_connect.setEnabled(True)
-        self.btn_refresh.setEnabled(False)   # not connected yet — stays off until next connect
+        self._logged_in = False   # not connected yet — stays off until next connect
         self.terminal.append("[SYS] VARA ready — you may reconnect.\n", "#888888")
 
     def _on_log(self, line: str):
@@ -5175,7 +5812,6 @@ class MainWindow(QMainWindow):
             if chunk:
                 clean = self._format_bbs_output(chunk)
                 self.terminal.append(clean + "\n", "#ffffff")
-            self._rx_buf = ""
 
         self.status_label.setText(line[:100])
 
@@ -5264,15 +5900,20 @@ class MainWindow(QMainWindow):
         self.debug_view.append(mail_line, "#aaffff")
 
         if summary.new_personal:
-            # In Terminal/Debug view — hold the summary and notify user
-            if self.stack.currentIndex() in (self.VIEW_TERMINAL, self.VIEW_DEBUG):
+            # A Send / Receive downloads straight away whatever view the
+            # session was started from — the user pressed the button, and
+            # they are already looking at Mail view. Holding the summary
+            # for a "switch to Mail view" that has already happened would
+            # be a dead end (2026-09-20 flow audit).
+            if self._login_only_connect and not self._sr_active:
                 self._pending_summary = summary
                 notice = (f"\n[MAIL] {new_count} message(s) ready — "
-                          f"switch to Mail View to download.\n")
+                          f"Mail view → Send / Receive to download.\n")
                 self.terminal.append(notice, "#ffff00")
                 self.debug_view.append(notice, "#ffff00")
                 self._set_status(
-                    f"{new_count} new message(s) available — switch to Mail view to download.",
+                    f"{new_count} new message(s) available — "
+                    f"Mail view → Send / Receive to download.",
                     connected=True)
             else:
                 # Auto-download — no dialog, per user preference
@@ -5280,48 +5921,70 @@ class MainWindow(QMainWindow):
                     f"Downloading {new_count} new message(s)…", connected=True)
                 self.worker.do_download(summary.new_personal)
         else:
+            # Send / Receive stops here: no mail, and bulletins are not
+            # part of this button.
+            if self._sr_active:
+                self._sr_finish("no new mail")
+                return
             self._set_status("No new personal mail.", connected=True)
-            # Trigger bulletin check if enabled, subscriptions exist, and on home BBS
-            bull_cfg = self.config.get("bulletins", {})
-            subs = bull_cfg.get("subscriptions", [])
-            on_home   = self._is_home_bbs()
-            want_bull = (bull_cfg.get("check_on_connect", False)
+            self._start_bulletin_stage()
+
+    def _start_bulletin_stage(self):
+        """
+        Single entry point for the bulletin stage, used by every path that
+        finishes the mail stage: connect-with-mail, connect-without-mail,
+        and the manual Refresh check.
+
+        Runs LC first when it is due (Home BBS, every LC_REFRESH_DAYS) so
+        newly-created categories are discovered, then chains into the
+        `L> CATEGORY` sweep. Falls through to the outbox when bulletins
+        are off, there are no subscriptions, or this is not the Home BBS.
+        """
+        bull_cfg  = self.config.get("bulletins", {})
+        subs      = bull_cfg.get("subscriptions", [])
+        on_home   = self._is_home_bbs()
+        want_bull = bool(bull_cfg.get("check_on_connect", False)
                          and subs and on_home)
 
-            # Auto Category Update — runs LC at most once per 10 days.
-            # When due AND we're on Home BBS, run LC first then chain
-            # into whatever the existing decision was. Per
-            # feedback_rf_airtime_politeness this is gated by an absolute
-            # time delta, never by "every connect."
-            if on_home and self._auto_category_update_due():
-                self._set_status(
-                    "Updating bulletin categories…", connected=True)
-                if want_bull:
-                    self._post_lc_action = (
-                        lambda subs=subs: self._begin_bulletin_check(subs))
-                else:
-                    self._post_lc_action = self._prompt_outbox
-                QTimer.singleShot(200, lambda: self.worker
-                    .do_list_categories(open_dialog=False))
-                return
+        # Auto Category Update — LC at most once per LC_REFRESH_DAYS. Per
+        # feedback_rf_airtime_politeness this is gated by an absolute time
+        # delta, never by "every connect".
+        if on_home and self._auto_category_update_due():
+            self._set_status("Updating bulletin categories…", connected=True)
+            self._post_lc_action = (
+                (lambda s=subs: self._begin_bulletin_check(s)) if want_bull
+                else self._prompt_outbox)
+            QTimer.singleShot(200, lambda: self.worker
+                .do_list_categories(open_dialog=False))
+            return
 
-            if want_bull:
-                self._begin_bulletin_check(subs)
-                return
-            # Route through _prompt_outbox — handles outbox and Telnet auto-disconnect
-            self._prompt_outbox()
+        if want_bull:
+            self._begin_bulletin_check(subs)
+            return
+        self._prompt_outbox()
 
     def _begin_bulletin_check(self, subs):
-        """Kick off the per-category L> sweep. Factored out so the
-        auto-category-update post-LC chain and the direct path both go
-        through the same entrypoint."""
+        """Kick off the per-category `L> CATEGORY` sweep.
+
+        A Mail-Call session is unattended, so it reads each category as
+        soon as the listing pauses — no selection dialog, and no 'A'
+        round trip. An interactive session collects candidates from every
+        category first and shows one dialog."""
         self._set_status("Checking bulletins…", connected=True)
-        QTimer.singleShot(200, lambda: self.worker.do_check_bulletins(subs))
+        unattended = bool(self._mc_session_owned)
+        QTimer.singleShot(200, lambda: self.worker.do_check_bulletins(
+            subs, unattended=unattended))
+
+    LC_REFRESH_DAYS = 30
 
     def _auto_category_update_due(self) -> bool:
         """True iff 'Check for new bulletins on connect' is on AND
-        (last_lc_at is None OR (now - last_lc_at) >= 10 days).
-        Caller is expected to verify we're on Home BBS first."""
+        (last_lc_at is None OR (now - last_lc_at) >= LC_REFRESH_DAYS).
+        Caller is expected to verify we're on Home BBS first.
+
+        30 days matches SessionWorker.OP_REFRESH_DAYS deliberately, so LC
+        and OP fall due on the same connect and a normal session carries
+        no housekeeping traffic at all."""
         bull_cfg = self.config.get("bulletins", {}) or {}
         if not bull_cfg.get("check_on_connect", False):
             return False
@@ -5335,7 +5998,8 @@ class MainWindow(QMainWindow):
                 str(last).replace("Z", ""), "%Y-%m-%dT%H:%M:%S")
         except (ValueError, TypeError):
             return True   # bad stored value — treat as never
-        return (_dt.datetime.utcnow() - last_dt) >= _dt.timedelta(days=10)
+        return (_dt.datetime.utcnow() - last_dt) >= \
+               _dt.timedelta(days=self.LC_REFRESH_DAYS)
 
     def _on_categories_ready(self, categories, open_dialog):
         """Worker has fetched LC, persisted the cache to config, and may
@@ -5364,14 +6028,22 @@ class MainWindow(QMainWindow):
         self.terminal.append(dl_line, "#aaffff")
         self.debug_view.append(dl_line, "#aaffff")
 
-        # Check bulletins from LL/L scan — no extra L> commands needed
-        if self._is_home_bbs():
-            bull_cfg = self.config.get("bulletins", {})
-            subs = bull_cfg.get("subscriptions", [])
-            if bull_cfg.get("check_on_connect", False) and subs:
-                self._set_status("Checking bulletins…", connected=True)
-                QTimer.singleShot(200, self._process_ll_bulletins)
-                return   # outbox prompt will happen after bulletin check
+        # Send / Receive ends here — no bulletin sweep, and no outbox
+        # prompt (it just sent the outbox itself).
+        if self._sr_active:
+            self._sr_finish(
+                f"{count} message(s) received" if count else "nothing new")
+            return
+
+        # Bulletin stage — its own bounded `L> CATEGORY` sweep. Returns
+        # here only if there is nothing to sweep; otherwise the outbox
+        # prompt happens after the bulletin check completes.
+        bull_cfg = self.config.get("bulletins", {})
+        if (self._is_home_bbs()
+                and bull_cfg.get("check_on_connect", False)
+                and bull_cfg.get("subscriptions", [])):
+            self._start_bulletin_stage()
+            return
 
         # Prompt about outbox / auto-disconnect
         pending = self.db.get_pending_outbox()
@@ -5394,54 +6066,6 @@ class MainWindow(QMainWindow):
                 self._on_send_outbox()
                 return
         self._prompt_outbox()
-
-    def _process_ll_bulletins(self):
-        """
-        Filter _ll_bulletins through tombstone/exists checks and feed the
-        result to _on_bulletin_check — same dialog path as before, without
-        any extra L> commands on the wire.
-        Called instead of do_check_bulletins() on auto-connect paths.
-        """
-        raw = getattr(self, "_ll_bulletins", [])
-        if not raw:
-            self._on_bulletin_check({})
-            return
-
-        bbs_id = (f"{self.config.get('user',{}).get('callsign','NOCALL').upper()}"
-                  f"@{self._get_active_bbs_entry().get('callsign','')}")
-
-        # ── First bulletin connect — auto-tombstone all but 2 newest ──────
-        mycall   = self.config.get("user", {}).get("callsign", "NOCALL").upper()
-        bull_key = f"bulletins_seen@{self._get_active_bbs_entry().get('callsign','')}"
-        visited  = self.config.get("visited_bbs", {})
-
-        if bull_key not in visited:
-            # Group by category to tombstone all but 2 newest per category
-            from collections import defaultdict
-            by_cat = defaultdict(list)
-            for m in raw:
-                by_cat[m.to_call.upper()].append(m)
-            for cat, msgs in by_cat.items():
-                msgs_sorted = sorted(msgs, key=lambda m: m.msg_number, reverse=True)
-                to_tombstone = msgs_sorted[2:]
-                if to_tombstone:
-                    self.db.add_bulletin_tombstones_batch(to_tombstone, bbs_id)
-                    self.worker.sig_log.emit(
-                        f"[SYS] First bulletin connect — tombstoned "
-                        f"{len(to_tombstone)} old {cat} bulletins, "
-                        f"keeping {len(msgs_sorted[:2])} newest")
-            self.config.setdefault("visited_bbs", {})[bull_key] = True
-            save_config(self.config)
-
-        # Filter out already downloaded and tombstoned
-        filtered = {}
-        for m in raw:
-            cat = m.to_call.upper()
-            if (not self.db.bulletin_exists(m.msg_number, bbs_id)
-                    and not self.db.bulletin_tombstone_exists(m.msg_number, bbs_id)):
-                filtered.setdefault(cat, []).append(m)
-
-        self._on_bulletin_check(filtered)
 
     def _on_bulletin_check(self, bulletins_by_cat: dict):
         """Called when bulletin check completes — show selection dialog."""
@@ -5539,25 +6163,131 @@ class MainWindow(QMainWindow):
                 self._on_send_outbox()
                 return   # disconnect will happen after send completes
 
-        # Auto-disconnect Telnet sessions when initiated from Mail View
-        # LinBPQ has no built-in idle timer for Telnet — we disconnect cleanly
-        # after all downloads and outbox work is done so we don't hold a
-        # connection slot on the BBS indefinitely.
-        if (self.stack.currentIndex() == self.VIEW_MAIL
-                and self.worker and self.worker.session
-                and isinstance(self.worker.session.transport, TelnetTransport)):
-            self._set_status("Telnet session complete — disconnecting…",
-                             connected=True)
-            QTimer.singleShot(800, self._on_disconnect)
+        self._auto_disconnect_if_done()
+
+    def _auto_disconnect_if_done(self):
+        """Hang up once the automatic work (mail, bulletins, outbox) is done,
+        in the cases where nobody will do it by hand:
+
+          - A Mail-Call session, on ANY transport — it is unattended.
+            This used to be Telnet-only, so every packet and VARA Mail-Call
+            sat connected doing nothing until LinBPQ's idle timer dropped
+            it: 15 minutes holding the BBS port, with RR polls on the air
+            every 3 minutes (300 baud Direwolf run, 2026-09-11).
+          - ANY session QtC drove itself — i.e. one started from Mail
+            view. Until 2026-09-20 this was Telnet-only, on the reasoning
+            that LinBPQ has no idle timer for Telnet while RF has its own.
+            But an RF session left sitting costs far more than a Telnet
+            one: LinBPQ holds the BBS port for 15 minutes and polls RR
+            every ~3 minutes on a shared channel. Bill hit it on air
+            (2026-09-20, Direwolf, bulletin sweep ended with no new
+            bulletins and the link just sat there). One rule now:
+
+                Mail view      — QtC drives, and QtC hangs up.
+                Terminal/Debug — you drive, and you hang up.
+
+        Which of the two it is was decided at Connect
+        (_login_only_connect), not by whichever view happens to be open
+        now, so switching views to watch changes nothing.
+        """
+        if not (self.worker and self.worker.session):
+            return
+        if self._mc_session_owned:
+            why = "Mail-Call session complete"
+        elif not self._login_only_connect:
+            why = "Session complete"
+        else:
+            return
+        self._set_status(f"{why} — disconnecting…", connected=True)
+        QTimer.singleShot(800, self._on_disconnect)
 
     # ── Outbox ────────────────────────────────────────────────────
+
+    def _on_send_receive(self):
+        """Send / Receive — one button, one mail round trip (Bill,
+        2026-09-20).
+
+            outbox (SP/SB, if anything is queued)  →  LM  →  download new
+
+        Bulletins are deliberately NOT part of it: they run on a Mail view
+        connect, and keeping them out keeps this button one simple idea.
+        If people ask for them later we can add them.
+
+        This is what makes the Terminal-connect workflow whole — connect as
+        a dumb terminal, drive the BBS by hand, then switch to Mail view and
+        press one button to do the mail. It is also the only automatic
+        read in such a session, and it happens because the user asked.
+
+        The chain is driven by _sr_active through _on_send_result,
+        _on_mail_summary and _on_download_done, and always ends in
+        _sr_finish — including on the paths where nothing is sent, nothing
+        is new, or a send fails.
+        """
+        if not (self.worker and self.worker.session):
+            QMessageBox.warning(self, "Not Connected",
+                "Connect to a BBS first, then press Send / Receive.")
+            return
+        if self._sr_active:
+            # Log it, don't just flash the status bar. A press that is
+            # deliberately ignored should leave a trace — otherwise the
+            # only record of the refusal is a line that the next log
+            # message overwrites a second later (2026-09-20, D13c).
+            busy = "[S/R] Send / Receive already running — second press ignored"
+            self.terminal.append("\n" + busy + "\n", "#ffaa55")
+            self.debug_view.append(busy + "\n", "#ffaa55")
+            self._set_status("Send / Receive already running…", connected=True)
+            return
+
+        self._sr_active = True
+        pending = self.db.get_pending_outbox()
+        line = ("\n[S/R] Send / Receive — "
+                + (f"sending {len(pending)} message(s), then checking mail\n"
+                   if pending else "nothing to send, checking mail\n"))
+        self.terminal.append(line, "#aaffff")
+        self.debug_view.append(line, "#aaffff")
+
+        if pending:
+            self._on_send_outbox()      # _on_send_result chains onward
+        else:
+            self._sr_mail_check()
+
+    def _sr_mail_check(self):
+        """Second leg of Send / Receive: LM, then download whatever is new."""
+        if not (self.worker and self.worker.session):
+            self._sr_finish("Link gone before the mail check")
+            return
+        self._set_status("Send / Receive — checking mail…", connected=True)
+        self.worker.do_mail_check(new_only=True)
+
+    def _sr_finish(self, summary_text: str):
+        """Every Send / Receive path ends here — success, nothing to do, or
+        a failure. Clears the flag first so the button works again even if
+        the hang-up below does nothing."""
+        was_active = self._sr_active
+        self._sr_active = False
+        if not was_active:
+            return
+        done = f"\n[S/R] Send / Receive complete — {summary_text}.\n"
+        self.terminal.append(done, "#aaffff")
+        self.debug_view.append(done, "#aaffff")
+        self._set_status(f"Send / Receive complete — {summary_text}.",
+                         connected=bool(self.worker and self.worker.session))
+        # A Mail-view session hangs up here; a Terminal one stays up for
+        # the user to carry on typing (see _auto_disconnect_if_done).
+        self._auto_disconnect_if_done()
 
     def _on_send_outbox(self):
         pending = self.db.get_pending_outbox()
         if not pending:
+            if self._sr_active:
+                self._sr_finish("nothing to send")
+                return
             QMessageBox.information(self, "Outbox", "Outbox is empty.")
             return
         if not self.worker or not self.worker.session:
+            if self._sr_active:
+                self._sr_finish("not connected")
+                return
             QMessageBox.warning(self, "Not Connected",
                 "Connect to your home BBS first.")
             return
@@ -5565,13 +6295,22 @@ class MainWindow(QMainWindow):
         self._set_status(f"Sending {total} outbox message(s)…", connected=True)
         self._send_total   = total
         self._send_current = 0
-        for row in pending:
+        # _send_done counts every reply, sent or failed; _send_current
+        # counts only the successes. The batch is finished when _send_done
+        # reaches total — if it were keyed to the successes instead, one
+        # failed send would leave the batch waiting forever, and with it
+        # the Send / Receive chain and the end-of-session hang-up. Found
+        # in the 2026-09-20 flow audit. (The progress pill no longer comes
+        # from either of them — _run_send drives it as each send starts.)
+        self._send_done    = 0
+        for i, row in enumerate(pending, 1):
             self.worker.do_send(
                 row["to_call"], row["subject"],
                 row["body"],    row["msg_type"],
-                row["at_bbs"] or "")
+                row["at_bbs"] or "", index=i, total=total)
 
     def _on_send_result(self, success: bool, to_call: str):
+        total = getattr(self, "_send_total", 1) or 1
         if success:
             for row in self.db.get_pending_outbox():
                 if row["to_call"].upper() == to_call.upper():
@@ -5579,34 +6318,38 @@ class MainWindow(QMainWindow):
                     break
             # Increment address book use count so this contact rises in dropdown
             self.cdb.increment_use(to_call)
-            # Update send progress pill
+            # The counter is driven from _run_send now, at the moment each
+            # send begins. Emitting here as well would put it back one
+            # behind — this is where it used to be done, and it is what
+            # made a three-message batch read "1 / 3" while the second was
+            # still going out.
             self._send_current = getattr(self, "_send_current", 0) + 1
-            total = getattr(self, "_send_total", 1)
-            if self._send_current < total:
-                self.worker.sig_progress.emit(
-                    "sending", self._send_current, total,
-                    f"to {to_call}")
-            else:
-                self.worker.sig_progress.emit("done", 0, 0, "")
             self._refresh_folder(self._current_folder)
             self._update_folder_counts()
             self._set_status(f"Message sent to {to_call}", connected=True)
             self.terminal.append(
                 f"\n[SEND] Message sent to {to_call}\n", "#aaffff")
-            # Auto-disconnect Telnet after last message sent from Mail View
-            if (self._send_current >= total
-                    and self.stack.currentIndex() == self.VIEW_MAIL
-                    and self.worker and self.worker.session
-                    and isinstance(self.worker.session.transport,
-                                   TelnetTransport)):
-                self._set_status("Telnet session complete — disconnecting…",
-                                 connected=True)
-                QTimer.singleShot(800, self._on_disconnect)
         else:
             self._set_status(f"Send to {to_call} failed", connected=True)
+            self.terminal.append(
+                f"\n[SEND] Send to {to_call} FAILED — still in the Outbox\n",
+                "#ffaa55")
             QMessageBox.warning(self, "Send Failed",
                 f"Could not send message to {to_call}.\n"
+                "It stays in the Outbox so you can try again.\n"
                 "Check the terminal view for details.")
+
+        # Batch bookkeeping runs for BOTH outcomes, so one failed send can
+        # never leave the batch (and the Send / Receive chain, and the
+        # end-of-session hang-up) waiting on a reply that already came.
+        self._send_done = getattr(self, "_send_done", 0) + 1
+        if self._send_done < total:
+            return
+        self.worker.sig_progress.emit("done", 0, 0, "")
+        if self._sr_active:
+            self._sr_mail_check()       # second leg: LM + download
+        else:
+            self._auto_disconnect_if_done()
 
     # ── Folder / message display ──────────────────────────────────
 
@@ -5676,32 +6419,17 @@ class MainWindow(QMainWindow):
 
     # ── Compose / Reply / Delete ──────────────────────────────────
 
-    def _queue_with_conflict_check(self, v: dict):
-        """Queue outgoing message, warning if send_now conflicts with
-        existing pending messages to the same callsign."""
-        to_call  = v["to_call"]
-        send_now = v.get("send_now", True)
-        existing = [r for r in self.db.get_pending_outbox()
-                    if r["to_call"].upper() == to_call.upper()]
-        if existing:
-            existing_mode = bool(existing[0].get("send_now", 1))
-            if existing_mode != send_now:
-                mode_str     = "immediately" if send_now else "only when connected to Home BBS"
-                existing_str = "immediately" if existing_mode else "only when connected to Home BBS"
-                r = QMessageBox.question(
-                    self, "Send Mode Conflict",
-                    f"You have {len(existing)} pending message(s) to "
-                    f"<b>{to_call}</b> set to send <b>{existing_str}</b>.<br><br>"
-                    f"Change all messages to <b>{mode_str}</b>?",
-                    QMessageBox.StandardButton.Yes |
-                    QMessageBox.StandardButton.No)
-                if r == QMessageBox.StandardButton.Yes:
-                    for row in existing:
-                        self.db.update_send_now(row["id"], send_now)
+    def _queue_outgoing(self, v: dict):
+        """Put a composed message in the outbox.
+
+        This used to be _queue_with_conflict_check, whose whole job was
+        asking what to do when two pending messages to the same callsign
+        disagreed about a send mode that never did anything. Both are gone
+        (Bill, 2026-09-23)."""
         self.db.queue_outgoing(
-            to_call=to_call,          subject=v["subject"],
-            body=v["body"],           msg_type=v["msg_type"],
-            at_bbs=v.get("at_bbs",""), send_now=send_now)
+            to_call=v["to_call"],      subject=v["subject"],
+            body=v["body"],            msg_type=v["msg_type"],
+            at_bbs=v.get("at_bbs", ""))
 
     def _on_new_message(self):
         font_size = self.config.get("app", {}).get("font_size", 10)
@@ -5713,15 +6441,14 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Missing Field",
                 "Please enter a To: callsign.")
             return
-        self._queue_with_conflict_check(v)
+        self._queue_outgoing(v)
         self._refresh_folder("outbox")   # switch to outbox so user sees queued msg
         self._update_folder_counts()
         if self.worker and self.worker.session:
             self.mail_view.enable_send_outbox(True)
-        mode = "immediately" if v.get("send_now", True) else "when connected to Home BBS"
         QMessageBox.information(self, "Queued",
             f"Message to {v['to_call']} saved to outbox.\n"
-            f"Will send {mode}.")
+            f"It goes out on your next Send / Receive.")
 
     def _on_mark_all_read(self):
         folder = self._current_folder
@@ -5758,7 +6485,7 @@ class MainWindow(QMainWindow):
                                     contacts_db=self.cdb, font_size=font_size)
                 if dlg.exec() == QDialog.DialogCode.Accepted:
                     v = dlg.get_values()
-                    self._queue_with_conflict_check(v)
+                    self._queue_outgoing(v)
                     self._update_folder_counts()   # updates outbox badge count only
                     if self.worker and self.worker.session:
                         self.mail_view.enable_send_outbox(True)
@@ -5808,13 +6535,67 @@ class MainWindow(QMainWindow):
 
     # ── Terminal command (Phase 2 stub) ───────────────────────────
 
+    # Commands that destroy mail ON THE BBS. The BBS has no undo, and for
+    # anything QtC has not downloaded yet the BBS copy is the only copy.
+    DESTRUCTIVE_BBS_CMDS = {"KM"}
+
     def _on_terminal_cmd(self, cmd: str):
-        """Send a raw command through the live BBS session."""
+        """Send a raw command through the live BBS session.
+
+        Every terminal command funnels through here — the input box, the
+        quick buttons and the test API alike — so this is the one place a
+        guard has to go."""
         if not self.worker or not self.worker.session:
             self.terminal.append(
                 "[Not connected — connect to a BBS first]\n", "#ff4444")
             return
+        if not self._confirm_destructive(cmd):
+            return
         self.worker.do_terminal_send(cmd)
+
+    def _confirm_destructive(self, cmd: str) -> bool:
+        """Ask before a command that deletes mail on the BBS.
+
+        KM is "Kill Mine". On LinBPQ it kills the messages you have already
+        READ (PY); unread mail survives (D17 on the Pi, 2026-10-01). It
+        still cannot be undone from here. It sat in the Terminal
+        quick-command row between RM and I, same size and colour as L and
+        LM, and went out on a single click with nothing in the way
+        (Bill, 2026-09-20: "It will wipe all my mail still on the BBS").
+
+        The dialog names the consequence rather than asking a bare yes/no,
+        and defaults to No."""
+        verb = cmd.strip().upper().split()[0] if cmd.strip() else ""
+        if verb not in self.DESTRUCTIVE_BBS_CMDS:
+            return True
+        bbs = self._get_active_bbs_entry().get("callsign", "the BBS")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        # Wording per Bill, 2026-10-01. D17 on the Pi showed LinBPQ's KM
+        # kills only mail you have already READ (PY); unread PN survives,
+        # and BPQ's own help says "KM (Kill my read messages)". The old
+        # text claimed every undownloaded message would be gone.
+        box.setWindowTitle("Kill your read messages on the BBS?")
+        box.setText(
+            f"<b>KM kills \"read\" messages in the BBS ({bbs}).</b>"
+            f"<br><br>"
+            f"Doing this helps speed up future connections. Your mail is "
+            f"still in the QtC Inbox.<br><br>"
+            f"Send <b>KM</b> to {bbs}?")
+        btn_send = box.addButton("Yes — kill my read messages",
+                                 QMessageBox.ButtonRole.DestructiveRole)
+        btn_no   = box.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(btn_no)
+        box.setEscapeButton(btn_no)
+        box.exec()
+        if box.clickedButton() is not btn_send:      # None (Esc/X) lands here
+            self.terminal.append("\n[KM cancelled — nothing sent]\n", "#ffaa55")
+            self.debug_view.append("[SYS] KM cancelled by the user\n", "#ffaa55")
+            return False
+        self.debug_view.append(
+            f"[SYS] KM CONFIRMED by the user — deleting mail on {bbs}\n",
+            "#ff4444")
+        return True
 
     # ── Settings dialog ───────────────────────────────────────────
 
@@ -5823,6 +6604,7 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _on_settings(self):
+        old_mc = dict(self.config.get("mail_call", {}) or {})
         dlg = SettingsDialog(self.config, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.config = dlg.get_config()
@@ -5841,8 +6623,76 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Settings Saved",
                 f"Settings saved to {_CONFIG_PATH}.\n"
                 "Reconnect to apply any connection changes.")
+            self._mc_check_modem_after_save(old_mc)
 
     # ── Mail-Call !!! scheduler handlers ──────────────────────────
+
+    def _mc_check_modem_after_save(self, old_mc: dict):
+        """Warn at once when Mail-Call was just turned on or any of its
+        settings changed (BBS, schedule, times, time zone), and that BBS's
+        modem program isn't running. Unrelated edits stay quiet.
+
+        Settings OK is the moment the operator is still at the desk. A
+        warning at slot time could land after they've left for the weekend
+        (Bill, 2026-09-13). A slot that fires with the modem down still
+        takes the normal retry path — nothing reaches the radio."""
+        mc = self.config.get("mail_call", {}) or {}
+        if not mc.get("enabled"):
+            return
+        if old_mc.get("enabled") and old_mc == mc:
+            return          # nothing on the Mail-Call tab changed
+        if not self.btn_connect.isEnabled():
+            return          # a live session holds the modem's ports
+        entry, _err = self._mc_scheduler._validate()
+        if entry is None:
+            return          # the Mail-Call status line already says why
+        down = self._modem_not_running(entry)
+        if not down:
+            return
+        name, where = down
+        nxt = self._mc_scheduler._next_fire
+        tz = " UTC" if mc.get("time_zone") == "utc" else ""
+        when = f" at {nxt.strftime('%H:%M')}{tz}" if nxt else ""
+        self._on_log(
+            f"[SCHED] Mail-Call: {name} not answering on {where} — "
+            f"warned at Settings save")
+        QMessageBox.warning(self, "Mail-Call: modem not running",
+            f"Mail-Call is set to connect to {entry.get('callsign', '?')} "
+            f"through {name}, but nothing is answering on {where}. "
+            f"{name} doesn't seem to be running.\n\n"
+            f"Start {name} before the next Mail-Call{when}. If it is still "
+            f"down then, Mail-Call retries a few times without "
+            f"transmitting and waits for the following slot.")
+
+    def _modem_not_running(self, entry: dict):
+        """(modem name, "host:port") when the entry's modem program isn't
+        listening, else None. Local TCP only — nothing is transmitted.
+        Telnet has no modem to check."""
+        import socket
+        transport = entry.get("transport", "")
+        if transport in AGW_MODEMS:
+            name = AGW_MODEMS[transport]
+            host = entry.get("host") or "127.0.0.1"
+            port = int(entry.get("agw_port") or AGW_DEFAULT_PORT)
+        elif transport in ("vara_hf", "vara_fm"):
+            prefix = "hf" if transport == "vara_hf" else "fm"
+            vara = self.config.get("vara", {})
+            name = "VARA HF" if prefix == "hf" else "VARA FM"
+            host = vara.get(f"{prefix}_host", vara.get("hf_host", "127.0.0.1"))
+            port = int(vara.get(f"{prefix}_cmd_port",
+                                vara.get("hf_cmd_port", 8300)))
+            ctrl = self._vara_ctrl
+            if (ctrl.vara_host, int(ctrl.cmd_port)) == (host, port):
+                # QtC holds this port itself while idle, and VARA takes one
+                # client — a second connection is refused even when it runs.
+                return None if ctrl.open() else (name, f"{host}:{port}")
+        else:
+            return None
+        try:
+            with socket.create_connection((host, port), timeout=2):
+                return None
+        except OSError:
+            return (name, f"{host}:{port}")
 
     # Mail-Call retry tunables. The combined budget covers both channel-busy
     # detections and VARA connect-failures — every attempt of either kind
@@ -5883,7 +6733,8 @@ class MainWindow(QMainWindow):
         self._mc_session_owned = True
 
         transport = entry.get("transport", "")
-        if transport in ("vara_hf", "vara_fm"):
+        if transport in ("vara_hf", "vara_fm", *AGW_MODEMS):
+            # RF — VARA or packet: retry budget + slot deadline apply
             self._mc_attempt_vara_fire(entry)
         else:
             # Telnet — no RF retry concept, fire and let _on_connected
@@ -5929,8 +6780,11 @@ class MainWindow(QMainWindow):
             self._mc_end_retry()
             return
 
-        # 3. Channel busy — increment and schedule retry
-        if self._vara_ctrl.is_busy():
+        # 3. Channel busy — increment and schedule retry. VARA only: AGW
+        #    has no BUSY report, and the packet modems carrier-sense on
+        #    their own before every transmission.
+        if (entry.get("transport") in ("vara_hf", "vara_fm")
+                and self._vara_ctrl.is_busy()):
             self._mc_tries_used += 1
             self._on_log(
                 f"[SCHED] Mail-Call: channel busy "
@@ -6002,6 +6856,43 @@ class MainWindow(QMainWindow):
                 f"in {m}:{s:02d}")
             self._mc_status_label.setVisible(True)
 
+    def _mc_link_dropped(self) -> bool:
+        """True when an error belongs to a Mail-Call session that had
+        connected and has since lost its link — the unattended case."""
+        if not (self._mc_session_owned or self._mc_owned_at_disconnect):
+            return False
+        session = self.worker.session if self.worker else None
+        return not getattr(getattr(session, "transport", None),
+                           "connected", False)
+
+    def _mc_notify_link_drop(self, msg: str):
+        """Record a mid-session Mail-Call link drop in 🔔 Notifications.
+        No retry: the next Mail-Call runs at its usual time — see
+        feedback_rf_airtime_politeness."""
+        bbs = self.worker.bbs_entry.get("callsign", "?") if self.worker else "?"
+        self._on_log(
+            f"[SCHED] Mail-Call: link to {bbs} lost mid-session — {msg} "
+            f"(see 🔔 Notifications)")
+        if self._mc_drop_noted:
+            return          # a second error from the same drop
+        self._mc_drop_noted = True
+        mycall = self.config.get("user", {}).get("callsign", "NOCALL")
+        body = (f"The {datetime.now().strftime('%H:%M')} Mail-Call session "
+                f"with {bbs} ended early: the link dropped while QtC was "
+                f"waiting on the BBS.\n\n"
+                f"  {msg}\n\n"
+                f"Nothing is retried now. The next Mail-Call runs at its "
+                f"usual time.\n\n"
+                f"-- QtC Mail-Call\n")
+        try:
+            self.db.create_system_message(
+                mycall, f"Mail-Call: link to {bbs} lost", body)
+            self._update_folder_counts()
+            if getattr(self, "_current_folder", "") == "notifications":
+                self._refresh_folder("notifications")
+        except Exception as e:
+            self._on_log(f"[SYS] Could not add Mail-Call notification: {e}")
+
     def _mc_end_retry(self):
         """Tear down all Mail-Call slot/retry state and let the scheduler
         resume its normal Next-Mail-Call countdown. Called on slot success
@@ -6009,9 +6900,15 @@ class MainWindow(QMainWindow):
         and on cancellation (feature disabled, manual session)."""
         # If we never got connected (i.e. abandoning the slot), clear the
         # session-owned flag too — there's no _on_disconnected coming to
-        # do it. When called from _on_connected, btn_connect is disabled
-        # (we're live) so the flag stays set for the rest of the session.
-        if self.btn_connect.isEnabled():
+        # do it. When called from _on_connected we are logged in, so the
+        # flag stays set for the rest of the session.
+        # This used to test btn_connect.isEnabled(), but _on_error greys
+        # Connect for the modem recovery BEFORE the connect-fail roll-over
+        # runs, so after an exhausted slot the flag stayed True and the
+        # next MANUAL connect ran as Mail-Call: autopilot even from
+        # Terminal view, outbox sent and bulletins taken unasked
+        # (H3, Direwolf, radio off, 2026-10-01).
+        if not self._logged_in:
             self._mc_session_owned = False
         self._mc_active_entry   = None
         self._mc_tries_used     = 0
@@ -6101,7 +6998,7 @@ class MainWindow(QMainWindow):
         QMessageBox.about(self, "About QtC",
             f"<b>QtC</b> v{APP_VERSION}<br><br>"
             "A modern BBS client for LinBPQ/BPQ32 nodes<br>"
-            "via VARA HF, VARA FM, and Telnet.<br><br>"
+            "via VARA HF, VARA FM, AX.25 packet, and Telnet.<br><br>"
             "Built with Python + PyQt6.")
 
     def _on_shortcuts_help(self):
@@ -6213,7 +7110,32 @@ class MainWindow(QMainWindow):
             color = "#888888"
         self.conn_light.setStyleSheet(f"color:{color}; font-size:18px;")
 
+    # How long a close may wait for a clean hang-up before quitting anyway.
+    # AGW waits up to HANGUP_WAIT_SECS (10) for the BBS's DISC; VARA HF's
+    # own DISCONNECT handshake can take 10-20 s.
+    CLOSE_DISCONNECT_CAP_MS = 30000
+
     def closeEvent(self, event):
+        # Closing while linked: hang up FIRST, then close. Waiting only 2 s
+        # here let QtC exit with the link still up — D9, 1200 baud,
+        # 2026-10-01: `b` went out, the BBS answered with DISC, but QtC had
+        # already dropped its AGW socket, so Direwolf never sent the UA
+        # and the BBS kept repeating DISC on the air until it gave up.
+        # Closing a second time quits at once.
+        if (self.worker and self.worker.session
+                and not getattr(self, "_close_after_disconnect", False)):
+            self._close_after_disconnect = True
+            event.ignore()
+            self._set_status("Disconnecting before exit…", connecting=True)
+            note = ("[SYS] Closing — disconnecting from the BBS first. "
+                    "Close again to quit now.\n")
+            self.terminal.append(note, "#888888")
+            self.debug_view.append(note, "#888888")
+            self.worker.sig_disconnected.connect(
+                lambda: QTimer.singleShot(0, self.close))
+            self.worker.do_disconnect()
+            QTimer.singleShot(self.CLOSE_DISCONNECT_CAP_MS, self.close)
+            return
         # Stop the Mail-Call scheduler so its QTimer doesn't keep ticking
         # during the shutdown teardown.
         if hasattr(self, "_mc_scheduler"):
@@ -6280,8 +7202,26 @@ def _apply_dark_palette(app):
     app.setPalette(palette)
 
 
+def _take_test_api_flag(argv):
+    """--test-api[=PORT] — development/QA only. Pulled out of argv before
+    Qt sees it. Returns the port, or None when the flag is absent.
+
+    Off unless asked for, and the socket binds to 127.0.0.1 only. See
+    qtc_test_api.py: it presses the same buttons a person would, and some
+    of those key the transmitter, so the control operator has to be there.
+    """
+    port = None
+    for arg in list(argv[1:]):
+        if arg == "--test-api" or arg.startswith("--test-api="):
+            argv.remove(arg)
+            _, _, val = arg.partition("=")
+            port = int(val) if val.isdigit() else 8787
+    return port
+
+
 def main():
     os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.wayland*=false")
+    test_api_port = _take_test_api_flag(sys.argv)
     app = QApplication(sys.argv)
     app.setApplicationName("QtC")
     app.setStyle("Fusion")
@@ -6328,6 +7268,30 @@ def main():
     if splash is not None:
         splash.finish(win)
 
+    if test_api_port is not None:
+        try:
+            import qtc_test_api
+        except ImportError:
+            # Release builds leave the QA control socket out (the Windows
+            # exe's QtC.spec excludes it; the tarball never carries it).
+            print("\n*** --test-api is not available in this build — it is "
+                  "for development from a source checkout.\n", flush=True)
+            return 2
+        try:
+            qtc_test_api.install(win, test_api_port)
+        except RuntimeError as e:
+            # Asked for the API and could not have it — say why and stop,
+            # rather than running on silently without the thing that was
+            # requested, or dying on a raw traceback.
+            print(f"\n*** {e}\n", flush=True)
+            return 2
+        print(f"\n*** QtC TEST API on 127.0.0.1:{test_api_port} ***\n"
+              f"    Development/QA control socket. Anything that reaches the\n"
+              f"    BBS goes out over your radio: connect, type and\n"
+              f"    click send_receive all key the transmitter. Stay at the\n"
+              f"    set. Every command is written into the Debug log.\n",
+              flush=True)
+
     # First-run check — if no real callsign set, open settings immediately
     callsign = win.config.get("user", {}).get("callsign", "").strip().upper()
     if not callsign or callsign in ("NOCALL", "N0CALL", "CALL", "MYCALL"):
@@ -6344,4 +7308,7 @@ def main():
     sys.exit(app.exec())
 
 if __name__ == "__main__":
-    main()
+    # Propagate main()'s status. It returns non-zero when a requested
+    # --test-api port could not be opened, and a test run needs to be able
+    # to tell that apart from a clean exit.
+    sys.exit(main())

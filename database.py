@@ -1,4 +1,4 @@
-# QtC v0.14.0-beta — database.py  (built 2026-06-21)
+# QtC v0.15.0-beta — database.py  (built 2026-09-23)
 # VARA BBS Client — A modern BBS client for LinBPQ/BPQ32 nodes
 # via VARA HF, VARA FM, and Telnet.
 #
@@ -374,16 +374,6 @@ class MessageDatabase:
                      body, row["msg_type"], len(body.encode("utf-8"))))
                 conn.execute("DELETE FROM outbox WHERE id=?", (row_id,))
 
-    def update_send_now(self, row_id: int, send_now: bool):
-        """Update the send_now flag on a pending outbox message."""
-        with self._conn() as conn:
-            conn.execute("UPDATE outbox SET send_now=? WHERE id=?",
-                         (1 if send_now else 0, row_id))
-
-    def delete_outbox(self, row_id: int):
-        with self._conn() as conn:
-            conn.execute("DELETE FROM outbox WHERE id=?", (row_id,))
-
     # ── Sent ───────────────────────────────────────────────────────
 
     def get_sent(self) -> list:
@@ -458,12 +448,6 @@ class MessageDatabase:
             ).fetchall()
             return [dict(r) for r in rows]
 
-    def get_bulletin_unread_count(self) -> int:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM bulletins WHERE read=0").fetchone()
-            return row[0] if row else 0
-
     def mark_bulletin_read(self, row_id: int):
         with self._conn() as conn:
             conn.execute("UPDATE bulletins SET read=1 WHERE id=?", (row_id,))
@@ -490,15 +474,6 @@ class MessageDatabase:
                 "WHERE msg_number=? AND bbs_id=?",
                 (msg_number, bbs_id)).fetchone()
             return row is not None
-
-    def add_bulletin_tombstone(self, msg_number: int, bbs_id: str):
-        """Add a tombstone directly — used when skipping bulletins in the
-        selection dialog or auto-tombstoning old backlog on first connect."""
-        with self._conn() as conn:
-            conn.execute("""
-                INSERT OR IGNORE INTO bulletin_tombstones (msg_number, bbs_id)
-                VALUES (?,?)
-            """, (msg_number, bbs_id))
 
     def add_bulletin_tombstones_batch(self, items: list, bbs_id: str):
         """Tombstone a list of BBSMessage objects in one transaction."""

@@ -20,6 +20,8 @@ a = Analysis(
         # Bundle the SVG icon and splash PNG alongside the exe
         ('qtc_icon.svg', '.'),
         ('qtc_splash.png', '.'),
+        # Version history — the changelog lives here now, not in the READMEs
+        ('VERSION', '.'),
     ],
     hiddenimports=[
         # pyserial is imported lazily inside ptt.py functions — must be explicit

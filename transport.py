@@ -1,4 +1,4 @@
-# QtC v0.14.0-beta — transport.py  (built 2026-06-13)
+# QtC v0.15.0-beta — transport.py  (built 2026-10-04)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -14,6 +14,7 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 import socket
+import struct
 import time
 import threading
 
@@ -34,6 +35,43 @@ def _validate_codec(codec: str) -> str:
     unrecognized so a typo in config.json can never break the data path."""
     name = (codec or "").strip().lower().replace("_", "-")
     return name if name in SUPPORTED_TEXT_CODECS else "utf-8"
+
+
+# Characters a BBS prompt can end on with no CR/LF behind it: "Username:",
+# "de N0CALL>", "<CR> = Continue..>". They only END A LINE when they are the
+# last thing that arrived. Flushing on every one of them chopped ordinary
+# sentences into pieces — LinBPQ's node line "MYNODE:N0CALL-7} Invalid
+# command - Enter ? for command list" came out as three [RX] lines, and a
+# subject line like "Re: tonight's net" split at the colon (Bill,
+# 2026-09-20).
+_PROMPT_ENDS = (">", ":", "?")
+
+
+def _stream_rx_lines(text: str, line_buf: str, emit) -> str:
+    """Feed newly arrived text through the [RX] line splitter and return
+    the new partial-line buffer.
+
+    A line flushes on CR/LF, or on a prompt character that is the last
+    non-blank thing in `text` — so a prompt with nothing after it still
+    shows the instant it lands, while a line split across two reads (or
+    two AX.25 frames) is reassembled instead of being printed in pieces.
+    A prompt arriving with trailing blanks ("Username: ") still counts.
+
+    Display only. The receive buffer the protocol code matches against is
+    filled separately by the caller and is not touched here, so changing
+    what the user sees can never change what QtC reads.
+    """
+    for i, ch in enumerate(text):
+        if ch in ("\r", "\n"):
+            emit(line_buf.strip())
+            line_buf = ""
+        elif ch in _PROMPT_ENDS and not text[i + 1:].strip():
+            emit((line_buf + ch).strip())
+            line_buf = ""
+        else:
+            line_buf += ch
+    return line_buf
+
 
 class TelnetTransport:
     """
@@ -101,11 +139,17 @@ class TelnetTransport:
         on the same socket and end up with fragmented or duplicated lines.
 
         When _terminal_mode is True, also emits complete lines as [RX]
-        log entries. Lines are flushed on real terminators only —
-        \\r, \\n, >, :, ? — never on socket timeout, so a BBS line split
-        across two recv() calls is reassembled, not printed in pieces.
+        log entries, via _stream_rx_lines: CR/LF, or a prompt character
+        that is the last thing in the chunk. Never on socket timeout, so
+        a BBS line split across two recv() calls is reassembled, not
+        printed in pieces.
         """
         line_buf = ""
+
+        def _emit_line(s: str):
+            if s and self._log:
+                self._log("RX", s)
+
         while not self._stop_reader.is_set():
             if not self.connected or self.sock is None:
                 time.sleep(0.1)
@@ -119,18 +163,7 @@ class TelnetTransport:
                 line_buf = ""
                 continue
             text = chunk.decode(self._text_codec, errors="replace")
-            for ch in text:
-                if ch in ("\r", "\n"):
-                    if line_buf.strip() and self._log:
-                        self._log("RX", line_buf.strip())
-                    line_buf = ""
-                elif ch in (">", ":", "?"):
-                    line_buf += ch
-                    if line_buf.strip() and self._log:
-                        self._log("RX", line_buf.strip())
-                    line_buf = ""
-                else:
-                    line_buf += ch
+            line_buf = _stream_rx_lines(text, line_buf, _emit_line)
 
     def connect(self):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -213,6 +246,11 @@ class TelnetTransport:
         with self._lock:
             self._buf = b""
 
+    def peek_input(self) -> str:
+        """Everything buffered and not yet read, without consuming it."""
+        with self._lock:
+            return self._buf.decode(self._text_codec, errors="replace")
+
     def read_until(self, expected: str, timeout: int = 15) -> str:
         """Read from _buf until expected string appears.
 
@@ -224,6 +262,7 @@ class TelnetTransport:
             expected_b = expected
 
         deadline = time.time() + timeout
+        seen = -1
         while True:
             with self._lock:
                 # User abort — return whatever's buffered now. The caller
@@ -233,6 +272,10 @@ class TelnetTransport:
                     result = self._buf
                     self._buf = b""
                     return result.decode(self._text_codec, errors="replace")
+                if len(self._buf) != seen:
+                    # Silence-based timeout — see read_until_any()
+                    seen = len(self._buf)
+                    deadline = time.time() + timeout
                 idx = self._buf.lower().find(expected_b.lower())
                 if idx >= 0:
                     end = idx + len(expected_b)
@@ -243,6 +286,60 @@ class TelnetTransport:
                     result = self._buf
                     self._buf = b""
                     return result.decode(self._text_codec, errors="replace")
+            time.sleep(0.05)
+
+    def read_until_any(self, expected, timeout: int = 15):
+        """Read until ANY string in `expected` appears.
+
+        Returns (text, matched) where `matched` is the entry from
+        `expected` that fired, or None on timeout/abort. Same
+        consume-from-buffer contract as read_until() — never calls
+        recv(); the reader thread owns the socket.
+
+        Used for BBS paged output: with `OP n` set, LinBPQ interrupts a
+        listing with "<A>bort, <R Msg(s)>, <CR> = Continue..>" instead of
+        returning to the command prompt, so a caller has to watch for both
+        terminators at once. Order matters — the first entry that matches
+        at the EARLIEST buffer position wins, so pass the page prompt
+        before the BBS prompt (the page prompt also ends in '>').
+        """
+        if isinstance(expected, str):
+            expected = [expected]
+        needles = [(e, e.encode("utf-8") if isinstance(e, str) else e)
+                   for e in expected]
+
+        deadline = time.time() + timeout
+        seen = -1
+        while True:
+            with self._lock:
+                if self._abort.is_set():
+                    result = self._buf
+                    self._buf = b""
+                    return (result.decode(self._text_codec,
+                                          errors="replace"), None)
+                if len(self._buf) != seen:
+                    # Time out on SILENCE, not total time: the deadline
+                    # moves on while bytes keep arriving. Half-duplex RF
+                    # can take minutes over one reply — never jump ahead.
+                    seen = len(self._buf)
+                    deadline = time.time() + timeout
+                low = self._buf.lower()
+                best_idx, best = -1, None
+                for entry, needle in needles:
+                    i = low.find(needle.lower())
+                    if i >= 0 and (best_idx < 0 or i < best_idx):
+                        best_idx, best = i, (entry, needle)
+                if best is not None:
+                    end = best_idx + len(best[1])
+                    result = self._buf[:end]
+                    self._buf = self._buf[end:]
+                    return (result.decode(self._text_codec,
+                                          errors="replace"), best[0])
+                if time.time() >= deadline:
+                    result = self._buf
+                    self._buf = b""
+                    return (result.decode(self._text_codec,
+                                          errors="replace"), None)
             time.sleep(0.05)
 
     def read_eager(self) -> str:
@@ -270,8 +367,13 @@ class TelnetTransport:
         Returns fewer than n bytes only if timeout expires.
         """
         deadline = time.time() + timeout
+        seen = -1
         while True:
             with self._lock:
+                if len(self._buf) != seen:
+                    # Silence-based timeout — see read_until_any()
+                    seen = len(self._buf)
+                    deadline = time.time() + timeout
                 if len(self._buf) >= n:
                     result = self._buf[:n]
                     self._buf = self._buf[n:]
@@ -340,6 +442,7 @@ class VaraTransport:
         self._data_sock = None
 
         self.connected  = False          # True once VARA says CONNECTED
+        self._lost_reason = None         # why VARA ended the link, if it did
         self._busy      = False          # Channel busy flag
         self._buffer    = 0             # Bytes in VARA TX queue
         self._last_cmd_resp = ""        # Last raw response from cmd port
@@ -462,7 +565,14 @@ class VaraTransport:
                 if upper.startswith(self.RESP_CONNECTED):
                     self.connected = True
                 elif upper.startswith(self.RESP_DISCONNECTED):
+                    # The monitor only runs while linked — disconnect()
+                    # stops it before sending DISCONNECT — so this one is
+                    # never ours. Set the reason before connected drops: a
+                    # blocked read raises with it the moment it looks.
+                    self._lost_reason = (
+                        f"VARA reports the link to {self.target_call} is gone")
                     self.connected = False
+                    self._emit("SYS", self._lost_reason)
                     # Remote-initiated disconnect (BBS timeout, far-end bye, etc.)
                     # Stop the monitor thread, release PTT, and clean up sockets
                     # so VARA can reset its TCP listener before the next connect.
@@ -505,10 +615,10 @@ class VaraTransport:
         between background streaming and a foreground _expect().
 
         When _terminal_mode is True, the reader ALSO emits complete lines
-        as [RX] log entries for the terminal view. Lines are flushed only
-        on real terminators (\\r, \\n, >, :, ?) — no timeout-based partial
-        flush, so a line split across two RF frames is reassembled instead
-        of being printed in two pieces.
+        as [RX] log entries for the terminal view, via _stream_rx_lines:
+        CR/LF, or a prompt character with nothing after it. No
+        timeout-based partial flush, so a line split across two RF frames
+        is reassembled instead of being printed in two pieces.
 
         Defense in depth (unchanged from prior design):
           * `recent[]` — suppresses identical lines repeated within a short
@@ -562,18 +672,7 @@ class VaraTransport:
                 continue
 
             text = chunk.decode(self._text_codec, errors="replace")
-            for ch in text:
-                if ch in ("\r", "\n"):
-                    _emit_line(line_buf.strip())
-                    line_buf = ""
-                elif ch in (">", ":", "?"):
-                    # Prompt terminators — flush immediately so the user
-                    # sees the BBS waiting-for-input cue without delay.
-                    line_buf += ch
-                    _emit_line(line_buf.strip())
-                    line_buf = ""
-                else:
-                    line_buf += ch
+            line_buf = _stream_rx_lines(text, line_buf, _emit_line)
 
     # ── Public interface (mirrors TelnetTransport) ────────────────
 
@@ -582,6 +681,7 @@ class VaraTransport:
         Open command + data sockets, handshake with VARA, initiate RF connect.
         Raises ConnectionError if anything fails.
         """
+        self._lost_reason = None
         # 1. Open command socket — retry generously since VARA needs time
         #    to reset its TCP listener after a previous disconnect/failed connect.
         #    A failed RF connect can leave VARA resetting for up to ~15 seconds.
@@ -800,13 +900,23 @@ class VaraTransport:
                     f"flush_input: discarding {len(self._data_buf)} stale bytes")
             self._data_buf = b""
 
-    def _buf_find(self, needle: bytes):
-        """Case-insensitive search in _data_buf under the lock."""
+    def _link_lost(self):
+        """Why a blocked read should give up now because the link is gone,
+        or None while linked. Same rule as AGWTransport._link_lost.
+
+        Until 2026-10-04 VARA reads ignored DISCONNECTED and ran out their
+        silence timer instead. On air that day a VARA FM link failed during
+        the login wait: VARA said DISCONNECTED at 16:04:57, but the login
+        read kept going for a full minute, sent its 'A' nudge, then popped
+        "Login failed" over the next session Bill had already started."""
+        if self.connected:
+            return None
+        return self._lost_reason or f"Not linked to {self.target_call}"
+
+    def peek_input(self) -> str:
+        """Everything buffered and not yet read, without consuming it."""
         with self._data_lock:
-            i = self._data_buf.lower().find(needle.lower())
-            if i < 0:
-                return -1
-            return i
+            return self._data_buf.decode(self._text_codec, errors="replace")
 
     def read_until(self, expected: str, timeout: int = 30) -> str:
         """
@@ -820,6 +930,7 @@ class VaraTransport:
             expected_b = expected
 
         deadline = time.time() + timeout
+        seen = -1
         while True:
             with self._data_lock:
                 # User abort — return whatever's buffered now. The caller
@@ -829,17 +940,81 @@ class VaraTransport:
                     result = self._data_buf
                     self._data_buf = b""
                     return result.decode(self._text_codec, errors="replace")
+                if len(self._data_buf) != seen:
+                    # Silence-based timeout — see read_until_any()
+                    seen = len(self._data_buf)
+                    deadline = time.time() + timeout
                 idx = self._data_buf.lower().find(expected_b.lower())
                 if idx >= 0:
                     end = idx + len(expected_b)
                     result = self._data_buf[:end]
                     self._data_buf = self._data_buf[end:]
                     return result.decode(self._text_codec, errors="replace")
+                lost = self._link_lost()
+                if lost:
+                    raise ConnectionError(lost)
                 if time.time() >= deadline:
                     result = self._data_buf
                     self._data_buf = b""
                     return result.decode(self._text_codec, errors="replace")
             # No match yet — give the reader a moment to add more bytes
+            time.sleep(0.05)
+
+    def read_until_any(self, expected, timeout: int = 30):
+        """Read until ANY string in `expected` appears.
+
+        Returns (text, matched) where `matched` is the entry from
+        `expected` that fired, or None on timeout/abort. Same
+        consume-from-buffer contract as read_until() — never calls
+        recv(); the reader thread owns the socket.
+
+        Used for BBS paged output: with `OP n` set, LinBPQ interrupts a
+        listing with "<A>bort, <R Msg(s)>, <CR> = Continue..>" instead of
+        returning to the command prompt, so a caller has to watch for both
+        terminators at once. Order matters — the first entry that matches
+        at the EARLIEST buffer position wins, so pass the page prompt
+        before the BBS prompt (the page prompt also ends in '>').
+        """
+        if isinstance(expected, str):
+            expected = [expected]
+        needles = [(e, e.encode("utf-8") if isinstance(e, str) else e)
+                   for e in expected]
+
+        deadline = time.time() + timeout
+        seen = -1
+        while True:
+            with self._data_lock:
+                if self._abort.is_set():
+                    result = self._data_buf
+                    self._data_buf = b""
+                    return (result.decode(self._text_codec,
+                                          errors="replace"), None)
+                if len(self._data_buf) != seen:
+                    # Time out on SILENCE, not total time: the deadline
+                    # moves on while bytes keep arriving. Half-duplex RF
+                    # can take minutes over one reply — never jump ahead.
+                    seen = len(self._data_buf)
+                    deadline = time.time() + timeout
+                low = self._data_buf.lower()
+                best_idx, best = -1, None
+                for entry, needle in needles:
+                    i = low.find(needle.lower())
+                    if i >= 0 and (best_idx < 0 or i < best_idx):
+                        best_idx, best = i, (entry, needle)
+                if best is not None:
+                    end = best_idx + len(best[1])
+                    result = self._data_buf[:end]
+                    self._data_buf = self._data_buf[end:]
+                    return (result.decode(self._text_codec,
+                                          errors="replace"), best[0])
+                lost = self._link_lost()
+                if lost:
+                    raise ConnectionError(lost)
+                if time.time() >= deadline:
+                    result = self._data_buf
+                    self._data_buf = b""
+                    return (result.decode(self._text_codec,
+                                          errors="replace"), None)
             time.sleep(0.05)
 
     def read_eager(self) -> str:
@@ -867,12 +1042,20 @@ class VaraTransport:
         Returns fewer than n bytes only if timeout expires.
         """
         deadline = time.time() + timeout
+        seen = -1
         while True:
             with self._data_lock:
+                if len(self._data_buf) != seen:
+                    # Silence-based timeout — see read_until_any()
+                    seen = len(self._data_buf)
+                    deadline = time.time() + timeout
                 if len(self._data_buf) >= n:
                     result = self._data_buf[:n]
                     self._data_buf = self._data_buf[n:]
                     return result
+                lost = self._link_lost()
+                if lost:
+                    raise ConnectionError(lost)
                 if time.time() >= deadline:
                     result = self._data_buf
                     self._data_buf = b""
@@ -884,6 +1067,586 @@ class VaraTransport:
         if not self.connected:
             raise ConnectionError("VARA not connected")
         self._data_sock.sendall(data)
+
+
+class AGWTransport:
+    """
+    AX.25 packet transport through an AGWPE-compatible modem — Direwolf,
+    or (Qt)SoundModem.
+
+    Unlike VARA there is ONE TCP socket (default port 8000), and
+    everything on it is a frame: a 36-byte little-endian header followed
+    by data_len bytes of data.
+
+      offset  0  port       int32    radio port, 0 = first channel
+              4  kind       1 byte   'C' connect, 'D' data, 'd' disconnect…
+              6  pid        1 byte   0xF0 for BBS text
+              8  call_from  10 bytes NUL padded
+             18  call_to    10 bytes NUL padded
+             28  data_len   uint32
+             32  user       uint32   unused
+
+    The modem runs the AX.25 link itself — QtC never builds an AX.25
+    frame. BBS text arrives in 'D' frames and goes into _data_buf, the
+    same shared buffer VaraTransport uses, so BBSSession can't tell the
+    two apart.
+
+    Connect sequence:
+      1. Open the socket, start the single reader thread
+      2. 'R' version and 'G' port list — logged; 'G' also checks that the
+         radio port exists before anything is transmitted
+      3. 'C' mycall -> BBS
+      4. Wait for 'C' "*** CONNECTED With Station <BBS>", or a 'd' frame
+         if the station never answers ("RETRYOUT" from Direwolf) or
+         refuses ("From Station" — also (Qt)SoundModem's retry-out text)
+
+    Disconnect sequence:
+      1. BBSSession has already sent `b`
+      2. Poll 'Y' (frames not yet acknowledged) until it reaches 0 — a
+         'd' throws away anything still queued, `b` included
+      3. Give the BBS HANGUP_WAIT_SECS to hang up by itself — LinBPQ
+         sends its own DISC right after `b`
+      4. Still linked? Send 'd' and wait for the modem's 'd' reply
+         (DISC/UA on air)
+      5. Only then close the socket. Closing it with the link still up
+         frees the link inside Direwolf WITHOUT a DISC on the air, which
+         leaves the BBS holding a dead session.
+
+    The modems silently drop 'D' / 'd' / 'Y' frames whose callsigns don't
+    match the link exactly (case and SSID), so the remote call is taken
+    from the modem's own 'C' reply rather than from what the user typed.
+    """
+
+    _HDR        = struct.Struct("<IBxBx10s10sII")
+    HEADER_LEN  = _HDR.size          # 36
+    PID_TEXT    = 0xF0               # no layer 3 — plain BBS text
+    # A header claiming more than this is a desync (wrong port, not an
+    # AGW server), not a real frame. Direwolf itself caps data near 2 KB.
+    MAX_RX_DATA = 65536
+
+    # Floor, in seconds of SILENCE, for any wait on a BBS reply (applied
+    # by BBSSession._reply_wait). Half-duplex 300 baud with RF retries can
+    # go quiet a long while mid-reply, and a genuinely dead link is
+    # reported by the modem itself (retries run out → 'd'), so QtC must
+    # never give up early and send its next command over the BBS.
+    MIN_REPLY_WAIT = 120
+
+    # After `b` is acknowledged, how long disconnect() waits for the BBS to
+    # hang up by itself before sending our own DISC. LinBPQ hangs up about
+    # a second after `b`; sending 'd' straight away crossed its DISC on the
+    # air and cost two wasted frames (our DISC, its DM) — 2026-09-10.
+    HANGUP_WAIT_SECS = 10
+
+    def __init__(self, host, port, mycall, target_call, radio_port=0,
+                 timeout=120, modem_name="Direwolf", max_frame_data=256):
+        self.host        = host
+        self.port        = int(port)
+        self.mycall      = self._norm_call(mycall)
+        self.target_call = self._norm_call(target_call)
+        self.radio_port  = int(radio_port)
+        # QtC's own backstop. The modem normally reports a failed connect
+        # first (Direwolf: RETRY x FRACK), so this only fires if it never
+        # answers at all.
+        self.timeout     = timeout
+        self.modem_name  = modem_name
+        # Largest payload QtC puts in one 'D' frame. Direwolf re-splits to
+        # its own PACLEN; the cap keeps a long send under Direwolf's ~2 KB
+        # receive buffer, which drops the client when exceeded.
+        self.max_frame_data = max_frame_data
+        # Callsign the modem uses for the far end — replaced by the
+        # call_from of its 'C' reply once connected.
+        self.remote_call = self.target_call
+
+        self.sock        = None
+        self.connected   = False
+        self.agw_version = None
+        self.radio_ports = []            # descriptions from the 'G' reply
+
+        self._data_buf  = b""            # BBS bytes for read_until & co.
+        self._data_lock = threading.Lock()
+        self._send_lock = threading.Lock()   # sendall() from several threads
+        self._stop_evt  = threading.Event()
+        self._reader_thread = None
+        self._line_buf  = ""             # reader-only: partial [RX] line
+        self._terminal_mode = False
+
+        # Reader -> connect()/disconnect() hand-off, all under _cond.
+        self._cond       = threading.Condition()
+        self._replies    = {}            # 'R' / 'G' / 'Y' -> latest data
+        self._link_event = None          # ('C' | 'd', text) of the last link frame
+        self._sock_gone  = False         # modem closed the socket, or we did
+        self._closing    = False         # our own disconnect is in progress
+        self._lost_reason = None         # why the far end or the modem ended it
+
+        self._log = None
+        # Kept for interface parity with VaraTransport. The modem keys the
+        # radio itself (or VOX does) — nothing here drives PTT.
+        self.ptt  = None
+        # Fired when the BBS or the modem ends the link unexpectedly.
+        self._on_disconnected_cb = None
+        self._text_codec = "utf-8"
+        self._abort = threading.Event()
+
+    # Buffer consumers are identical to VaraTransport's — same attribute
+    # names (_data_buf, _data_lock, _abort, _text_codec, _terminal_mode,
+    # _log) — so borrow them instead of keeping a third copy in step.
+    # The readers ask self._link_lost(), which this class overrides.
+    set_text_codec    = VaraTransport.set_text_codec
+    request_abort     = VaraTransport.request_abort
+    clear_abort       = VaraTransport.clear_abort
+    abort_requested   = VaraTransport.abort_requested
+    set_terminal_mode = VaraTransport.set_terminal_mode
+    flush_input       = VaraTransport.flush_input
+    read_until        = VaraTransport.read_until
+    read_until_any    = VaraTransport.read_until_any
+    read_eager        = VaraTransport.read_eager
+    read_all_pending  = VaraTransport.read_all_pending
+    read_raw_bytes    = VaraTransport.read_raw_bytes
+    peek_input        = VaraTransport.peek_input
+
+    # ── Internal helpers ──────────────────────────────────────────
+
+    @staticmethod
+    def _norm_call(call: str) -> str:
+        """Uppercase, and drop a -0 SSID — the modems report SSID 0 as the
+        bare call, and every later frame has to match their spelling."""
+        c = (call or "").strip().upper()
+        if c.endswith("-0"):
+            c = c[:-2]
+        return c
+
+    @staticmethod
+    def _frame_text(data: bytes) -> str:
+        """Status texts end in CR plus a NUL counted in data_len."""
+        return data.split(b"\0", 1)[0].decode("ascii", errors="replace").strip()
+
+    def _emit(self, direction, text):
+        if self._log:
+            self._log(direction, text)
+
+    def _send_frame(self, kind: str, data: bytes = b"",
+                    call_from: str = "", call_to: str = "", pid: int = 0):
+        # 9 characters max so byte 10 of each call field stays NUL.
+        header = self._HDR.pack(
+            self.radio_port, ord(kind), pid,
+            call_from.encode("ascii", errors="replace")[:9],
+            call_to.encode("ascii", errors="replace")[:9],
+            len(data), 0)
+        with self._send_lock:
+            if self.sock is None:
+                raise ConnectionError(f"{self.modem_name} not connected")
+            try:
+                self.sock.sendall(header + data)
+            except OSError as e:
+                raise ConnectionError(
+                    f"Lost the connection to {self.modem_name} — {e}") from e
+
+    def _wait_reply(self, kind: str, timeout: float, while_linked=False):
+        """Wait for the modem's answer to an 'R' / 'G' / 'Y' request.
+        Returns its data, or None on timeout. while_linked=True also stops
+        waiting the moment the link goes down."""
+        with self._cond:
+            self._cond.wait_for(
+                lambda: (kind in self._replies or self._sock_gone
+                         or (while_linked and not self.connected)),
+                timeout)
+            return self._replies.pop(kind, None)
+
+    def _wait_link_event(self, timeout: float):
+        """Wait for the next 'C' / 'd' frame. Returns it, or None."""
+        with self._cond:
+            self._cond.wait_for(
+                lambda: self._link_event is not None or self._sock_gone,
+                timeout)
+            return self._link_event
+
+    def _reader(self):
+        """
+        Single-reader thread — the ONLY caller of recv() on self.sock.
+
+        Reassembles the byte stream into AGW frames (a header can arrive
+        split across recv() calls) and dispatches each one. 'D' data goes
+        into _data_buf exactly as VaraTransport's data reader does, and is
+        streamed as [RX] lines when _terminal_mode is on.
+        """
+        rx = b""
+        while not self._stop_evt.is_set():
+            sock = self.sock
+            if sock is None:
+                break
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                chunk = b""
+            if not chunk:
+                self._on_socket_closed()
+                return
+            rx += chunk
+            while len(rx) >= self.HEADER_LEN:
+                (_port, kind, _pid, call_from, call_to,
+                 data_len, _user) = self._HDR.unpack_from(rx)
+                if data_len > self.MAX_RX_DATA:
+                    self._emit("SYS",
+                        f"{self.modem_name} sent a frame QtC can't read "
+                        f"(length {data_len}) — is {self.host}:{self.port} "
+                        f"really its AGW port?")
+                    self._on_socket_closed()
+                    return
+                end = self.HEADER_LEN + data_len
+                if len(rx) < end:
+                    break
+                data = rx[self.HEADER_LEN:end]
+                rx = rx[end:]
+                self._handle_frame(
+                    chr(kind),
+                    call_from.split(b"\0", 1)[0].decode("ascii", "replace"),
+                    call_to.split(b"\0", 1)[0].decode("ascii", "replace"),
+                    data)
+
+    def _handle_frame(self, kind, call_from, call_to, data):
+        if kind == "D":
+            with self._data_lock:
+                self._data_buf += data
+            if self._terminal_mode:
+                self._stream_lines(data)
+            else:
+                self._line_buf = ""
+        elif kind == "C":
+            text = self._frame_text(data)
+            self._emit("RX-CMD", text)
+            with self._cond:
+                if call_from:
+                    self.remote_call = call_from
+                self.connected   = True
+                self._link_event = ("C", text)
+                self._cond.notify_all()
+        elif kind == "d":
+            text = self._frame_text(data)
+            self._emit("RX-CMD", text)
+            with self._cond:
+                unsolicited = self.connected and not self._closing
+                if unsolicited:
+                    # Set before connected drops — a blocked read raises
+                    # with this text the moment it sees the link gone.
+                    if "RETRYOUT" in text.upper():
+                        self._lost_reason = (
+                            f"Link to {self.remote_call} lost — "
+                            f"{self.modem_name} ran out of retries")
+                    else:
+                        self._lost_reason = f"{self.remote_call} disconnected"
+                self.connected   = False
+                self._link_event = ("d", text)
+                self._cond.notify_all()
+            if unsolicited:
+                self._emit("SYS", self._lost_reason)
+                self._drop_link()
+        elif kind in ("R", "G", "Y"):
+            with self._cond:
+                self._replies[kind] = data
+                self._cond.notify_all()
+        # Anything else ('X' register replies, monitor frames) is not ours.
+
+    def _stream_lines(self, data: bytes):
+        """Emit complete [RX] lines through the shared splitter, so a line
+        split across AX.25 frames is reassembled, not printed in pieces.
+        _line_buf carries the partial line between frames."""
+        def _emit_line(s: str):
+            if s:
+                self._emit("RX", s)
+
+        text = data.decode(self._text_codec, errors="replace")
+        self._line_buf = _stream_rx_lines(text, self._line_buf, _emit_line)
+
+    def _on_socket_closed(self):
+        """The modem closed the socket (or quit), or we closed it."""
+        with self._cond:
+            unsolicited = (self.connected and not self._closing
+                           and not self._stop_evt.is_set())
+            if unsolicited:
+                self._lost_reason = (
+                    f"{self.modem_name} closed the connection — the link to "
+                    f"{self.remote_call} is gone")
+            self.connected  = False
+            self._sock_gone = True
+            self._cond.notify_all()
+        if unsolicited:
+            self._emit("SYS", self._lost_reason)
+            self._drop_link()
+
+    def _drop_link(self):
+        """Tear down after the far end or the modem ended the link.
+        Runs on the reader thread, like VaraTransport's cmd monitor."""
+        self._stop_evt.set()
+        if self._on_disconnected_cb:
+            self._on_disconnected_cb()
+        self._cleanup()
+
+    def _link_lost(self):
+        """Why a blocked BBS read should stop now, or None while linked.
+
+        Once the modem reports the link gone, nothing more can arrive. The
+        one reader thread files every 'D' frame into _data_buf before it
+        handles the 'd' that follows, so a read still matches anything
+        that got through first. Waiting out MIN_REPLY_WAIT after that cost
+        2+ minutes before the session noticed, and a read that timed out
+        handed back half a message as if it were whole."""
+        if self.connected:
+            return None
+        return self._lost_reason or f"Not linked to {self.remote_call}"
+
+    def _handshake(self):
+        self._send_frame("R")
+        ver = self._wait_reply("R", 3.0)
+        if ver is None or len(ver) < 8:
+            raise ConnectionError(
+                f"{self.host}:{self.port} did not answer like an AGW port.\n"
+                f"Check that {self.modem_name} is running and that its AGW "
+                f"port matches this BBS entry.")
+        major, minor = struct.unpack_from("<II", ver)
+        self.agw_version = f"{major}.{minor}"
+        self._emit("SYS", f"{self.modem_name} AGW version {self.agw_version}")
+
+        self._send_frame("G")
+        info = self._wait_reply("G", 3.0)
+        if info is None:
+            self._emit("SYS", f"{self.modem_name} did not list its channels")
+            return
+        # "1;Port1 first soundcard mono;" — a count, then one description
+        # per port. Port1 in the text is radio port 0 on the wire.
+        parts = self._frame_text(info).split(";")
+        self.radio_ports = [p.strip() for p in parts[1:] if p.strip()]
+        for i, desc in enumerate(self.radio_ports):
+            self._emit("SYS", f"  channel {i}: {desc}")
+        try:
+            count = int(parts[0])
+        except ValueError:
+            return
+        if self.radio_port >= count:
+            raise ConnectionError(
+                f"{self.modem_name} has no channel {self.radio_port} — it "
+                f"reports {count} channel(s), numbered from 0. Set Channel in "
+                f"the BBS entry to match CHANNEL in the modem's config.")
+
+    def _open_link(self):
+        with self._cond:
+            self._link_event = None
+        self._emit("TX-CMD",
+            f"CONNECT {self.mycall} {self.target_call} "
+            f"(channel {self.radio_port})")
+        self._send_frame("C", call_from=self.mycall, call_to=self.target_call)
+        self._emit("SYS",
+            f"Waiting for {self.modem_name} connection to {self.target_call}…")
+
+        event = self._wait_link_event(self.timeout)
+        if event and event[0] == "C":
+            self._emit("SYS",
+                f"{self.modem_name} connected to {self.remote_call}")
+            return
+        if event and event[0] == "d":
+            if "RETRYOUT" in event[1].upper():
+                why = "no answer"
+            else:
+                why = "no answer, or the station refused the connection"
+            raise ConnectionError(
+                f"{self.modem_name} could not connect to {self.target_call} "
+                f"— {why}")
+        if self._sock_gone:
+            raise ConnectionError(
+                f"{self.modem_name} closed the connection while connecting "
+                f"to {self.target_call}")
+        # Our own backstop fired — cancel the attempt so the modem stops
+        # calling on the air.
+        self._closing = True
+        try:
+            self._send_frame("d", call_from=self.mycall,
+                             call_to=self.target_call)
+            self._wait_link_event(10)
+        except ConnectionError:
+            pass
+        raise ConnectionError(
+            f"Timed out waiting for {self.modem_name} connection to "
+            f"{self.target_call}")
+
+    def _wait_for_tx_drain(self, limit_secs: float = 60):
+        """Poll 'Y' until nothing is queued or unacknowledged on the link,
+        so the `b` sent just before disconnect() actually reaches the BBS."""
+        self.wait_until_sent(stall_secs=limit_secs,
+                             why="before disconnecting")
+
+    def wait_until_sent(self, stall_secs: float = 180, why: str = "") -> bool:
+        """Block until everything handed to the modem is on the air and
+        acknowledged — 'Y' reports 0 frames outstanding.
+
+        Until then the BBS has not even received the end of what we sent,
+        so it cannot have answered: a reply wait started earlier is timing
+        our own transmission. At 300 baud with MAXFRAME 1 each frame and
+        its RR take ~5 s, so a 2 KB message body stays on the air longer
+        than the 120 s silence floor, and the wait for "Message nnn saved"
+        would run out while Direwolf is still sending the body.
+
+        Gives up only when the count stops going down for `stall_secs` —
+        never on total time; frame size, PACLEN and MAXFRAME don't matter.
+        Returns True once nothing is outstanding (or the modem doesn't
+        answer 'Y'), False if the link dropped or stalled.
+        """
+        reported, last_change, last_note = None, time.time(), 0.0
+        while self.connected:
+            with self._cond:
+                self._replies.pop("Y", None)
+            self._send_frame("Y", call_from=self.mycall,
+                             call_to=self.remote_call)
+            reply = self._wait_reply("Y", 2.0, while_linked=True)
+            if reply is None or len(reply) < 4:
+                # Link already gone, or the modem doesn't answer 'Y' for it.
+                return self.connected
+            outstanding = struct.unpack_from("<I", reply)[0]
+            if outstanding == 0:
+                return True
+            now = time.time()
+            if outstanding != reported:
+                last_change = now
+                reported = outstanding
+                # First count, then at most every 30 s — a long body would
+                # otherwise log one line per acknowledged frame.
+                if now - last_note >= 30:
+                    self._emit("SYS",
+                        f"Waiting for {outstanding} frame(s) to be "
+                        f"acknowledged {why}…".replace("  ", " "))
+                    last_note = now
+            elif now - last_change >= stall_secs:
+                self._emit("SYS",
+                    f"{outstanding} frame(s) still unacknowledged — no "
+                    f"progress in {int(stall_secs)} s")
+                return False
+            time.sleep(1.0)
+        return False
+
+    def _cleanup(self):
+        """Close the socket — called after disconnect or on error."""
+        self._stop_evt.set()
+        with self._send_lock:
+            sock, self.sock = self.sock, None
+        if sock:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                sock.close()
+            except OSError:
+                pass
+        with self._cond:
+            self.connected  = False
+            self._sock_gone = True
+            self._cond.notify_all()
+
+    # ── Public interface (mirrors VaraTransport) ──────────────────
+
+    def connect(self):
+        """
+        Open the AGW socket, check the modem, and bring up the AX.25 link.
+        Raises ConnectionError if anything fails.
+        """
+        if not self.target_call:
+            raise ConnectionError("No BBS callsign set.")
+        for call in (self.mycall, self.target_call):
+            if len(call) > 9:
+                raise ConnectionError(
+                    f"Callsign {call} is too long for AX.25 packet "
+                    f"(9 characters at most, e.g. N0CALL-15).")
+        try:
+            self.sock = socket.create_connection((self.host, self.port),
+                                                 timeout=5)
+        except OSError as e:
+            self.sock = None
+            raise ConnectionError(
+                f"Cannot reach {self.modem_name} AGW port "
+                f"{self.host}:{self.port} — {e}\n"
+                f"Is {self.modem_name} running?")
+        # Short timeout so the reader notices _stop_evt promptly. Sends
+        # are a few hundred bytes to a local socket, well inside it.
+        self.sock.settimeout(0.5)
+        self._stop_evt.clear()
+        with self._cond:
+            self._replies.clear()
+            self._link_event = None
+            self._sock_gone  = False
+            self._closing    = False
+            self._lost_reason = None
+        self._reader_thread = threading.Thread(
+            target=self._reader, daemon=True, name="agw-reader")
+        self._reader_thread.start()
+
+        try:
+            self._handshake()
+            self._open_link()
+        except Exception:
+            self._cleanup()
+            raise
+
+    def disconnect(self):
+        """
+        Clean disconnect — let the modem deliver what's queued (the `b`),
+        then ask it for a DISC and wait for confirmation before closing.
+        """
+        if not (self.sock and self.connected):
+            self._cleanup()
+            return
+        self._closing = True
+        try:
+            self._wait_for_tx_drain()
+            if self.connected and self.HANGUP_WAIT_SECS:
+                # Let the BBS end it — see HANGUP_WAIT_SECS
+                with self._cond:
+                    self._cond.wait_for(
+                        lambda: not self.connected or self._sock_gone,
+                        self.HANGUP_WAIT_SECS)
+                if not self.connected:
+                    self._emit("SYS", f"{self.remote_call} hung up")
+            if self.connected:
+                with self._cond:
+                    self._link_event = None
+                self._emit("TX-CMD", f"DISCONNECT {self.remote_call}")
+                self._send_frame("d", call_from=self.mycall,
+                                 call_to=self.remote_call)
+                if self._wait_link_event(60) is None:
+                    self._emit("SYS",
+                        f"No disconnect confirmation from {self.modem_name} "
+                        f"— closing anyway")
+        except ConnectionError:
+            pass
+        self._cleanup()
+
+    def abort(self):
+        """Immediate disconnect — no drain. Still sends 'd' so the modem
+        puts a DISC on the air instead of silently dropping the link."""
+        self._closing = True
+        if self.sock and self.connected:
+            try:
+                self._send_frame("d", call_from=self.mycall,
+                                 call_to=self.remote_call)
+                time.sleep(0.5)   # let the modem act before the socket closes
+            except ConnectionError:
+                pass
+        self._cleanup()
+
+    def send(self, text):
+        """Send text to the BBS. Lines end in CR only — the packet
+        convention; LinBPQ treats CR as end of line."""
+        if isinstance(text, str):
+            text = (text + "\r").encode("utf-8", errors="replace")
+        self.send_raw(text)
+
+    def send_raw(self, data: bytes):
+        """Send raw bytes without a line ending. Used for YAPP ACK/NAK bytes."""
+        if not self.connected:
+            raise ConnectionError(f"{self.modem_name} not connected")
+        for i in range(0, len(data), self.max_frame_data):
+            self._send_frame("D", data[i:i + self.max_frame_data],
+                             call_from=self.mycall, call_to=self.remote_call,
+                             pid=self.PID_TEXT)
 
 
 class VaraControl:
@@ -917,18 +1680,27 @@ class VaraControl:
         self._busy_last_update = 0.0
         self._reader_thread = None
         self._reader_stop = threading.Event()
+        # Bumped by close(). open(gen=...) from a background re-link does
+        # nothing if a close() happened since the caller read `gen` — so a
+        # re-link in flight can never take the port back from a session
+        # that is just starting.
+        self.gen = 0
 
     def _emit(self, direction: str, text: str):
         if self._log:
             self._log(direction, text)
 
-    def open(self) -> bool:
+    def open(self, gen: int = None) -> bool:
         """
         Open both the command (8300) and data (8301) sockets.
         Returns True if at least the command port connected.
         Never raises.  Safe to call multiple times.
+        gen: skip the open if close() was called since this value of
+        self.gen was read.
         """
         with self._lock:
+            if gen is not None and gen != self.gen:
+                return False
             # Command port
             if not self._sock:
                 try:
@@ -967,6 +1739,7 @@ class VaraControl:
         """Close both sockets and stop the busy-reader thread."""
         self._reader_stop.set()
         with self._lock:
+            self.gen += 1
             for sock in (self._sock, self._data_sock):
                 if sock:
                     try:
@@ -1008,10 +1781,17 @@ class VaraControl:
             except socket.timeout:
                 continue
             except OSError:
+                self._drop_dead(sock)
+                buf = b""
                 self._reader_stop.wait(0.5)
                 continue
             if not chunk:
-                # Socket closed by VARA — wait briefly and let open() reopen
+                # Socket closed by VARA (VARA quit). Forget both sockets so
+                # is_open goes False and the GUI's re-link timer can reopen
+                # them once VARA is back — until 2026-10-01 a dead socket
+                # stayed "open" for good.
+                self._drop_dead(sock)
+                buf = b""
                 self._reader_stop.wait(1.0)
                 continue
             buf += chunk
@@ -1035,6 +1815,22 @@ class VaraControl:
                 elif upper.startswith("BUSY OFF"):
                     self._busy = False
                     self._busy_last_update = time.time()
+
+    def _drop_dead(self, sock):
+        """Forget both sockets after the cmd socket `sock` died, unless
+        open()/close() already replaced it in the meantime."""
+        with self._lock:
+            if self._sock is not sock:
+                return
+            for s in (self._sock, self._data_sock):
+                if s:
+                    try:
+                        s.close()
+                    except OSError:
+                        pass
+            self._sock      = None
+            self._data_sock = None
+            self._busy      = False
 
     def send(self, cmd: str) -> bool:
         """
@@ -1072,10 +1868,6 @@ class VaraControl:
         if up in ("NARROW", "WIDE"):
             return self.send(up)
         return self.send(f"BW{up}")
-
-    def set_mycall(self, callsign: str) -> bool:
-        """Send MYCALL <callsign>."""
-        return self.send(f"MYCALL {callsign.upper()}")
 
     @property
     def is_open(self) -> bool:

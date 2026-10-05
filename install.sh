@@ -65,6 +65,10 @@ install_app_files() {
     if [ -f "$SCRIPT_DIR/README.txt" ]; then
         cp "$SCRIPT_DIR/README.txt" "$INSTALL_DIR/"
     fi
+    # Version history — the changelog lives here now, not in the READMEs.
+    if [ -f "$SCRIPT_DIR/VERSION" ]; then
+        cp "$SCRIPT_DIR/VERSION" "$INSTALL_DIR/"
+    fi
     if [ -f "$SCRIPT_DIR/LICENSE" ]; then
         cp "$SCRIPT_DIR/LICENSE" "$INSTALL_DIR/"
     fi

@@ -1,4 +1,4 @@
-# QtC v0.14.0-beta — ptt.py  (built 2026-06-13)
+# QtC v0.15.0-beta — ptt.py  (built 2026-10-04)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -72,16 +72,14 @@ def list_serial_ports() -> list[str]:
     """
     ports = []
     if sys.platform.startswith("win"):
-        # Windows — try COM1..COM32
-        import serial
-        for i in range(1, 33):
-            name = f"COM{i}"
-            try:
-                s = serial.Serial(name)
-                s.close()
-                ports.append(name)
-            except Exception:
-                pass
+        # Windows — ask the OS for its COM ports; never open one to find
+        # out. This used to open and close COM1..COM32 in turn, and
+        # opening a port raises RTS and DTR on Windows: every time the
+        # Settings dialog opened, a Digirig (PTT on RTS) keyed the radio
+        # for a blip (Bill, HP laptop, 2026-10-04).
+        from serial.tools import list_ports
+        ports = sorted((p.device for p in list_ports.comports()),
+                       key=lambda n: (len(n), n))   # COM3 before COM10
     else:
         # Linux / macOS
         for pattern in (
@@ -142,14 +140,21 @@ class PTTController:
             try:
                 # Disable hardware/software flow control so pyserial doesn't
                 # auto-manage RTS/DTR for us — we drive those lines for PTT.
-                self._ser = serial.Serial(
-                    port     = self.port,
-                    baudrate = 9600,       # baudrate irrelevant for RTS/DTR
-                    timeout  = 0,
-                    rtscts   = False,
-                    dsrdtr   = False,
-                    xonxoff  = False,
-                )
+                # Build the port closed and set both lines low BEFORE
+                # open(): serial.Serial(port=...) opens at once with RTS
+                # and DTR raised, which keys a Digirig for a blip until
+                # _set_lines(False) catches up.
+                ser = serial.Serial()
+                ser.port     = self.port
+                ser.baudrate = 9600        # baudrate irrelevant for RTS/DTR
+                ser.timeout  = 0
+                ser.rtscts   = False
+                ser.dsrdtr   = False
+                ser.xonxoff  = False
+                ser.rts      = False
+                ser.dtr      = False
+                ser.open()
+                self._ser = ser
                 # Start in RX (lines low)
                 self._set_lines(False)
                 self.last_error = ""
