@@ -1,5 +1,16 @@
 # QtC — BBS Client for Amateur Radio  
-**Beta** · Linux · Windows 11 · Raspberry Pi
+**Development branch `dev` — v0.16.0-dev** · Linux · Windows 11 · Raspberry Pi
+
+> ⚠️ **You are on the `dev` branch.** This is work in progress for testers and
+> developers, **not a release**. It may break, and settings it adds may change.
+> For the stable release, use the [`main` branch](https://github.com/Bill-Johnson/QtC/tree/main)
+> or the [Releases page](https://github.com/Bill-Johnson/QtC/releases).
+> There are no downloads for `-dev` builds — **run it from a git clone** (below).
+
+> 📘 **New to QtC?** The basics — what QtC does, installing a release, first-time
+> setup, VARA and packet setup — are also on the
+> **[main branch README](https://github.com/Bill-Johnson/QtC/blob/main/README.md)**.
+> This page adds what is new on `dev`: getting the dev code, and the experimental modems.
 
 > *QTC — Q-code for "I have messages for you."*
 
@@ -11,9 +22,124 @@ three-pane GUI.
 
 Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 
+**New on `dev`:** three experimental open-source modems that speak VARA's TCP
+interface — **[Mercury](https://github.com/Rhizomatica/mercury)**,
+**[Data2G](https://github.com/arodland/Data2G)** and
+**[VardeFM](https://github.com/notepid/vardeFM)** — behind a Settings switch.
+Mercury and Data2G have completed full BBS mail sessions over HF with QtC.
+What we measured, and how to set each one up, is in **[dev_notes.txt](dev_notes.txt)**.
+Feedback is very welcome: open an [Issue](https://github.com/Bill-Johnson/QtC/issues).
+
+---
+
+## Get the dev branch (run from a git clone)
+
+You need **git**, **Python 3.10+**, **PyQt6** and **pyserial**. Nothing is
+installed system-wide — QtC runs from the folder you clone.
+
+> **Note `-b dev`** in the clone command. Without it you get `main`, the release.
+
+### Linux / Raspberry Pi
+
+Install what QtC needs (once):
+
+```bash
+# Fedora
+sudo dnf install git python3-pyqt6 python3-pyserial
+
+# Ubuntu / Debian / Raspberry Pi OS
+sudo apt install git python3-pyqt6 python3-pyserial
+```
+
+Clone and run (in a terminal):
+
+```bash
+cd ~
+git clone -b dev https://github.com/Bill-Johnson/QtC.git QtC-dev
+cd ~/QtC-dev
+python3 main_window.py
+```
+
+**Update** to the newest dev code later:
+
+```bash
+cd ~/QtC-dev
+git pull
+python3 main_window.py
+```
+
+**Keep dev testing out of your real mailbox (recommended).** Start it with its
+own data folder; your normal QtC settings and mail in `~/.local/share/qtc` are
+not touched:
+
+```bash
+cd ~/QtC-dev
+XDG_DATA_HOME=~/qtc-dev-data python3 main_window.py
+```
+
+### Windows 11
+
+1. Install **Python 3.12** from [python.org](https://www.python.org/downloads/) —
+   on the first installer screen tick **"Add python.exe to PATH"**.
+2. Install **Git for Windows** from [git-scm.com](https://git-scm.com/download/win) — the defaults are fine.
+3. Open **PowerShell** (Start → type *PowerShell*). These commands are for
+   PowerShell, not the old Command Prompt.
+
+```powershell
+cd $HOME
+git clone -b dev https://github.com/Bill-Johnson/QtC.git QtC-dev
+cd $HOME\QtC-dev
+py -m pip install -r requirements.txt
+py main_window.py
+```
+
+**Update** to the newest dev code later (PowerShell):
+
+```powershell
+cd $HOME\QtC-dev
+git pull
+py main_window.py
+```
+
+**Keep dev testing out of your real mailbox (recommended).** In PowerShell, this
+gives the dev copy its own data folder for that window only; your normal QtC in
+`%APPDATA%\qtc` is not touched:
+
+```powershell
+cd $HOME\QtC-dev
+$env:APPDATA = "$HOME\qtc-dev-data"
+py main_window.py
+```
+
+**Reporting a problem:** open an [Issue](https://github.com/Bill-Johnson/QtC/issues)
+with your OS, the modem and its version, what you did, and the Debug view text
+(**View → Debug View**, or F4) around the problem. Please remove passwords before posting.
+
 ---
 
 ## Screenshots
+
+### New on `dev` — experimental modems
+
+![New modems in the BBS entry dialog](screenshots/dev_1_New_Modems.png)
+*Settings → BBS List → Edit — with **Experimental modems** turned on, Mercury, Data2G and VardeFM join VARA, Telnet and packet in the Transport list*
+
+![Mail and bulletins brought in over Mercury and Data2G](screenshots/dev_2_Mail_and_Bulletins.png)
+*Mail view after sessions over Mercury and Data2G — new personal mail in the Inbox and new SITREP bulletins, downloaded automatically (test mailbox, fake callsigns)*
+
+![Mercury session in the Terminal view](screenshots/dev_3_Mercury_Terminal.png)
+*Terminal view during a Mercury session at BW500 — the BBS listing and message 405 in, while QtC fetches the next (2 of 3)*
+
+![Data2G session in the Terminal view](screenshots/dev_4_Data2G_Terminal.png)
+*Terminal view of a Data2G session at BW500 — the same mail run, noticeably faster*
+
+![Mercury's log during a QtC session](screenshots/dev_5_Mercury_Log.png)
+*Mercury's own log as QtC drives it — BW500, MYCALL and CONNECT received, connected, then the transmit turns of the session*
+
+![Data2G's window during a session](screenshots/dev_6_Data2G_Modem.png)
+*Data2G's window — each burst's mode and SNR as the link moves between QPSK, 16-QAM and 64-QAM*
+
+### The rest of QtC (0.15.0 release screenshots)
 
 ![Inbox](screenshots/1_Inbox_v0.15.png)
 *Three-pane inbox — folder tree, message list, and preview pane; the toolbar carries the BBS, Mode, Abort and the View dropdown*
@@ -30,10 +156,10 @@ Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 ![BBS List](screenshots/5_BBS_List_v0.15.png)
 *Settings → BBS List — VARA HF, VARA FM, Telnet, Direwolf and (Qt)SoundModem entries, grouped by type*
 
-![Bulletin subscriptions](screenshots/6_Bulletin_Subs.png)
-*Settings → Bulletins — pull the live category list off the BBS (📡 Get categories from BBS…) and check the ones you want*
+![Bulletin subscriptions](screenshots/6_Bulletin_Subs_v0.15.png)
+*Settings → Bulletins — the live category list from your Home BBS, with counts; tick the ones you want*
 
-![Mail-Call !!!](screenshots/7_Mail-Call.png)
+![Mail-Call !!!](screenshots/7_Mail-Call_v0.15.png)
 *Mail-Call !!! — scheduled unattended Home-BBS sessions (once daily, twice daily, every N hours, or custom times)*
 
 ![YAPP file download](screenshots/8_YAPP_Download_v0.15.png)
@@ -54,6 +180,7 @@ Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 - **VARA FM** — packet-voice frequencies with **NARROW / WIDE** bandwidth control; same UI as HF
 - **AX.25 packet** — 300 baud HF and 1200 baud VHF through **Direwolf** or **UZ7HO SoundModem / QtSoundModem**, using the modem's AGW port. The modem can run on another computer on your network (many operators keep SoundModem on a separate Windows PC) — set its address in the BBS entry
 - **Telnet** — LAN / internet nodes for local testing; auto-disconnects after the mail check completes
+- **Experimental modems (dev)** — **Mercury**, **Data2G** and **VardeFM**, open-source modems that use VARA's TCP interface. Turn on **Settings → App → Experimental modems** to see them. Each keeps its own Host / Command port per BBS entry and its own timing. They talk only to the same modem at the other station, not to VARA — so the BBS must run the same modem. See [Experimental Modems Setup](#experimental-modems-setup-dev) and [dev_notes.txt](dev_notes.txt)
 - **PTT** — for VARA, RTS or DTR via serial port, with both lines set low before QtC opens the port, so opening it does not key the radio; defensive flow-control flags for Digirig / CP2105 setups. Packet modems key the radio themselves
 
 ### Mail
@@ -65,7 +192,7 @@ Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 
 ### Bulletins
 - Subscribe by category (SITREP, EWN, WX, BDN, …); browse in the folder tree
-- **Pull the category list off the BBS** — *📡 Get categories from BBS…* runs the node's `LC` command and shows every category it carries, with message counts, as a checkable list; pick subscriptions from what the BBS actually offers instead of typing names blind
+- **Category list straight from the BBS** — QtC runs the node's `LC` command on your first Home BBS connect and every 10 days after, and shows every category it carries, with message counts, as a checkable list; pick subscriptions from what the BBS actually offers instead of typing names blind. *🔄 Refresh now* (while connected) updates it on demand
 - **New-category alerts** — QtC remembers the known category set and drops a 🔔 Notifications entry whenever a brand-new category appears on your BBS
 - **Selection dialog with size estimates** — prune before pulling over slow RF
 - **First-visit backlog management** — only the newest few bulletins per category are kept on a new install (2 on VARA HF and packet, 3 on the roomier VARA FM / Telnet paths); skipped bulletins are tombstoned and never reappear
@@ -127,7 +254,9 @@ Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 
 ---
 
-## Installation
+## Installation (release builds)
+
+> On the `dev` branch? Use [Get the dev branch](#get-the-dev-branch-run-from-a-git-clone) above instead — these steps install the release tarball / exe.
 
 ### Raspberry Pi 4 / 5 (Raspberry Pi OS Bookworm)
 
@@ -229,8 +358,8 @@ Linux/Mac `.tar.gz` release. Requires Python 3.10+, PyQt6, and pyserial.
 1. Open **File → Settings → My Station** — enter callsign, name, QTH, and Home BBS
 2. Go to the **BBS List** tab — add your BBS with its transport (VARA HF, VARA FM, Direwolf, (Qt)SoundModem, or Telnet)
 3. Go to the **PTT** tab — select serial port and signal (RTS recommended for Digirig)
-4. Go to the **Bulletins** tab — click **📡 Get categories from BBS…** to pull the live category list off your node and check the ones you want (or type them by hand, e.g. SITREP, EWN, WX)
-5. Close Settings, select your BBS from the dropdown, and click **⚡ Connect**
+4. Close Settings, select your BBS from the dropdown, and click **⚡ Connect**
+5. After your first connect to your Home BBS, open **Settings → Bulletins** — QtC has already pulled the category list off the node. Tick the ones you want (SITREP, WX, …); **🔄 Refresh now** updates the list while you are connected
 
 On your first connection QtC will ask whether to download all personal messages or new only. After that, only new messages (PN) are fetched automatically — keeping sessions short and efficient over slow RF links.
 
@@ -252,6 +381,24 @@ On your first connection QtC will ask whether to download all personal messages 
 - **Host** is `127.0.0.1` when the modem runs on the same computer as QtC, or that computer's address on your network
 - **Channel** is Direwolf's `CHANNEL` number, or the SoundModem modem (A = 0). Leave it at **0** for one radio
 - The modem keys the radio — set PTT in Direwolf or SoundModem, not in QtC
+
+---
+
+## Experimental Modems Setup (dev)
+
+1. **Settings → App →** tick **Experimental modems**
+2. **Settings → BBS List → Add/Edit** — Transport **Mercury**, **Data2G** or **VardeFM**;
+   **Host** `127.0.0.1` (or the computer running the modem); **Command port** = the
+   modem's command port (8300 by default for all three — use a different one if you
+   run two modems on one computer). The data port is always the next number
+3. **The modem keys the radio** — set PTT in the modem, not in QtC (Settings → PTT stays *None*)
+   - **Data2G:** its **Rig** switch must be **on** for any PTT except VOX — with Rig off it never keys, even with RTS selected
+   - **Mercury:** PTT is *none* unless you start it with `-P serial -A /dev/ttyUSB0` (or Hamlib) — or use VOX
+4. Start the modem **before** you click Connect
+5. The station at the other end must run the **same modem** — these do not talk to VARA, or to each other
+
+Measured settings, levels, timings and known quirks for each modem are in
+**[dev_notes.txt](dev_notes.txt)**.
 
 ---
 
@@ -287,6 +434,13 @@ sqlite3 ~/.local/share/qtc/data/messages.db "DELETE FROM bulletin_tombstones; DE
 ---
 
 ## Known Limitations (Beta)
+
+**Dev branch:**
+- Experimental modems are in testing. Mercury and Data2G have passed full mail sessions on HF; **VardeFM** has not yet been tested on the air; **Modem73** is not supported (it has no connected mode yet)
+- YAPP file transfer over the experimental modems is untested
+- No release downloads for `-dev` builds — run from a git clone (see the top of this page)
+
+**All builds:**
 
 - No rig control yet — set frequency manually on your radio
 - YAPP **upload** not yet implemented (download only)

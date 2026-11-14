@@ -52,10 +52,11 @@ Mail
 Bulletins
 - Subscribe by category (SITREP, EWN, WX, BDN, ...); browse in the
   folder tree
-- Pull the category list off the BBS — "Get categories from BBS..." runs
-  the node's LC command and shows every category it carries, with message
-  counts, as a checkable list; pick subscriptions from what the BBS
-  actually offers instead of typing names blind
+- Category list straight from the BBS — QtC runs the node's LC command on
+  your first Home BBS connect and every 10 days after, and shows every
+  category it carries, with message counts, as a checkable list; pick
+  subscriptions from what the BBS actually offers instead of typing names
+  blind. "Refresh now" (while connected) updates it on demand
 - New-category alerts — QtC remembers the known category set and drops a
   Notifications entry whenever a brand-new category appears on your BBS
 - Selection dialog with size estimates — prune before pulling over slow RF
@@ -257,10 +258,10 @@ First-Time Setup
 2. Go to the BBS List tab — add your BBS with its transport (VARA HF,
    VARA FM, Direwolf, (Qt)SoundModem, or Telnet)
 3. Go to the PTT tab — select serial port and signal (RTS recommended for Digirig)
-4. Go to the Bulletins tab — click "Get categories from BBS..." to pull the
-   live category list off your node and check the ones you want (or type them
-   by hand, e.g. SITREP, EWN, WX)
-5. Close Settings, select your BBS from the dropdown, and click Connect
+4. Close Settings, select your BBS from the dropdown, and click Connect
+5. After your first connect to your Home BBS, open Settings -> Bulletins —
+   QtC has already pulled the category list off the node. Tick the ones you
+   want (SITREP, WX, ...); "Refresh now" updates the list while connected
 
 On your first connection QtC will ask whether to download all personal messages
 or new only. After that, only new messages (PN) are fetched automatically —

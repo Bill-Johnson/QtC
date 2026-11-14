@@ -7,6 +7,46 @@ only place that records what changed and when.
 
 
 ========================================================================
+0.16.0-dev  (2026-11-14)  — development branch, not a release
+========================================================================
+
+WHAT THIS IS
+  The public dev branch. Run it from a git clone (see README.md); there
+  are no release downloads for -dev builds. It adds three experimental
+  open-source modems that use VARA's TCP interface — Mercury, Data2G and
+  VardeFM — behind a Settings switch, and the fixes that made them work.
+  What we measured on the air is in dev_notes.txt.
+
+NEW
+  - Settings > App > "Experimental modems" (off by default) adds
+    Mercury, Data2G and VardeFM to the Mode lists and the BBS entry
+    dialog.
+  - Each VARA-protocol modem has its own timing profile: connect
+    timeout, reply-silence floor, login-nudge floor and disconnect wait.
+    VARA HF / FM keep exactly the values they always had.
+  - Host and Command port per BBS entry for VARA HF/FM and the new
+    modems (data port = command port + 1), like the packet entries.
+    Older entries keep using the config.json values.
+
+FIXED
+  - Modem commands end in CR only, as the VARA spec says. Mercury
+    rejected every command after the first with CR+LF.
+  - Each modem command now waits for its OK / WRONG reply; a refused
+    MYCALL or CONNECT gives a plain error.
+  - A connect that times out sends ABORT, so the modem stops calling.
+  - The idle modem link can no longer reopen during a connect (a late
+    recovery timer took the modem away from a call in progress).
+  - Settings no longer locks up on a bad Home BBS; the Inbox keeps its
+    selection on refresh. (Unreleased fixes from after 0.15.0.)
+  - Test PTT reports errors without crashing.
+
+FOR DEVELOPERS
+  - tests/fake_bbs_vara.py: a small LinBPQ-style mailbox behind any
+    VARA-protocol modem, for testing without a real BBS.
+  - tests/modem_tune.py: hold a TUNE tone while setting levels.
+  - New offline tests: test_vara_cmd_handshake.py, test_vara_profiles.py.
+
+========================================================================
 0.15.0-beta  (2026-10-04)
 ========================================================================
 

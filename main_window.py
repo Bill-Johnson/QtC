@@ -1,4 +1,4 @@
-# QtC v0.15.0-beta — main_window.py  (built 2026-10-01)
+# QtC v0.16.0-dev — main_window.py  (built 2026-11-14)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -13,12 +13,12 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
-APP_VERSION = "0.15.0-beta"  # keep in sync with header comment
+APP_VERSION = "0.16.0-dev"  # keep in sync with header comment
 """
 QtC — Main Window (PyQt6)
 v0.2 — Quick-connect bar, auto-download, terminal swap button
 """
-import sys, json, os, copy, time, threading
+import sys, json, os, copy, re, time, threading
 from datetime import datetime, timedelta
 
 from PyQt6.QtWidgets import (
@@ -39,9 +39,30 @@ from PyQt6.QtGui import (QFont, QColor, QTextCursor, QPalette, QAction, QPixmap,
                          QShortcut, QKeySequence)
 
 from transport import TelnetTransport
+from transport import VARA_MODEMS, vara_address, entry_vara_address
 
 # AX.25 packet modems reached over AGW — transport key -> display name.
 AGW_MODEMS = {"direwolf": "Direwolf", "soundmodem": "(Qt)SoundModem"}
+# Display name <-> key for the VARA-protocol modems (VARA HF/FM, Mercury,
+# Data2G, VardeFM). Profiles live in transport.VARA_MODEMS.
+VARA_BY_NAME = {p["name"]: k for k, p in VARA_MODEMS.items()}
+
+
+def experimental_modems_on(config: dict) -> bool:
+    """Settings > App > Experimental modems (Bill, 2026-11-14)."""
+    return bool((config or {}).get("app", {}).get("experimental_modems", False))
+
+
+def vara_modem_names(config: dict, extra: str = "") -> list:
+    """VARA-protocol modem names to offer: the standard ones, plus the
+    experimental ones when that switch is on. `extra` (a name) is always
+    included, so an entry saved with an experimental modem still shows
+    correctly after the switch is turned off."""
+    show_exp = experimental_modems_on(config)
+    return [p["name"] for p in VARA_MODEMS.values()
+            if show_exp or not p["experimental"] or p["name"] == extra]
+
+
 AGW_DEFAULT_PORT = 8000   # Direwolf and QtSoundModem both default here
 from bbs_session import BBSSession, BBSMailSummary, DownloadAborted
 
@@ -287,32 +308,27 @@ class SessionWorker(QThread):
                            telnet_user=self.config["user"].get("telnet_user", ""),
                            user_info=user_info)
 
-        elif transport in ("vara_hf", "vara_fm"):
+        elif transport in VARA_MODEMS:
             from transport import VaraTransport
-            vara_cfg      = self.config.get("vara", {})
-            prefix        = "hf" if transport == "vara_hf" else "fm"
-            vara_host     = vara_cfg.get(f"{prefix}_host",
-                            vara_cfg.get("hf_host", "127.0.0.1"))
-            vara_cmd_port = vara_cfg.get(f"{prefix}_cmd_port",
-                            vara_cfg.get("hf_cmd_port", 8300))
-            vara_data_port= vara_cfg.get(f"{prefix}_data_port",
-                            vara_cfg.get("hf_data_port", 8301))
+            profile       = VARA_MODEMS[transport]
+            vara_host, vara_cmd_port, vara_data_port = entry_vara_address(
+                self.config.get("vara", {}), e)
             mycall        = self.config["user"]["callsign"]
             target_call   = e.get("callsign", "")
             if not target_call:
                 raise ValueError("No BBS callsign set for VARA connection.")
-            # Pick a sensible default BW per variant in case the entry
-            # lacks a saved value (legacy entries pre-FM-BW support).
-            default_bw = "500" if prefix == "hf" else "NARROW"
+            # Fall back to the modem's default BW when the entry lacks a
+            # saved value (legacy entries pre-FM-BW support). The profile
+            # supplies the timeouts — VARA's are the old fixed values.
+            bw = e.get("bw") if e.get("bw") in profile["bw"] else profile["bw_default"]
             t = VaraTransport(
                 vara_host=vara_host,
                 cmd_port=vara_cmd_port,
                 data_port=vara_data_port,
                 mycall=mycall,
                 target_call=target_call,
-                timeout=90,
-                bandwidth=e.get("bw") or default_bw,
-                vara_type=prefix,
+                bandwidth=bw,
+                profile=profile,
             )
             t._log = lambda d, txt: self.sig_log.emit(f"[{d}] {txt.strip()}")
 
@@ -704,8 +720,9 @@ class SessionWorker(QThread):
         # category and tombstone the rest, so a new user is not handed a
         # backlog. VARA HF and packet are slow, so cap tighter there.
         first_connect = bull_key not in visited
-        first_keep = 2 if self.bbs_entry.get(
-            "transport", "vara_hf") in ("vara_hf", *AGW_MODEMS) else 3
+        _t = self.bbs_entry.get("transport", "vara_hf")
+        first_keep = 2 if (VARA_MODEMS.get(_t, {}).get("bw_style") == "hf"
+                           or _t in AGW_MODEMS) else 3
 
         def _already_have(m):
             return (self.db.bulletin_exists(m.msg_number, bbs_id)
@@ -901,10 +918,7 @@ class SessionWorker(QThread):
                         f"    {cat}  ({count} bulletins currently posted)\n\n"
                         f"To subscribe:\n"
                         f"  - Open Settings → Bulletins\n"
-                        f"  - Click \"📡 Get categories from BBS…\" "
-                        f"and tick {cat}, or\n"
-                        f"  - Add {cat} on its own line in the "
-                        f"Subscriptions box\n\n"
+                        f"  - Tick {cat} in the category list\n\n"
                         f"You'll then receive new {cat} bulletins on "
                         f"your next Home BBS connect.\n\n"
                         f"-- QtC Category Update\n")
@@ -1969,6 +1983,7 @@ class MailView(QWidget):
                     results.append((rd, disp_folder))
 
         # Display results in table
+        self._loaded_folder = None   # search rows mix folders — see load_table
         self.msg_table.setRowCount(0)
         self.preview_header.setText("")
         self.preview_body.clear()
@@ -2063,7 +2078,20 @@ class MailView(QWidget):
             if notifications else "🔔  Notifications")
 
     def load_table(self, rows, folder: str):
-        """Populate the message table for the given folder."""
+        """Populate the message table for the given folder.
+
+        Reloading the folder already on screen keeps the highlight on the
+        same MESSAGE, not the same row. Without that, a Mail-Call download
+        cleared the selection while the table kept keyboard focus, and the
+        next key that reached QtC (an arrow, Space, a tap to wake the
+        screen) selected row 0 — the new message — and marked it read
+        before anyone saw it (Bill, 2026-10-29)."""
+        keep_id = None
+        if folder == getattr(self, "_loaded_folder", None):
+            it = self.msg_table.item(self.msg_table.currentRow(), 1)
+            keep_id = it.data(Qt.ItemDataRole.UserRole) if it else None
+        self._loaded_folder = folder
+
         self.msg_table.setRowCount(0)
         self.preview_header.setText("")
         self.preview_body.clear()
@@ -2085,6 +2113,16 @@ class MailView(QWidget):
             self._fill_inbox_sent(
                 rows, show_from=(folder == "inbox" or is_notif),
                 notifications=is_notif)
+
+        # Re-selecting re-shows the preview cleared above. That message
+        # was already read when it was first selected, so nothing else
+        # gets marked read.
+        if keep_id is not None:
+            for r in range(self.msg_table.rowCount()):
+                it = self.msg_table.item(r, 1)
+                if it and it.data(Qt.ItemDataRole.UserRole) == keep_id:
+                    self.msg_table.setCurrentCell(r, 1)
+                    break
 
     def _short_date(self, raw: str) -> str:
         """Normalize any date string to short DD-Mon format.
@@ -2410,9 +2448,16 @@ class SettingsDialog(QDialog):
     Reads/writes the config dict in-memory; caller saves to disk on Accept.
     """
 
+    # Test PTT result, from its worker thread back to the GUI thread:
+    # "" = keyed OK, otherwise the error text.  Widgets and message boxes
+    # must never be touched off the GUI thread — doing so segfaulted QtC
+    # on Wayland when the port failed to open (2026-10-26).
+    _sig_ptt_test_done = pyqtSignal(str)
+
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
         self._cfg = copy.deepcopy(config)
+        self._orig_home_bbs = (config.get("user", {}) or {}).get("home_bbs", "")
         self._dark = bool(config.get("app", {}).get("dark_mode", False))
         self._note_color = "#aaaaaa" if self._dark else "#666666"
 
@@ -2430,13 +2475,21 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
 
         tabs = QTabWidget()
-        tabs.addTab(self._build_user_tab(),      "👤  My Station")
+        self._tabs = tabs
+        self._tab_user = self._build_user_tab()
+        tabs.addTab(self._tab_user,              "👤  My Station")
         tabs.addTab(self._build_bbs_tab(),       "📡  BBS List")
         tabs.addTab(self._build_ptt_tab(),       "🎙️  PTT")
         tabs.addTab(self._build_bulletins_tab(), "📋  Bulletins")
-        tabs.addTab(self._build_mailcall_tab(),  "📬  Mail-Call !!!")
+        self._tab_mailcall = self._build_mailcall_tab()
+        tabs.addTab(self._tab_mailcall,          "📬  Mail-Call !!!")
         tabs.addTab(self._build_app_tab(),       "⚙️  App")
         layout.addWidget(tabs)
+        # Home BBS (My Station) and the BBS List can both change while
+        # the dialog is open — re-check Mail-Call each time its tab shows.
+        tabs.currentChanged.connect(
+            lambda i: tabs.widget(i) is self._tab_mailcall
+            and self._mc_refresh_availability())
 
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
@@ -2513,8 +2566,7 @@ class SettingsDialog(QDialog):
     _BBS_COLS = ["Type", "Name", "Callsign", "Freq", "BW",
                  "Host", "Port", "Notes"]
     _BBS_TRANSPORT_LABEL = {
-        "vara_hf":    "VARA HF",
-        "vara_fm":    "VARA FM",
+        **{k: p["name"] for k, p in VARA_MODEMS.items()},
         "telnet":     "Telnet",
         **AGW_MODEMS,
     }
@@ -2578,19 +2630,23 @@ class SettingsDialog(QDialog):
         self.bbs_table.setRowCount(0)
         for idx, e in enumerate(self._cfg.get("bbs_list", [])):
             transport = e.get("transport", "telnet")
-            is_vara   = transport in ("vara_hf", "vara_fm")
+            is_vara   = transport in VARA_MODEMS
             is_agw    = transport in AGW_MODEMS
-            has_host  = transport == "telnet" or is_agw   # Host/Port apply
+            has_host  = transport == "telnet" or is_agw or is_vara
             type_lbl  = self._BBS_TRANSPORT_LABEL.get(transport, transport)
             port_val  = (e.get("agw_port", AGW_DEFAULT_PORT) if is_agw
                          else e.get("telnet_port", ""))
+            host_val  = e.get("host", "")
+            if is_vara:     # the modem's address (command port)
+                host_val, port_val, _ = entry_vara_address(
+                    self._cfg.get("vara", {}), e)
             cells = [
                 type_lbl,
                 e.get("name", ""),
                 e.get("callsign", ""),
                 e.get("freq", "") if is_vara else self._BBS_NA,
                 e.get("bw", "")   if is_vara else self._BBS_NA,
-                e.get("host", "") if has_host else self._BBS_NA,
+                host_val          if has_host else self._BBS_NA,
                 str(port_val)     if has_host and port_val != "" else
                                        (self._BBS_NA if not has_host else ""),
                 e.get("notes", ""),
@@ -2708,6 +2764,7 @@ class SettingsDialog(QDialog):
             "QPushButton:hover { background:#7a2020; }"
             "QPushButton:pressed { background:#aa2020; color:#ffffff; }")
         self.btn_ptt_test.clicked.connect(self._ptt_test)
+        self._sig_ptt_test_done.connect(self._ptt_test_done)
         test_row.addWidget(self.btn_ptt_test)
         test_row.addStretch()
         outer.addLayout(test_row)
@@ -2763,26 +2820,33 @@ class SettingsDialog(QDialog):
         self.btn_ptt_test.setEnabled(False)
         self.btn_ptt_test.setText("🔴  Keying…")
         def _do_test():
+            err = ""
             try:
                 ptt = PTTController(port=port, mode=signal)
                 ptt.open()
                 if not ptt.is_open:
-                    QMessageBox.warning(
-                        self, "PTT Error",
-                        f"Could not open {port}:\n\n"
-                        f"{ptt.last_error or 'unknown error'}\n\n"
-                        f"This port may be open in Vara Terminal or another "
-                        f"PTT-driving app — only one program can hold the "
-                        f"COM port. Close it and try again.")
-                    return
-                ptt.test(duration=1.0)
-                ptt.close()
+                    err = (f"Could not open {port}:\n\n"
+                           f"{ptt.last_error or 'unknown error'}\n\n"
+                           f"This port may be open in Vara Terminal or another "
+                           f"PTT-driving app — only one program can hold the "
+                           f"COM port. Close it and try again.")
+                else:
+                    ptt.test(duration=1.0)
+                    ptt.close()
             except Exception as exc:
-                QMessageBox.warning(self, "PTT Error", str(exc))
-            finally:
-                self.btn_ptt_test.setEnabled(True)
-                self.btn_ptt_test.setText("🔴  Test PTT  (1 second key)")
+                err = str(exc) or exc.__class__.__name__
+            try:
+                self._sig_ptt_test_done.emit(err)
+            except RuntimeError:
+                pass   # Settings closed while keying — nothing left to update
         threading.Thread(target=_do_test, daemon=True).start()
+
+    def _ptt_test_done(self, err: str):
+        """GUI-thread end of _ptt_test(): restore the button, report any error."""
+        self.btn_ptt_test.setEnabled(True)
+        self.btn_ptt_test.setText("🔴  Test PTT  (1 second key)")
+        if err:
+            QMessageBox.warning(self, "PTT Error", err)
 
     # ── Tab: App preferences ──────────────────────────────────────
 
@@ -2951,7 +3015,7 @@ class SettingsDialog(QDialog):
     def _is_connected_for_bulletins(self) -> bool:
         """True when the parent main window is connected AND logged in.
 
-        Gates the "📡 Get categories from BBS…" button, which sends LC —
+        Gates the "🔄 Refresh now" button, which sends LC —
         so the gate has to mean logged in, not just "a session object
         exists". Until v0.15.0 this read a hidden Refresh button's enabled
         flag through getattr, which would have failed silently (button
@@ -3196,29 +3260,17 @@ class SettingsDialog(QDialog):
         info_form.setVerticalSpacing(8)
         info_form.setContentsMargins(0, 4, 0, 4)
 
-        home_bbs = u.get("home_bbs", "").strip()
-        home_bbs_display = home_bbs or "(not set — configure in My Station)"
-        self.lbl_mc_home = QLabel(home_bbs_display)
+        # Text is filled in by _mc_refresh_availability()
+        self.lbl_mc_home = QLabel()
         self.lbl_mc_home.setStyleSheet("font-family: 'Courier New'; font-weight: bold;")
         info_form.addRow("Home BBS:", self.lbl_mc_home)
 
         # Connection picker — every bbs_list entry whose callsign matches
         # the Home BBS. Stored as a composite key so reorders/edits to
-        # bbs_list don't lose the user's choice.
+        # bbs_list don't lose the user's choice. Filled (and re-filled)
+        # by _mc_refresh_availability().
         self.combo_mc_connection = QComboBox()
         self.combo_mc_connection.setMinimumWidth(280)
-        matching = self._mc_matching_entries()
-        for entry in matching:
-            self.combo_mc_connection.addItem(
-                self._mc_entry_label(entry), userData=entry)
-        # Restore saved selection by composite key, else default to first
-        saved_key = mc.get("bbs_key") or {}
-        for i, entry in enumerate(matching):
-            if self._mc_entry_key(entry) == saved_key:
-                self.combo_mc_connection.setCurrentIndex(i)
-                break
-        # If no matches, dropdown stays empty and gets disabled
-        # alongside the rest of the tab below.
         info_form.addRow("Connection:", self.combo_mc_connection)
 
         self.rb_mc_tz_local = QRadioButton("Local")
@@ -3390,33 +3442,88 @@ class SettingsDialog(QDialog):
         # the RF-specific reminder banner + Review link apply.
         self.combo_mc_connection.currentIndexChanged.connect(
             self._mc_update_reminder)
-        self._mc_update_enabled_state()
-        self._mc_update_reminder()
+        # Hint shown under the Enable checkbox when there's no usable
+        # connection to the Home BBS. Hidden otherwise.
+        self.lbl_mc_hint = QLabel()
+        self.lbl_mc_hint.setStyleSheet("color:#ff8844; font-size:11px;")
+        self.lbl_mc_hint.setWordWrap(True)
+        self.lbl_mc_hint.hide()
+        outer.insertWidget(1, self.lbl_mc_hint)
 
-        # Disable the whole tab content if there's no usable connection to
-        # the Home BBS — either Home BBS isn't set, or no bbs_list entry
-        # matches it.
-        if not home_bbs:
-            self._mc_disable_tab(outer, sched_box,
-                "<i>Set a Home BBS in the My Station tab to enable Mail-Call !!!.</i>")
-        elif not matching:
-            home_base = self._base_callsign(home_bbs)
-            self._mc_disable_tab(outer, sched_box,
-                f"<i>No BBS List entry matches Home BBS <b>{home_bbs}</b>. "
-                f"Add a BBS List entry with callsign <b>{home_base}</b> "
-                f"(or <b>{home_base}-N</b>) to enable Mail-Call !!!.</i>")
+        self._mc_sched_box = sched_box
+        self._mc_auto_off = ""   # why we unticked Enable ourselves, if we did
+        self._mc_refresh_availability()
 
         return w
 
-    def _mc_disable_tab(self, outer_layout, sched_box, hint_html: str):
-        """Grey out the Mail-Call tab content and show a hint at the top."""
-        for widget in (self.chk_mc_enabled, sched_box, self.lbl_mc_home,
-                       self.combo_mc_connection):
-            widget.setEnabled(False)
-        hint = QLabel(hint_html)
-        hint.setStyleSheet("color:#ff8844; font-size:11px;")
-        hint.setWordWrap(True)
-        outer_layout.insertWidget(1, hint)
+    def _mc_live_home_bbs(self) -> str:
+        """Home BBS as currently typed in My Station (not yet saved)."""
+        if hasattr(self, "e_home_bbs"):
+            return self.e_home_bbs.text().strip().upper()
+        return self._cfg.get("user", {}).get("home_bbs", "").strip().upper()
+
+    def _mc_refresh_availability(self):
+        """
+        Re-check whether Mail-Call has a usable connection to the Home BBS
+        and set the tab up to match.
+
+        Reads the Home BBS as typed right now and the BBS List as edited
+        right now, so a fix made elsewhere in this dialog takes effect
+        without reopening Settings.
+
+        If there's no usable connection, the Enable box is UNTICKED before
+        it's greyed out. Greying out a ticked box left OK refusing to save
+        ("disable Mail-Call") with no way to untick it — a beta tester
+        had to delete config.json to get out (2026-10-26).
+        """
+        home = self._mc_live_home_bbs()
+        matching = self._mc_matching_entries()
+
+        # Rebuild the Connection list, keeping the current pick if it's
+        # still there, else the saved one, else the first.
+        cur = self._mc_selected_entry()
+        want = (self._mc_entry_key(cur) if cur else
+                (self._cfg.get("mail_call", {}) or {}).get("bbs_key") or {})
+        combo = self.combo_mc_connection
+        combo.blockSignals(True)
+        combo.clear()
+        for entry in matching:
+            combo.addItem(self._mc_entry_label(entry), userData=entry)
+        for i, entry in enumerate(matching):
+            if self._mc_entry_key(entry) == want:
+                combo.setCurrentIndex(i)
+                break
+        combo.blockSignals(False)
+
+        self.lbl_mc_home.setText(home or "(not set — configure in My Station)")
+
+        if not home:
+            self._mc_unusable_reason = (
+                "Set a Home BBS in the My Station tab to enable Mail-Call !!!.")
+        elif not matching:
+            home_base = self._base_callsign(home)
+            self._mc_unusable_reason = (
+                f"No BBS List entry matches Home BBS <b>{home}</b>. "
+                f"Add a BBS List entry with callsign <b>{home_base}</b> "
+                f"(or <b>{home_base}-N</b>) to enable Mail-Call !!!.")
+        else:
+            self._mc_unusable_reason = ""
+        usable = not self._mc_unusable_reason
+
+        if not usable and self.chk_mc_enabled.isChecked():
+            self.chk_mc_enabled.blockSignals(True)
+            self.chk_mc_enabled.setChecked(False)
+            self.chk_mc_enabled.blockSignals(False)
+            self._mc_auto_off = self._mc_unusable_reason
+
+        for widget in (self.chk_mc_enabled, self._mc_sched_box,
+                       self.lbl_mc_home, combo):
+            widget.setEnabled(usable)
+        self.lbl_mc_hint.setText(f"<i>{self._mc_unusable_reason}</i>")
+        self.lbl_mc_hint.setVisible(not usable)
+
+        self._mc_update_enabled_state()
+        self._mc_update_reminder()
 
     def _mc_update_enabled_state(self):
         """Gate child widgets on the enable checkbox + selected schedule mode."""
@@ -3477,11 +3584,78 @@ class SettingsDialog(QDialog):
         s = s.split('-', 1)[0]   # drop SSID suffix
         return s
 
+    @staticmethod
+    def _home_bbs_problem(addr: str) -> str:
+        """
+        "" if `addr` looks like a Home BBS hierarchical address, else a
+        short HTML explanation of what's wrong.
+
+        Valid shape: BBS callsign (optional -SSID), then dot-separated
+        sections, each letters/digits. A section may START with '#' — that
+        marks an area smaller than a state:
+
+          N0CALL.#REGION.ST.USA.NOAM     N0CALL.ST.USA.NOAM     N0CALL
+
+        Blank is fine (Home BBS is optional). This only advises; the user
+        can still save what they typed.
+        """
+        s = (addr or "").strip().upper()
+        if not s:
+            return ""
+        if "@" in s:
+            after = s.rsplit("@", 1)[1]
+            return (f"<b>{s}</b> looks like a full mail address. Home BBS "
+                    f"is only the BBS part — what comes after the @, "
+                    f"for example <b>{after}</b>.")
+        if any(ch.isspace() for ch in s):
+            return "Home BBS can't contain spaces."
+        bad = sorted({ch for ch in s
+                      if not (ch.isascii() and ch.isalnum()) and ch not in ".#-"})
+        if bad:
+            return (f"Home BBS can't contain <b>{' '.join(bad)}</b>. Only "
+                    f"letters, digits, dots, # and - are used.")
+        parts = s.split(".")
+        if "" in parts:
+            return ("Home BBS has an empty section — two dots in a row, or "
+                    "a dot at the start or end.")
+        call = parts[0]
+        if not (re.fullmatch(r"[A-Z0-9]+(-\d{1,2})?", call)
+                and re.search(r"[A-Z]", call) and re.search(r"\d", call)):
+            return (f"Home BBS should start with the BBS callsign, but "
+                    f"<b>{call}</b> doesn't look like one.")
+        for p in parts[1:]:
+            if not re.fullmatch(r"#?[A-Z0-9]+", p):
+                return (f"Section <b>{p}</b> isn't valid. Each section after "
+                        f"the callsign is letters and digits; only a local "
+                        f"area may start with #, like <b>#REGION</b>.")
+        return ""
+
+    def _confirm_odd_home_bbs(self, problem: str) -> bool:
+        """Ask whether to save a Home BBS that _home_bbs_problem() flagged.
+        True = save anyway, False = go back and fix it."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Home BBS")
+        box.setText(
+            f"{problem}<br><br>"
+            "A Home BBS address looks like "
+            "<b>N0CALL.#REGION.ST.USA.NOAM</b> — your BBS's callsign, then "
+            "its area, state, country and continent. Your sysop can tell "
+            "you the exact form.<br><br>"
+            "It's sent to new BBSes when you register, and Mail-Call !!! "
+            "uses it to find your Home BBS.")
+        fix = box.addButton("Go Back and Fix",
+                            QMessageBox.ButtonRole.RejectRole)
+        box.addButton("Save Anyway", QMessageBox.ButtonRole.AcceptRole)
+        box.setDefaultButton(fix)
+        box.exec()
+        return box.clickedButton() is not fix
+
     def _mc_matching_entries(self) -> list:
         """Return all bbs_list entries whose base callsign matches the
-        base callsign of the user's home_bbs (HA address)."""
-        home_base = self._base_callsign(
-            self._cfg.get("user", {}).get("home_bbs", ""))
+        base callsign of the user's home_bbs (HA address), as currently
+        typed in My Station."""
+        home_base = self._base_callsign(self._mc_live_home_bbs())
         if not home_base:
             return []
         return [e for e in self._cfg.get("bbs_list", [])
@@ -3510,8 +3684,7 @@ class SettingsDialog(QDialog):
     def _mc_entry_label(entry: dict) -> str:
         """Human-readable label for the Connection dropdown."""
         transport_map = {
-            "vara_hf": "VARA HF",
-            "vara_fm": "VARA FM",
+            **{k: p["name"] for k, p in VARA_MODEMS.items()},
             "telnet":  "Telnet",
             **AGW_MODEMS,
         }
@@ -3523,7 +3696,9 @@ class SettingsDialog(QDialog):
         elif entry.get("transport") in AGW_MODEMS:
             port = entry.get("agw_port", AGW_DEFAULT_PORT)
         else:
-            port = entry.get("vara_cmd_port", "")
+            # VARA-protocol modem: the entry's own address (a static
+            # method has no config, so an old entry shows the default)
+            host, port, _ = entry_vara_address({}, entry)
         location = f"{host}:{port}" if host and port else (host or "?")
         return f"{entry.get('callsign','?')} — {tname} ({location})"
 
@@ -3570,6 +3745,7 @@ class SettingsDialog(QDialog):
         back off.
         """
         if checked:
+            self._mc_auto_off = ""        # the user is deciding now
             entry = self._mc_selected_entry()
             if entry is None:
                 # No selectable connection — revert. The tab's grey-out
@@ -3587,7 +3763,7 @@ class SettingsDialog(QDialog):
             # fire and could ingest a huge backlog over slow RF.
             if not self._mc_has_visited_home_bbs():
                 home_base = self._base_callsign(
-                    self._cfg.get("user", {}).get("home_bbs", "")) or "(none)"
+                    self._mc_live_home_bbs()) or "(none)"
                 QMessageBox.information(
                     self, "Mail-Call !!! — Connect to Home BBS first",
                     f"<b>Mail-Call can't be enabled yet.</b><br><br>"
@@ -3791,6 +3967,17 @@ class SettingsDialog(QDialog):
         codec_row.addStretch()
 
         form.addRow("", self.chk_dark_mode)
+        # Experimental modems (Bill, 2026-11-14): Mercury, Data2G and
+        # VardeFM speak VARA's TCP interface. Off by default so the Mode
+        # lists stay simple for new users.
+        self.chk_experimental = QCheckBox(
+            "Experimental modems  (Mercury, Data2G, VardeFM)")
+        self.chk_experimental.setChecked(experimental_modems_on(self._cfg))
+        self.chk_experimental.setToolTip(
+            "Adds Mercury, Data2G and VardeFM to the Mode lists. They use\n"
+            "VARA's connection method but only talk to the same modem on\n"
+            "the other station. Still being tested.")
+        form.addRow("", self.chk_experimental)
         form.addRow("Message font size:", font_row)
         form.addRow("", self._font_preview)
         form.addRow("Character set:", codec_row)
@@ -3839,9 +4026,17 @@ class SettingsDialog(QDialog):
                 "Callsign cannot be blank.")
             return
 
+        problem = self._home_bbs_problem(self._cfg["user"]["home_bbs"])
+        if problem and not self._confirm_odd_home_bbs(problem):
+            self._tabs.setCurrentWidget(self._tab_user)
+            self.e_home_bbs.setFocus()
+            self.e_home_bbs.selectAll()
+            return
+
         # App tab
         self._cfg.setdefault("app", {})
         self._cfg["app"]["dark_mode"]            = self.chk_dark_mode.isChecked()
+        self._cfg["app"]["experimental_modems"]  = self.chk_experimental.isChecked()
         self._cfg["app"]["font_size"]            = self.spin_font.value()
         self._cfg["app"]["data_dir"]             = self.e_data_dir.text().strip() or "data"
         self._cfg["app"]["text_codec"]           = self.combo_codec.currentData()
@@ -3887,7 +4082,32 @@ class SettingsDialog(QDialog):
         custom_times = [self.lst_mc_custom.item(i).text()
                         for i in range(self.lst_mc_custom.count())]
         custom_times.sort()
-        if mc_mode == "custom":
+
+        # A Mail-Call problem must never stop the OTHER tabs from saving.
+        # Re-check against the Home BBS and BBS List as they are now; if
+        # Mail-Call can't run, it's saved OFF and the user is told why.
+        self._mc_refresh_availability()
+        mc_off_reason = ""
+        if self._mc_auto_off:
+            mc_off_reason = self._mc_auto_off
+        elif self.chk_mc_enabled.isChecked():
+            # Home BBS moved to a different station in this dialog: the
+            # same "connect once first" rule as ticking Enable applies.
+            old_base = self._base_callsign(self._orig_home_bbs)
+            new_base = self._base_callsign(self._mc_live_home_bbs())
+            if new_base != old_base and not self._mc_has_visited_home_bbs():
+                mc_off_reason = (
+                    f"Your Home BBS is now <b>{new_base}</b>. Connect to it "
+                    f"once from the toolbar Connect button, then turn "
+                    f"Mail-Call !!! back on.")
+        if mc_off_reason:
+            self.chk_mc_enabled.blockSignals(True)
+            self.chk_mc_enabled.setChecked(False)
+            self.chk_mc_enabled.blockSignals(False)
+
+        # Schedule rules only matter if Mail-Call is going to run. While
+        # it's on, every widget these messages point at is clickable.
+        if self.chk_mc_enabled.isChecked() and mc_mode == "custom":
             err = self._mc_validate_gap(custom_times)
             if err:
                 QMessageBox.warning(self, "Mail-Call !!! schedule",
@@ -3896,15 +4116,7 @@ class SettingsDialog(QDialog):
                     "scheduled connections. Please adjust the times.")
                 return
 
-        # Refuse OK if Mail-Call is enabled but no connection is picked
-        # (defensive — the tab is greyed out when there are no matches).
         selected_entry = self._mc_selected_entry()
-        if self.chk_mc_enabled.isChecked() and selected_entry is None:
-            QMessageBox.warning(self, "Mail-Call !!!",
-                "Mail-Call is enabled but no connection is selected.\n\n"
-                "Either add a BBS List entry matching your Home BBS "
-                "callsign, or disable Mail-Call.")
-            return
 
         # If the user switched to an RF connection without ever accepting
         # the RF responsibility text, refuse OK and tell them how to fix.
@@ -3933,6 +4145,13 @@ class SettingsDialog(QDialog):
             "responsibility_accepted_rf_version": int(existing_mc.get(
                 "responsibility_accepted_rf_version", 0)),
         }
+
+        if mc_off_reason:
+            QMessageBox.information(self, "Mail-Call !!! turned off",
+                "<b>Your settings were saved, but Mail-Call !!! has been "
+                "turned off.</b><br><br>"
+                f"{mc_off_reason}<br><br>"
+                "Turn it back on in the Mail-Call !!! tab once that's fixed.")
 
         self.accept()
 
@@ -3970,9 +4189,10 @@ class SettingsDialog(QDialog):
 class _BBSEntryDialog(QDialog):
     """Add or edit a single BBS entry."""
 
+    # The VARA-protocol rows are added per dialog (see __init__): the
+    # experimental modems only show when that switch is on, or when the
+    # entry being edited already uses one.
     TRANSPORTS = [
-        ("VARA HF",      "vara_hf"),
-        ("VARA FM",      "vara_fm"),
         ("Telnet",       "telnet"),
         ("Direwolf",     "direwolf"),
         ("(Qt)SoundModem", "soundmodem"),
@@ -3984,6 +4204,18 @@ class _BBSEntryDialog(QDialog):
         self.setWindowTitle("Edit BBS Entry" if entry else "Add BBS Entry")
         self.setMinimumWidth(420)
         e = entry or {}
+        # Experimental modems: the live checkbox when opened from Settings
+        # (so ticking it takes effect before OK), else the saved config.
+        if parent is not None and hasattr(parent, "chk_experimental"):
+            show_exp = parent.chk_experimental.isChecked()
+        else:
+            cfg = getattr(parent, "_cfg", None) or getattr(parent, "config", None)
+            show_exp = experimental_modems_on(cfg)
+        cur_key = e.get("transport", "vara_hf")
+        self.TRANSPORTS = [
+            (p["name"], k) for k, p in VARA_MODEMS.items()
+            if show_exp or not p["experimental"] or k == cur_key
+        ] + list(type(self).TRANSPORTS)
         # Derive note color from parent's dark mode setting if available
         dark = False
         if parent and hasattr(parent, 'config'):
@@ -4042,8 +4274,47 @@ class _BBSEntryDialog(QDialog):
         # matches HF (500/2300 kHz) vs FM (NARROW/WIDE).
         self._vara_initial_bw = e.get("bw", "")
 
+        # Modem address (2026-11-14), like the packet panel's Host / AGW
+        # Port. Blank on an old entry = the config.json "vara" values, so
+        # the boxes show what QtC actually uses. Data port is always the
+        # command port + 1 on every VARA-protocol modem.
+        _pcfg = (getattr(parent, "_cfg", None)
+                 or getattr(parent, "config", None) or {})
+        self._vara_cfg = (_pcfg.get("vara", {})
+                          if isinstance(_pcfg, dict) else {})
+        _vkey = (e.get("transport") if e.get("transport") in VARA_MODEMS
+                 else "vara_hf")
+        _vh, _vc, _ = entry_vara_address(self._vara_cfg,
+                                         dict(e, transport=_vkey))
+        self.e_vara_host = QLineEdit(_vh or "127.0.0.1")
+        self.e_vara_host.setPlaceholderText("127.0.0.1")
+        self.e_vara_host.setToolTip(
+            "Computer running the modem — 127.0.0.1 when it's this one")
+        self.e_vara_port = QLineEdit(str(_vc))
+        self.e_vara_port.setPlaceholderText("8300")
+        self.e_vara_port.setFixedWidth(70)
+        self.e_vara_port.setToolTip(
+            "The modem's command (TCP) port — 8300 is VARA's default, and "
+            "Mercury's, Data2G's and VardeFM's too. Change it when two "
+            "modems run on one computer.")
+        self.l_vara_data = QLabel()
+        self.l_vara_data.setStyleSheet(
+            f"color: {self._note_color}; font-size:11px;")
+        def _data_hint(txt):
+            t = txt.strip()
+            self.l_vara_data.setText(
+                f"data port {int(t) + 1}" if t.isdigit() else "")
+        self.e_vara_port.textChanged.connect(_data_hint)
+        _data_hint(self.e_vara_port.text())
+        vara_port_row = QHBoxLayout()
+        vara_port_row.setSpacing(8)
+        vara_port_row.addWidget(self.e_vara_port)
+        vara_port_row.addWidget(self.l_vara_data, 1)
+
         vara_form.addRow("Frequency (MHz):", self.e_freq)
         vara_form.addRow("Bandwidth:",       self.e_bw)
+        vara_form.addRow("Host:",            self.e_vara_host)
+        vara_form.addRow("Command port:",    vara_port_row)
         layout.addWidget(self.vara_group)
 
         # ── Telnet fields panel ────────────────────────
@@ -4143,11 +4414,8 @@ class _BBSEntryDialog(QDialog):
     # VARA HF bandwidth values are kHz numbers ("BW500" / "BW2300" on the
     # wire). VARA FM uses bare keyword commands ("NARROW" / "WIDE") with
     # no BW prefix — verified against VARA FM modem behavior.
-    _VARA_BW_OPTIONS = {
-        "vara_hf": ["500", "2300"],
-        "vara_fm": ["NARROW", "WIDE"],
-    }
-    _VARA_BW_DEFAULT = {"vara_hf": "500", "vara_fm": "NARROW"}
+    _VARA_BW_OPTIONS = {k: p["bw"] for k, p in VARA_MODEMS.items()}
+    _VARA_BW_DEFAULT = {k: p["bw_default"] for k, p in VARA_MODEMS.items()}
 
     # What each AGW modem calls the "radio port" field in its own config.
     _AGW_CHANNEL_WORDS = {
@@ -4165,7 +4433,7 @@ class _BBSEntryDialog(QDialog):
 
     def _on_transport_changed(self, index: int):
         _, key = self.TRANSPORTS[index]
-        is_vara    = key in ("vara_hf", "vara_fm")
+        is_vara    = key in VARA_MODEMS
         is_telnet  = key == "telnet"
         is_future  = key in self.FUTURE
         is_agw     = key in AGW_MODEMS and not is_future
@@ -4206,6 +4474,12 @@ class _BBSEntryDialog(QDialog):
                       current if current in opts else
                       self._VARA_BW_DEFAULT[key])
             self.e_bw.setCurrentText(picked)
+            # VardeFM has no bandwidth choice — its width is its own
+            # --mode setting — so the box goes grey and empty.
+            self.e_bw.setEnabled(bool(opts))
+            self.e_bw.setToolTip("" if opts else
+                f"{VARA_MODEMS[key]['name']} sets its own width "
+                f"(its --mode setting); QtC sends no bandwidth command.")
             self.e_bw.blockSignals(False)
             # Saved value is only used to seed the first paint; clear it
             # so subsequent transport switches use the live combo value.
@@ -4229,6 +4503,13 @@ class _BBSEntryDialog(QDialog):
         if key == "telnet" and not self.e_host.text().strip():
             QMessageBox.warning(self, "Missing Field", "Host cannot be blank for Telnet.")
             return
+        if key in VARA_MODEMS:
+            p = self.e_vara_port.text().strip()
+            if not (p.isdigit() and 0 < int(p) < 65535):
+                QMessageBox.warning(self, "Invalid Port",
+                    "Command port must be a number from 1 to 65534 "
+                    "(default 8300; the data port is the next number).")
+                return
         if key in AGW_MODEMS and key not in self.FUTURE:
             p = self.e_agw_port.text().strip()
             if not (p.isdigit() and 0 < int(p) < 65536):
@@ -4247,8 +4528,8 @@ class _BBSEntryDialog(QDialog):
             "name":        self.e_name.text().strip(),
             "callsign":    self.e_callsign.text().strip().upper(),
             "transport":   key,
-            "vara_type":   ("hf" if key == "vara_hf" else
-                            "fm" if key == "vara_fm" else None),
+            "vara_type":   (VARA_MODEMS[key]["bw_style"]
+                            if key in VARA_MODEMS else None),
             "freq":        self.e_freq.text().strip(),
             "bw":          "" if is_agw else self.e_bw.currentText(),
             # Telnet and packet both keep their address in "host"
@@ -4257,6 +4538,13 @@ class _BBSEntryDialog(QDialog):
             "telnet_port": int(port) if port.isdigit() else 8010,
             "agw_port":    int(agw_port) if agw_port.isdigit() else AGW_DEFAULT_PORT,
             "agw_radio_port": self.e_agw_radio.value(),
+            # VARA-protocol modem address (blank for other transports)
+            "vara_host":   ((self.e_vara_host.text().strip() or "127.0.0.1")
+                            if key in VARA_MODEMS else ""),
+            "vara_cmd_port": (int(self.e_vara_port.text().strip())
+                              if key in VARA_MODEMS
+                              and self.e_vara_port.text().strip().isdigit()
+                              else None),
             "notes":       self.e_notes.text().strip(),
         }
 
@@ -4696,11 +4984,12 @@ class MainWindow(QMainWindow):
 
         vara_layout.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["VARA HF", "VARA FM", *AGW_MODEMS.values()])
+        self._fill_mode_combo()
         self.mode_combo.setFixedWidth(
             self.mode_combo.fontMetrics().horizontalAdvance("(Qt)SoundModem") + 36)
         self.mode_combo.setToolTip(
-            "RF modem — VARA, or Direwolf / (Qt)SoundModem for AX.25 packet")
+            "RF modem — VARA (or a VARA-compatible modem), or "
+            "Direwolf / (Qt)SoundModem for AX.25 packet")
         self.mode_combo.currentTextChanged.connect(self._on_mode_changed)
         vara_layout.addWidget(self.mode_combo)
 
@@ -5015,9 +5304,13 @@ class MainWindow(QMainWindow):
             self.host_edit.setText(entry.get("host", ""))
             self.port_edit.setText(str(entry.get("telnet_port", 8010)))
         else:
-            mode_str = {"vara_hf": "VARA HF",
+            mode_str = {**{k: p["name"] for k, p in VARA_MODEMS.items()},
                         **AGW_MODEMS}.get(transport, "VARA FM")
             self.mode_combo.blockSignals(True)
+            # An entry saved with an experimental modem keeps working
+            # after the switch is turned off: add its name back.
+            if self.mode_combo.findText(mode_str) < 0:
+                self._fill_mode_combo(extra=mode_str)
             self.mode_combo.setCurrentText(mode_str)
             self.mode_combo.blockSignals(False)
             self.call_edit.setText(entry.get("callsign", ""))
@@ -5025,15 +5318,29 @@ class MainWindow(QMainWindow):
             # value when valid; the mode default otherwise.
             saved_bw = entry.get("bw", "")
             self._toolbar_bw_set_for_mode(mode_str, preferred=saved_bw)
+            self._vara_retarget()
             self._vara_set_bw(self.bw_combo.currentText())
 
     # VARA bandwidth dropdown options — mirrors _BBSEntryDialog so the
     # toolbar and the entry dialog stay in sync. HF uses kHz numbers
     # (BW500/BW2300 on the wire); FM uses bare NARROW/WIDE keywords.
-    _TB_VARA_BW = {
-        "VARA HF": (["500", "2300"], "500"),
-        "VARA FM": (["NARROW", "WIDE"], "NARROW"),
-    }
+    # Modems with no bandwidth choice (VardeFM) are left out, which hides
+    # the BW control and keeps _vara_set_bw from sending anything.
+    _TB_VARA_BW = {p["name"]: (p["bw"], p["bw_default"])
+                   for p in VARA_MODEMS.values() if p["bw"]}
+
+    def _fill_mode_combo(self, extra: str = ""):
+        """(Re)build the toolbar Mode list: VARA-protocol modems (the
+        experimental ones only when Settings says so), then packet.
+        Keeps the current choice when it is still offered."""
+        cur = self.mode_combo.currentText()
+        names = vara_modem_names(self.config, extra=extra or cur)
+        self.mode_combo.blockSignals(True)
+        self.mode_combo.clear()
+        self.mode_combo.addItems([*names, *AGW_MODEMS.values()])
+        if cur and self.mode_combo.findText(cur) >= 0:
+            self.mode_combo.setCurrentText(cur)
+        self.mode_combo.blockSignals(False)
 
     def _toolbar_bw_set_for_mode(self, mode_str: str, preferred: str = ""):
         """Repopulate the toolbar BW combo for the given VARA mode.
@@ -5064,6 +5371,28 @@ class MainWindow(QMainWindow):
         # toolbar. Don't push to VARA here — the bw_combo change signal
         # fires _vara_set_bw on its own once the new value is selected.
         self._toolbar_bw_set_for_mode(mode_str)
+        self._vara_retarget()
+
+    def _vara_retarget(self):
+        """Point the idle modem link at the active entry's modem address
+        (its Host / Command port). Idle only — a session owns the ports
+        then, and VaraControl.retarget refuses while they are lent."""
+        ctrl = getattr(self, "_vara_ctrl", None)
+        btn  = getattr(self, "btn_connect", None)      # not built yet at startup
+        if ctrl is None or btn is None or not btn.isEnabled():
+            return
+        entry = self._get_active_bbs_entry() or {}
+        if entry.get("transport") not in VARA_MODEMS:
+            return
+        host, cmd, data = entry_vara_address(self.config.get("vara", {}), entry)
+        if not ctrl.retarget(host, cmd, data):
+            return
+        if hasattr(self, "debug_view"):
+            self.debug_view.append(
+                f"[SYS] Modem link now {host}:{cmd} "
+                f"({VARA_MODEMS[entry['transport']]['name']})\n", "#888888")
+        self._vara_was_linked = False
+        ctrl.open()
 
     def _on_save_bbs(self):
         is_telnet = (self.tb_stack.currentIndex() == 1)
@@ -5079,7 +5408,7 @@ class MainWindow(QMainWindow):
         if not ok:
             return
         mode_str = self.mode_combo.currentText() if not is_telnet else "Telnet"
-        transport_map = {"VARA HF": "vara_hf", "VARA FM": "vara_fm",
+        transport_map = {**VARA_BY_NAME,
                          "Telnet": "telnet",
                          **{v: k for k, v in AGW_MODEMS.items()}}
         is_agw   = transport_map[mode_str] in AGW_MODEMS
@@ -5091,14 +5420,17 @@ class MainWindow(QMainWindow):
                             else self.telnet_call_edit.text().strip().upper()
                                  or self.host_edit.text().strip().upper().split(".")[0]),
             "transport":   transport_map[mode_str],
-            "vara_type":   ("hf" if mode_str == "VARA HF" else
-                            "fm" if mode_str == "VARA FM" else None),
+            "vara_type":   (VARA_MODEMS[VARA_BY_NAME[mode_str]]["bw_style"]
+                            if mode_str in VARA_BY_NAME else None),
             "bw":          (self.bw_combo.currentText()
-                            if not (is_telnet or is_agw) else ""),
+                            if not (is_telnet or is_agw)
+                               and mode_str in self._TB_VARA_BW else ""),
             "host":        (self.host_edit.text().strip() if is_telnet else
                             active.get("host") or "127.0.0.1" if is_agw else ""),
             "agw_port":    active.get("agw_port", AGW_DEFAULT_PORT),
             "agw_radio_port": active.get("agw_radio_port", 0),
+            "vara_host":   active.get("vara_host", "") if mode_str in VARA_BY_NAME else "",
+            "vara_cmd_port": active.get("vara_cmd_port") if mode_str in VARA_BY_NAME else None,
             "telnet_port": int(port_str) if port_str.isdigit() else 8010,
             "notes":       ""
         }
@@ -5149,9 +5481,14 @@ class MainWindow(QMainWindow):
                 entry["vara_type"] = None
                 entry["bw"]        = ""
             else:
-                entry["transport"] = "vara_hf" if mode_str == "VARA HF" else "vara_fm"
-                entry["vara_type"] = "hf"      if mode_str == "VARA HF" else "fm"
-                entry["bw"]        = self.bw_combo.currentText()
+                key = VARA_BY_NAME.get(mode_str, "vara_hf")
+                if base.get("transport") != key:
+                    entry.pop("vara_host", None)
+                    entry.pop("vara_cmd_port", None)
+                entry["transport"] = key
+                entry["vara_type"] = VARA_MODEMS[key]["bw_style"]
+                entry["bw"]        = (self.bw_combo.currentText()
+                                      if mode_str in self._TB_VARA_BW else "")
         return entry
 
     # ── VARA pre-session control ──────────────────────────────────
@@ -5176,6 +5513,10 @@ class MainWindow(QMainWindow):
         Idle only: Connect enabled means no session, no connect in
         progress and no post-error VARA recovery — the times QtC has
         deliberately let go of the port for VaraTransport."""
+        # Follow the selected entry's modem address (cheap no-op when it
+        # already matches) — also covers startup, when the first entry is
+        # selected before the Connect button exists.
+        self._vara_retarget()
         linked = self._vara_ctrl.is_open
         if linked and not self._vara_was_linked:
             # Just linked (by this timer or anywhere else): put the
@@ -5185,7 +5526,7 @@ class MainWindow(QMainWindow):
         self._vara_was_linked = linked
         if (linked or self._vara_relink_busy
                 or (self._get_active_bbs_entry() or {}).get("transport")
-                    not in ("vara_hf", "vara_fm")
+                    not in VARA_MODEMS
                 or not self.btn_connect.isEnabled() or self._logged_in):
             return
         self._vara_relink_busy = True
@@ -5224,12 +5565,14 @@ class MainWindow(QMainWindow):
                          f"{entry.get('agw_port') or AGW_DEFAULT_PORT}  "
                          f"channel {entry.get('agw_radio_port', 0)}")
         else:
-            is_hf = (entry.get("vara_type") == "hf")
-            mode_label = "VARA HF" if is_hf else "VARA FM"
+            p = VARA_MODEMS.get(transport, VARA_MODEMS["vara_hf"])
+            mode_label = p["name"]
             freq = entry.get("freq", "")
-            bw   = entry.get("bw", "500" if is_hf else "NARROW")
-            # HF prints as "BW500"/"BW2300"; FM prints the keyword as-is.
-            bw_label = f"BW{bw}" if is_hf else str(bw).upper()
+            bw   = entry.get("bw") or p["bw_default"]
+            # HF prints as "BW500"/"BW2300"; FM prints the keyword as-is;
+            # VardeFM sets its own width.
+            bw_label = ("" if p["bw_style"] == "none" else
+                        f"BW{bw}" if p["bw_style"] == "hf" else str(bw).upper())
             conn_desc = f"{mode_label}  {freq}  {bw_label}".strip()
 
         self._set_status(f"Connecting to {entry['callsign']}  ({conn_desc})...", connecting=True)
@@ -5261,8 +5604,10 @@ class MainWindow(QMainWindow):
         # VARA completes a full RF clean-disconnect sequence (PTT, CW ID, etc).
         # We calculate how long we still need to wait based on time elapsed
         # since the last disconnect, with a minimum of 8s after a recent one.
-        if entry.get("transport", "") in ("vara_hf", "vara_fm"):
-            self._vara_ctrl.close()
+        if entry.get("transport", "") in VARA_MODEMS:
+            # lend(), not close(): no idle-side open() may take the port
+            # back until this session is over (see VaraControl._lent).
+            self._vara_ctrl.lend()
             import time as _time
             elapsed = _time.time() - self._last_disconnect_time
             VARA_RESET_SECS = 8.0   # VARA needs up to 8s after RF disconnect
@@ -5325,13 +5670,14 @@ class MainWindow(QMainWindow):
             detail = entry.get("host", "")
         elif transport in AGW_MODEMS:
             detail = f"{AGW_MODEMS[transport]}  AX.25"
-        elif transport == "vara_hf":
-            bw = entry.get("bw", "500")
-            detail = f"VARA HF  BW{bw}"
         else:
-            # VARA FM — bw is a bare keyword ("NARROW"/"WIDE"), no prefix
-            bw = entry.get("bw", "NARROW")
-            detail = f"VARA FM  {str(bw).upper()}"
+            p  = VARA_MODEMS.get(transport, VARA_MODEMS["vara_hf"])
+            bw = entry.get("bw") or p["bw_default"]
+            # HF style prints "BW500"; FM style the bare keyword; VardeFM
+            # sets its own width, so nothing.
+            bw_txt = ("" if p["bw_style"] == "none" else
+                      f"BW{bw}" if p["bw_style"] == "hf" else str(bw).upper())
+            detail = f"{p['name']}  {bw_txt}".strip()
         self._set_status(
             f"Connected  ·  {entry['callsign']}  ({detail})",
             connected=True)
@@ -5587,7 +5933,7 @@ class MainWindow(QMainWindow):
         self._mc_owned_at_disconnect = self._mc_session_owned
         self._mc_session_owned = False
         # Reclaim the VaraControl socket for pre-session BW commands
-        self._vara_ctrl.open()
+        self._vara_ctrl.reclaim()
 
     # ── YAPP file download ────────────────────────────────────────
 
@@ -5776,11 +6122,18 @@ class MainWindow(QMainWindow):
         # Give VARA a moment to reset its TCP listener before allowing reconnect
         # and reclaiming VaraControl — a failed RF connect can take ~10-15s to recover
         self.terminal.append("[SYS] Waiting for VARA to reset…\n", "#888888")
-        QTimer.singleShot(8000, self._vara_recover)
+        gen = self._vara_ctrl.gen
+        QTimer.singleShot(8000, lambda: self._vara_recover(gen))
 
-    def _vara_recover(self):
-        """Called ~8s after a connection error to re-enable connect and reclaim VARA."""
-        self._vara_ctrl.open()
+    def _vara_recover(self, gen: int = None):
+        """Called ~8s after a connection error to re-enable connect and reclaim VARA.
+
+        gen: the link generation at the error. If a newer Connect has
+        lent the port out since, this recovery is stale — do nothing, or
+        it would steal the modem from that connect (2026-11-14)."""
+        if gen is not None and gen != self._vara_ctrl.gen:
+            return
+        self._vara_ctrl.reclaim(gen)
         self.btn_connect.setEnabled(True)
         self._logged_in = False   # not connected yet — stays off until next connect
         self.terminal.append("[SYS] VARA ready — you may reconnect.\n", "#888888")
@@ -6609,6 +6962,7 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.config = dlg.get_config()
             save_config(self.config)
+            self._fill_mode_combo()
             self._reload_bbs_combo()
             self._on_combo_changed(self.bbs_combo.currentIndex())
             mycall = self.config.get("user", {}).get("callsign", "").upper()
@@ -6674,13 +7028,9 @@ class MainWindow(QMainWindow):
             name = AGW_MODEMS[transport]
             host = entry.get("host") or "127.0.0.1"
             port = int(entry.get("agw_port") or AGW_DEFAULT_PORT)
-        elif transport in ("vara_hf", "vara_fm"):
-            prefix = "hf" if transport == "vara_hf" else "fm"
-            vara = self.config.get("vara", {})
-            name = "VARA HF" if prefix == "hf" else "VARA FM"
-            host = vara.get(f"{prefix}_host", vara.get("hf_host", "127.0.0.1"))
-            port = int(vara.get(f"{prefix}_cmd_port",
-                                vara.get("hf_cmd_port", 8300)))
+        elif transport in VARA_MODEMS:
+            name = VARA_MODEMS[transport]["name"]
+            host, port, _ = entry_vara_address(self.config.get("vara", {}), entry)
             ctrl = self._vara_ctrl
             if (ctrl.vara_host, int(ctrl.cmd_port)) == (host, port):
                 # QtC holds this port itself while idle, and VARA takes one
@@ -6733,7 +7083,7 @@ class MainWindow(QMainWindow):
         self._mc_session_owned = True
 
         transport = entry.get("transport", "")
-        if transport in ("vara_hf", "vara_fm", *AGW_MODEMS):
+        if transport in VARA_MODEMS or transport in AGW_MODEMS:
             # RF — VARA or packet: retry budget + slot deadline apply
             self._mc_attempt_vara_fire(entry)
         else:
@@ -6783,7 +7133,7 @@ class MainWindow(QMainWindow):
         # 3. Channel busy — increment and schedule retry. VARA only: AGW
         #    has no BUSY report, and the packet modems carrier-sense on
         #    their own before every transmission.
-        if (entry.get("transport") in ("vara_hf", "vara_fm")
+        if (entry.get("transport") in VARA_MODEMS
                 and self._vara_ctrl.is_busy()):
             self._mc_tries_used += 1
             self._on_log(

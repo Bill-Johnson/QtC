@@ -114,6 +114,9 @@ def stub(mode="vara_hf", connect_enabled=True, logged_in=False, linked=False):
     s._logged_in = logged_in
     s._vara_set_bw = lambda bw: s.bw_pushed.append(bw)
     s.debug_view = types.SimpleNamespace(append=lambda *a: None)
+    # The tick first follows the selected entry's modem address
+    # (2026-11-14); that has its own tests in test_vara_profiles.
+    s._vara_retarget = lambda: None
     return s
 
 s = stub(); MW._vara_relink_tick(s)

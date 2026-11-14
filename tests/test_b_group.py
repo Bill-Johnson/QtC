@@ -24,11 +24,16 @@ def check(name, cond, detail=""):
     print(f"{'PASS' if cond else 'FAIL'}  {name}" + (f"   {detail}" if detail and not cond else ""))
 
 D = mw._BBSEntryDialog
-KEYS = [k for _, k in D.TRANSPORTS]
+# Each dialog builds its own list (VARA-protocol rows first, the
+# experimental ones only when switched on — 2026-11-14), so pick rows by
+# key from the dialog's own TRANSPORTS, never from the class list.
+def pick(d, key):
+    d.transport_combo.setCurrentIndex([k for _, k in d.TRANSPORTS].index(key))
+KEYS = [k for _, k in D().TRANSPORTS]
 
 # ════ B1 — Direwolf panel ═══════════════════════════════════════════
 dlg = D()
-dlg.transport_combo.setCurrentIndex(KEYS.index("direwolf"))
+pick(dlg, "direwolf")
 app.processEvents()
 
 check("B1 Direwolf is offered in the transport list", "direwolf" in KEYS)
@@ -56,7 +61,7 @@ check("B1 saved radio port is 1", entry["agw_radio_port"] == 1)
 check("B1 callsign upper-cased", entry["callsign"] == "N0CALL-1")
 
 again = D(entry)
-again.transport_combo.setCurrentIndex(KEYS.index("direwolf"))
+pick(again, "direwolf")
 app.processEvents()
 check("B1 values survive Edit -> OK -> reopen",
       (again.e_agw_port.text(), again.e_agw_radio.value(),
@@ -64,14 +69,14 @@ check("B1 values survive Edit -> OK -> reopen",
       f"got {(again.e_agw_port.text(), again.e_agw_radio.value(), again.e_host.text())}")
 
 # ════ B2 — (Qt)SoundModem ═══════════════════════════════════════════
-labels = [l for l, _ in D.TRANSPORTS]
+labels = [l for l, _ in D().TRANSPORTS]
 check("B2 dropdown reads '(Qt)SoundModem'", "(Qt)SoundModem" in labels,
       f"got {labels}")
 check("B2 it is a working transport now", "soundmodem" not in D.FUTURE)
 check("B2 AGW_MODEMS label matches",
       mw.AGW_MODEMS.get("soundmodem") == "(Qt)SoundModem")
 dlg2 = D()
-dlg2.transport_combo.setCurrentIndex(KEYS.index("soundmodem"))
+pick(dlg2, "soundmodem")
 app.processEvents()
 check("B2 AGW fields are shown for it", not dlg2.agw_group.isHidden())
 check("B2 Channel hint is in QtSoundModem's words",
@@ -89,7 +94,7 @@ check("B4 Type column label for soundmodem",
 def row_for(e):
     """Mirror of _reload_bbs_table's cell construction."""
     t = e.get("transport", "telnet")
-    is_vara = t in ("vara_hf", "vara_fm")
+    is_vara = t in mw.VARA_MODEMS
     is_agw  = t in mw.AGW_MODEMS
     has_host = t == "telnet" or is_agw
     port_val = (e.get("agw_port", mw.AGW_DEFAULT_PORT) if is_agw
@@ -137,8 +142,12 @@ for e in old:
             ok = False
             print(f"        {e.get('name')}: {k} {e.get(k)!r} -> {back.get(k)!r}")
 check("B5 every VARA/Telnet entry round-trips through the dialog unchanged", ok)
+# Any transport QtC knows counts — including the experimental modems,
+# which a fresh dialog hides while that switch is off (2026-11-14).
+KNOWN = set(mw.VARA_MODEMS) | {k for _, k in D.TRANSPORTS}
 check("B5 no entry silently gained a transport it did not have",
-      all(e.get("transport") in KEYS for e in cfg.get("bbs_list", [])))
+      all(e.get("transport") in KNOWN for e in cfg.get("bbs_list", [])),
+      f"unknown: {[e.get('transport') for e in cfg.get('bbs_list', []) if e.get('transport') not in KNOWN]}")
 
 # ════ B3 — toolbar Mode dropdown / BW visibility ════════════════════
 # _toolbar_bw_set_for_mode is what decides both, so drive it directly on a

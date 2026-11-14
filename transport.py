@@ -391,6 +391,97 @@ class TelnetTransport:
         self.sock.sendall(data)
 
 
+# ── VARA-protocol modems ──────────────────────────────────────────────
+# Everything that speaks VARA's TCP interface (command port + data port
+# on the next number). key = the BBS entry's "transport" value.
+#
+#   bw / bw_default  bandwidth choices shown in QtC; [] = the modem sets
+#                    its own width (VardeFM's --mode) and QtC sends none
+#   bw_style         wire form: "hf" -> BW500, "fm" -> bare NARROW/WIDE,
+#                    "none" -> no bandwidth command
+#   experimental     only offered when Settings > App > "Experimental
+#                    modems" is on (Bill, 2026-11-14)
+#   connect_timeout  QtC's safety net on CONNECT. The modem gives up and
+#                    says DISCONNECTED on its own; this only has to be
+#                    longer than the modem's own calling.
+#   min_reply_wait   floor on every "silence while waiting for the BBS"
+#                    (BBSSession._reply_wait), like AGW's MIN_REPLY_WAIT.
+#                    Must exceed the modem's longest single frame plus a
+#                    turnaround, or QtC gives up mid-frame.
+#   min_nudge_wait   floor on the login 'A' nudge after the BPQ banner, so
+#                    a slow second frame of the banner isn't talked over.
+#   disconnect_wait  how long to wait for DISCONNECTED after DISCONNECT
+#                    (the modem delivers what is queued first).
+#
+# VARA's numbers are exactly what QtC used before profiles existed.
+# Mercury (measured on air 2026-11-14): BW500 slowest frames key ~27 s;
+# it calls for up to 300 s; DISCONNECT delivers queued data first,
+# minutes at the slowest rung. Data2G (measured on air 2026-11-14, BW500,
+# about 100 keydowns each end): longest keydown 6 s, typical 2 s; with no
+# answer it gave up by itself in 55 s; DISCONNECT closed in 6-7 s. VardeFM (docs/PROTOCOL.md): connect fails in ~17 s, a
+# burst is at most ~4 s of payload, retries 1.2 s.
+VARA_MODEMS = {
+    "vara_hf": dict(name="VARA HF", bw=["500", "2300"], bw_default="500",
+                    bw_style="hf", experimental=False,
+                    connect_timeout=90, min_reply_wait=0,
+                    min_nudge_wait=0, disconnect_wait=60),
+    "vara_fm": dict(name="VARA FM", bw=["NARROW", "WIDE"], bw_default="NARROW",
+                    bw_style="fm", experimental=False,
+                    connect_timeout=90, min_reply_wait=0,
+                    min_nudge_wait=0, disconnect_wait=60),
+    "mercury": dict(name="Mercury", bw=["500", "2300"], bw_default="500",
+                    bw_style="hf", experimental=True,
+                    connect_timeout=330, min_reply_wait=90,
+                    min_nudge_wait=60, disconnect_wait=240),
+    "data2g":  dict(name="Data2G", bw=["500", "2300"], bw_default="500",
+                    bw_style="hf", experimental=True,
+                    connect_timeout=90, min_reply_wait=30,
+                    min_nudge_wait=20, disconnect_wait=60),
+    "vardefm": dict(name="VardeFM", bw=[], bw_default="",
+                    bw_style="none", experimental=True,
+                    connect_timeout=60, min_reply_wait=30,
+                    min_nudge_wait=20, disconnect_wait=60),
+}
+
+
+def vara_config_prefix(key: str) -> str:
+    """Prefix of this modem's host/port keys in config["vara"]: VARA keeps
+    its historic hf_/fm_; the others use their own key and fall back to
+    the hf_ values (so a modem on VARA's default ports needs no setup)."""
+    return {"vara_hf": "hf", "vara_fm": "fm"}.get(key, key)
+
+
+def vara_address(vara_cfg: dict, key: str):
+    """(host, cmd_port, data_port) for a VARA-protocol modem."""
+    p = vara_config_prefix(key)
+    host = vara_cfg.get(f"{p}_host", vara_cfg.get("hf_host", "127.0.0.1"))
+    cmd  = int(vara_cfg.get(f"{p}_cmd_port", vara_cfg.get("hf_cmd_port", 8300)))
+    if f"{p}_data_port" in vara_cfg:
+        data = int(vara_cfg[f"{p}_data_port"])
+    elif f"{p}_cmd_port" in vara_cfg:
+        data = cmd + 1          # own command port: data is the next one
+    else:
+        data = int(vara_cfg.get("hf_data_port", cmd + 1))
+    return host, cmd, data
+
+
+def entry_vara_address(vara_cfg: dict, entry: dict):
+    """(host, cmd_port, data_port) for a BBS entry on a VARA-protocol
+    modem. The entry's own vara_host / vara_cmd_port win (set in its
+    Edit dialog, 2026-11-14); a blank one falls back to config["vara"]
+    via vara_address, so entries saved before then work unchanged. The
+    data port is always the command port + 1, as on VARA, Mercury,
+    Data2G and VardeFM."""
+    host, cmd, data = vara_address(vara_cfg or {},
+                                   entry.get("transport", "vara_hf"))
+    if str(entry.get("vara_host") or "").strip():
+        host = str(entry["vara_host"]).strip()
+    port = str(entry.get("vara_cmd_port") or "").strip()
+    if port.isdigit():
+        cmd, data = int(port), int(port) + 1
+    return host, cmd, data
+
+
 class VaraTransport:
     """
     VARA HF/FM transport.
@@ -426,7 +517,8 @@ class VaraTransport:
     RESP_WRONG        = "WRONG"
 
     def __init__(self, vara_host, cmd_port, data_port, mycall, target_call,
-                 timeout=60, bandwidth="2300", vara_type="hf"):
+                 timeout=60, bandwidth="2300", vara_type="hf",
+                 profile: dict = None):
         self.vara_host   = vara_host
         self.cmd_port    = cmd_port
         self.data_port   = data_port
@@ -437,6 +529,17 @@ class VaraTransport:
         # FM: "NARROW" / "WIDE" (sent as bare keyword — no BW prefix).
         self.bandwidth   = str(bandwidth)
         self.vara_type   = (vara_type or "hf").lower()
+        # Per-modem timing (see VARA_MODEMS). Defaults are VARA's — what
+        # QtC used before profiles. MIN_REPLY_WAIT / MIN_NUDGE_WAIT are
+        # read by BBSSession through getattr, same as AGW's class floor.
+        p = profile or {}
+        self.modem_name      = p.get("name", "VARA")
+        self.MIN_REPLY_WAIT  = p.get("min_reply_wait", 0)
+        self.MIN_NUDGE_WAIT  = p.get("min_nudge_wait", 0)
+        self.disconnect_wait = p.get("disconnect_wait", 60)
+        if profile:
+            self.timeout   = p.get("connect_timeout", timeout)
+            self.vara_type = p.get("bw_style", self.vara_type)
 
         self._cmd_sock  = None
         self._data_sock = None
@@ -501,10 +604,78 @@ class VaraTransport:
             self._log(direction, text)
 
     def _send_cmd(self, cmd: str):
-        """Send a command to VARA command port."""
-        raw = (cmd + "\r\n").encode("utf-8")
+        """Send a command to VARA command port.
+
+        CR only, as the VARA spec says. Real VARA shrugged off CR+LF, but
+        Mercury ends a line at CR alone, so the LF started the NEXT
+        command and every command after the first got WRONG (seen on
+        the tap 2026-11-14)."""
+        raw = (cmd + "\r").encode("utf-8")
         self._emit("TX-CMD", cmd)
         self._cmd_sock.sendall(raw)
+
+    def _handle_async(self, upper: str):
+        """Act on a status line that can arrive at any time (PTT, BUSY)."""
+        if upper == "PTT ON":
+            if self.ptt:
+                self.ptt.tx()
+        elif upper == "PTT OFF":
+            if self.ptt:
+                self.ptt.rx()
+        elif upper.startswith(self.RESP_BUSY_ON):
+            self._busy = True
+        elif upper.startswith(self.RESP_BUSY_OFF):
+            self._busy = False
+
+    def _cmd_reply(self, cmd: str, timeout: float = 3.0) -> str:
+        """Send `cmd` and wait for its OK / WRONG.
+
+        Returns "OK", "WRONG", or "" if no answer came in time. Status
+        lines that arrive meanwhile (PTT, BUSY, REGISTERED, BUFFER...)
+        are logged and handled. A CONNECTED / DISCONNECTED is put back
+        so the connect wait still sees it."""
+        self._send_cmd(cmd)
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return ""
+            line = self._read_cmd_line(timeout=remaining)
+            if not line:
+                continue
+            upper = line.upper()
+            if upper.startswith((self.RESP_CONNECTED, self.RESP_DISCONNECTED)):
+                self._cmd_buf = line.encode("utf-8") + b"\r" + self._cmd_buf
+                return ""
+            self._emit("RX-CMD", line)
+            if upper == self.RESP_OK:
+                return "OK"
+            if upper == self.RESP_WRONG:
+                return "WRONG"
+            self._handle_async(upper)
+
+    def _abort_connect(self):
+        """Give up on a CONNECT still in progress: ABORT it so the modem
+        stops calling, wait briefly for its DISCONNECTED, release PTT
+        and close. Before 2026-11-14 a connect timeout just closed the
+        sockets and left the modem to notice (Mercury did; VARA may not)."""
+        try:
+            self._send_cmd("ABORT")
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                line = self._read_cmd_line(timeout=deadline - time.time())
+                if not line:
+                    continue
+                self._emit("RX-CMD", line)
+                upper = line.upper()
+                if upper.startswith(self.RESP_DISCONNECTED):
+                    break
+                self._handle_async(upper)
+        except OSError:
+            pass
+        if self.ptt:
+            self.ptt.rx()
+        self._cleanup()
 
     def _read_cmd_line(self, timeout: float = 2.0) -> str:
         """
@@ -570,7 +741,7 @@ class VaraTransport:
                     # never ours. Set the reason before connected drops: a
                     # blocked read raises with it the moment it looks.
                     self._lost_reason = (
-                        f"VARA reports the link to {self.target_call} is gone")
+                        f"{self.modem_name} reports the link to {self.target_call} is gone")
                     self.connected = False
                     self._emit("SYS", self._lost_reason)
                     # Remote-initiated disconnect (BBS timeout, far-end bye, etc.)
@@ -701,15 +872,15 @@ class VaraTransport:
                 self._cmd_sock = None
                 if attempt < _RETRY_ATTEMPTS:
                     self._emit("SYS",
-                        f"VARA not ready (attempt {attempt}/{_RETRY_ATTEMPTS}) — "
+                        f"{self.modem_name} not ready (attempt {attempt}/{_RETRY_ATTEMPTS}) — "
                         f"retrying in {int(_RETRY_DELAY)}s…")
                     time.sleep(_RETRY_DELAY)
 
         if last_err is not None:
             raise ConnectionError(
-                f"Cannot reach VARA command port {self.vara_host}:{self.cmd_port} — "
+                f"Cannot reach {self.modem_name} command port {self.vara_host}:{self.cmd_port} — "
                 f"{last_err}\n"
-                f"Is VARA HF/FM running?")
+                f"Is {self.modem_name} running?")
 
         # 2. Open data socket
         try:
@@ -719,7 +890,7 @@ class VaraTransport:
         except OSError as e:
             self._cmd_sock.close()
             raise ConnectionError(
-                f"Cannot reach VARA data port {self.vara_host}:{self.data_port} — {e}")
+                f"Cannot reach {self.modem_name} data port {self.vara_host}:{self.data_port} — {e}")
 
         # 3. Drain any startup banner VARA may send
         time.sleep(0.3)
@@ -733,19 +904,34 @@ class VaraTransport:
 
         # 4. Set bandwidth, then our callsign.
         # HF takes "BW500" / "BW2300"; FM takes a bare "NARROW" / "WIDE".
-        if self.vara_type == "fm":
-            self._send_cmd(self.bandwidth.upper())
+        # Each command now waits for its OK / WRONG (until 2026-11-14 they
+        # went out on fixed sleeps and the replies were never read).
+        # bw_style "none" (VardeFM: width set by its own --mode) or an
+        # empty bandwidth sends nothing.
+        if self.vara_type == "none" or not self.bandwidth.strip():
+            bw_cmd = ""
+        elif self.vara_type == "fm":
+            bw_cmd = self.bandwidth.upper()
         else:
-            self._send_cmd(f"BW{self.bandwidth}")
-        time.sleep(0.1)
-        self._send_cmd(f"MYCALL {self.mycall}")
-        time.sleep(0.2)
+            bw_cmd = f"BW{self.bandwidth}"
+        if bw_cmd and self._cmd_reply(bw_cmd) == "WRONG":
+            self._emit("SYS", f"Modem did not accept '{bw_cmd}' — "
+                              f"keeping its own bandwidth setting")
+        if self._cmd_reply(f"MYCALL {self.mycall}") == "WRONG":
+            self._cleanup()
+            raise ConnectionError(
+                f"The modem rejected MYCALL {self.mycall} — check the "
+                f"callsign in Settings")
 
         # 5. Initiate RF connection
-        self._send_cmd(f"CONNECT {self.mycall} {self.target_call}")
+        if self._cmd_reply(f"CONNECT {self.mycall} {self.target_call}") == "WRONG":
+            self._cleanup()
+            raise ConnectionError(
+                f"The modem refused CONNECT {self.target_call} — it may "
+                f"still be finishing a session. Wait a moment and try again.")
 
         # 6. Wait for CONNECTED (or failure) on cmd port
-        self._emit("SYS", f"Waiting for VARA connection to {self.target_call}…")
+        self._emit("SYS", f"Waiting for {self.modem_name} connection to {self.target_call}…")
         deadline = time.time() + self.timeout
         while time.time() < deadline:
             line = self._read_cmd_line(timeout=2.0)
@@ -755,7 +941,7 @@ class VaraTransport:
             upper = line.upper()
             if upper.startswith(self.RESP_CONNECTED):
                 self.connected = True
-                self._emit("SYS", f"VARA connected to {self.target_call}")
+                self._emit("SYS", f"{self.modem_name} connected to {self.target_call}")
                 break
             elif upper.startswith(self.RESP_DISCONNECTED):
                 # Ensure PTT is released and sockets are closed cleanly so
@@ -764,7 +950,7 @@ class VaraTransport:
                     self.ptt.rx()
                 self._cleanup()
                 raise ConnectionError(
-                    f"VARA could not connect to {self.target_call} — station not responding")
+                    f"{self.modem_name} could not connect to {self.target_call} — station not responding")
             elif upper.startswith(self.RESP_BUSY_ON):
                 self._emit("SYS", "Channel busy — waiting…")
                 # keep waiting, VARA will retry
@@ -775,11 +961,9 @@ class VaraTransport:
                 if self.ptt:
                     self.ptt.rx()
         if not self.connected:
-            if self.ptt:
-                self.ptt.rx()
-            self._cleanup()
+            self._abort_connect()
             raise ConnectionError(
-                f"Timed out waiting for VARA connection to {self.target_call}")
+                f"Timed out waiting for {self.modem_name} connection to {self.target_call}")
 
         # 7. Start background cmd monitor thread
         self._stop_evt.clear()
@@ -810,10 +994,12 @@ class VaraTransport:
         try:
             self._send_cmd("DISCONNECT")
 
-            # Wait up to 60s for DISCONNECTED — PTT ON/OFF keep firing
-            # during buffer drain and CW ID; process them so the radio
-            # keys/unkeys correctly throughout
-            deadline = time.time() + 60
+            # Wait for DISCONNECTED — PTT ON/OFF keep firing during
+            # buffer drain and CW ID; process them so the radio keys/
+            # unkeys correctly throughout. VARA: 60 s. Mercury delivers
+            # everything queued before it closes, minutes at its slowest
+            # rung, so the wait comes from the modem's profile.
+            deadline = time.time() + self.disconnect_wait
             while time.time() < deadline:
                 line = self._read_cmd_line(timeout=1.0)
                 if not line:
@@ -881,7 +1067,7 @@ class VaraTransport:
     def send(self, text):
         """Send text over RF via VARA data port."""
         if not self.connected:
-            raise ConnectionError("VARA not connected")
+            raise ConnectionError(f"{self.modem_name} not connected")
         if isinstance(text, str):
             text = (text + "\r\n").encode("utf-8", errors="replace")
         self._data_sock.sendall(text)
@@ -1065,7 +1251,7 @@ class VaraTransport:
     def send_raw(self, data: bytes):
         """Send raw bytes without appending \\r\\n. Used for YAPP ACK/NAK bytes."""
         if not self.connected:
-            raise ConnectionError("VARA not connected")
+            raise ConnectionError(f"{self.modem_name} not connected")
         self._data_sock.sendall(data)
 
 
@@ -1685,6 +1871,13 @@ class VaraControl:
         # re-link in flight can never take the port back from a session
         # that is just starting.
         self.gen = 0
+        # True while a session (VaraTransport) owns the modem's ports.
+        # open() refuses until reclaim(). Mercury takes one command client
+        # and a NEW connection replaces the old one, so an idle re-open
+        # in the middle of a connect killed the call (2026-11-14: the
+        # 8 s _vara_recover of an earlier failed connect fired 4 s into
+        # the next one). Real VARA hid this.
+        self._lent = False
 
     def _emit(self, direction: str, text: str):
         if self._log:
@@ -1699,6 +1892,8 @@ class VaraControl:
         self.gen was read.
         """
         with self._lock:
+            if self._lent:
+                return False
             if gen is not None and gen != self.gen:
                 return False
             # Command port
@@ -1751,6 +1946,41 @@ class VaraControl:
         if self._reader_thread and self._reader_thread.is_alive():
             self._reader_thread.join(timeout=2.0)
         self._reader_thread = None
+
+    def lend(self):
+        """Hand the ports to a session: close, and refuse open() until
+        reclaim()."""
+        with self._lock:
+            self._lent = True
+        self.close()
+
+    def reclaim(self, gen: int = None) -> bool:
+        """Take the ports back after a session and re-open.
+        gen: only if no newer lend()/close() happened since gen was read,
+        so a late recovery timer can't steal the port from a newer
+        connect."""
+        with self._lock:
+            if gen is not None and gen != self.gen:
+                return False
+            self._lent = False
+        return self.open()
+
+    @property
+    def lent(self) -> bool:
+        return self._lent
+
+    def retarget(self, host: str, cmd_port: int, data_port: int) -> bool:
+        """Point the idle link at another modem address (the selected BBS
+        entry's). Closes the old link; the caller or the re-link timer
+        opens the new one. Does nothing while a session has the ports
+        (lent) or when the address is unchanged. Returns True if moved."""
+        new = (host, int(cmd_port), int(data_port))
+        if self._lent or new == (self.vara_host, int(self.cmd_port),
+                                 int(self.data_port)):
+            return False
+        self.close()
+        self.vara_host, self.cmd_port, self.data_port = new
+        return True
 
     def is_busy(self) -> bool:
         """Return VARA's current BUSY state (DCD-equivalent).
@@ -1842,7 +2072,8 @@ class VaraControl:
                 if self._sock is None:
                     break
                 try:
-                    self._sock.sendall((cmd + "\r\n").encode("utf-8"))
+                    # CR only — see VaraTransport._send_cmd
+                    self._sock.sendall((cmd + "\r").encode("utf-8"))
                     self._emit("TX-CMD", cmd)
                     return True
                 except OSError:

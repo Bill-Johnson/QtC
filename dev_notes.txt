@@ -1,0 +1,258 @@
+QtC dev notes — experimental modems (Mercury, Data2G, VardeFM)
+=====================================================================
+QtC 0.16.0-dev · first on-air results 2026-11-14 · branch `dev`
+
+These notes are for testers and developers who want to try QtC with the
+new open-source HF/VHF modems. They record what we set up, what we
+measured on the air, and what tripped us up, so you don't have to
+rediscover it. Corrections and your own results are very welcome:
+https://github.com/Bill-Johnson/QtC/issues
+
+
+---------------------------------------------------------------------
+1. STATUS AT A GLANCE
+---------------------------------------------------------------------
+
+  Modem     Interface        Tested with QtC                  Result
+  --------  ---------------  -------------------------------  -----------
+  Mercury   VARA TCP         HF, BW500, two stations          PASS
+  Data2G    VARA TCP         HF, BW500, two stations          PASS
+  VardeFM   VARA TCP         not yet on the air               untested
+  Modem73   KISS + JSON      not supported (no connected      —
+                             mode yet; its ARQ is planned)
+
+  "PASS" = a full QtC Mail-view session: connect, login, LM, automatic
+  download of new personal mail, bulletin listings (L> CATEGORY) and a
+  bulletin read, sign-off, clean disconnect. Received text was checked
+  byte-for-byte against what the BBS sent.
+
+  Versions tested (built from each project's git, 2026-11-11/12):
+    Mercury  fd467a0  (1.9.2x line)   github.com/Rhizomatica/mercury
+    Data2G   e09e19d                  github.com/arodland/Data2G
+    VardeFM  85f2dc3                  github.com/notepid/vardeFM
+    Modem73  4232d6e                  github.com/RFnexus/modem73
+
+  IMPORTANT: these modems talk only to the SAME modem at the other
+  station. They do not talk to VARA, or to each other. Both stations
+  must also run compatible versions — Data2G and Mercury both say their
+  on-air protocol may still change. Build both ends from the same commit.
+
+
+---------------------------------------------------------------------
+2. HOW QTC TALKS TO THEM
+---------------------------------------------------------------------
+
+  Mercury, Data2G and VardeFM all offer VARA's TCP host interface:
+  a command port (8300 by default) and a data port (command + 1). QtC
+  uses the same small command set it uses with VARA:
+
+      BW500 / BW2300 (HF)   MYCALL <call>   CONNECT <mycall> <target>
+      DISCONNECT            ABORT
+
+  and reacts to CONNECTED, DISCONNECTED, PTT ON/OFF, BUSY ON/OFF, BUFFER.
+  Each modem adds lines of its own (Mercury: REGISTERED, BITRATE, SN;
+  Data2G: MODE <name>, REGISTERED). QtC logs and ignores those.
+
+  In QtC: Settings > App > tick "Experimental modems". The BBS entry
+  dialog then offers Mercury, Data2G and VardeFM, each with its own
+  Host and Command port. VardeFM has no bandwidth choice (its width is
+  its own --mode setting), so QtC sends no BW command to it.
+
+  The modem keys the radio. Leave QtC's Settings > PTT at None.
+
+
+---------------------------------------------------------------------
+3. WHAT WE FIXED IN QTC TO MAKE THEM WORK
+---------------------------------------------------------------------
+
+  a) Line endings. QtC sent commands ending in CR+LF. The VARA spec says
+     CR. Real VARA didn't mind; Mercury ends a line at CR, so the LF
+     started the NEXT command and every command after the first came
+     back WRONG (so CONNECT never happened). QtC now sends CR only.
+     If you write a VARA host of your own: send CR only.
+
+  b) Replies. QtC now waits for each command's OK / WRONG instead of
+     firing them on fixed delays. A WRONG to MYCALL or CONNECT stops the
+     connect with a plain message; a WRONG to BW is only a warning.
+
+  c) ABORT on connect timeout. If no CONNECTED arrives in time, QtC sends
+     ABORT so the modem stops calling. (Before, it just closed its
+     sockets. Mercury happens to stop calling when its command client
+     leaves; don't rely on that.)
+
+  d) One client per port. Mercury takes one command-port client, and a
+     NEW connection replaces the old one. A late QtC timer once
+     reopened its idle link 4 seconds into a call, Mercury handed the
+     port to it and the call died. QtC now never opens the idle link
+     while a session owns the modem. Any host that keeps a "keep VARA
+     linked" connection open should check for the same race.
+
+  e) Timing per modem. VARA's timeouts were too short for Mercury's
+     slowest mode (see section 5), so each modem has its own profile.
+
+
+---------------------------------------------------------------------
+4. PER-MODEM SETUP NOTES
+---------------------------------------------------------------------
+
+  MERCURY
+    - Start:  mercury -p 8300 ...  (sound system and audio devices: see
+      `mercury -h` and Mercury's README). -p sets the command port;
+      data = +1.
+      It also opens a broadcast port on 8100 — the same default as
+      Data2G's KISS port, so don't run both at once without moving one.
+    - PTT: Mercury's default is NO PTT (it leaves keying to the client).
+      Use VOX, or start it with -P serial -A /dev/ttyUSB0 (RTS), or Hamlib.
+    - BW500 keeps it inside 500 Hz. At BW500 its slowest frames (MFSK)
+      key the radio for about 27 seconds each.
+    - TUNE: Mercury accepts VARA's TUNE command (TUNE -15 = steady 1 kHz
+      at -15 dBFS, TUNE OFF; it cuts off after 60 s by itself). QtC's
+      tests/modem_tune.py holds a tone while you set levels.
+    - Quirk: on the ANSWERING side Mercury sent DISCONNECTED twice for one
+      session (once when the peer's disconnect arrived, again ~10 s
+      later). The calling side gets one. Worth checking against LinBPQ.
+
+  DATA2G
+    - Data2G-GUI has a settings dialog; Data2G-Host takes the same as
+      command-line flags (data2g-host --help).
+    - PTT GOTCHA: Data2G's "Rig" switch OFF means NO PTT AT ALL — even
+      with PTT method RTS and a PTT device set. Turn Rig ON for RTS/DTR/
+      CAT keying. We used the radio's real Hamlib model (FT-817 = 1020)
+      with RTS on the USB interface's serial port; model 1 (Dummy) for an
+      RTS-only setup with no CAT is untested. VOX works with Rig off.
+      We lost a session to this.
+    - Command port 8300, data 8301, KISS 8100 (defaults).
+    - Its signals are much less peaky than VARA's or Mercury's: expect to
+      turn the drive down from where Mercury was.
+    - Unanswered, it gives up by itself after 5 CALLs (~55 s) and reports
+      DISCONNECTED.
+
+  VARDEFM
+    - FM modem (VHF/UHF). Not yet tested on the air with QtC.
+    - Width is set when you start it (--mode narrow|wide); both stations
+      must match. QtC sends it no BW command.
+    - `vardefm sim-pair` runs two VardeFM modems joined by a simulated FM
+      link on one computer (A on 8300, B on 8310) — a way to test a host
+      with no radios at all.
+
+  MODEM73
+    - KISS over TCP plus a JSON control port (8073). No connected (ARQ)
+      mode yet, so it can't carry a BBS session from QtC. Watching for
+      its planned ARQ.
+
+
+---------------------------------------------------------------------
+5. WHAT WE MEASURED (HF, BW500, two stations, 2026-11-14)
+---------------------------------------------------------------------
+
+  Station A: QtC + modem, radio keyed by VOX.
+  Station B: same modem + a small LinBPQ-style test mailbox (section 7),
+             radio keyed by RTS through a USB interface.
+  Same test both times: 3 personal messages (~1.8 KB, ~250 B, ~250 B)
+  and 1 bulletin (~320 B), plus the listings and prompts around them.
+
+                                       Mercury          Data2G
+  ---------------------------------  ---------------  ---------------
+  Connect (good levels)               8-20 s           3 s
+  1.8 KB personal message             84 s             23 s
+  ~250 B personal message             25 s             8 s
+  Whole Mail-view session             ~5 min           ~2 min
+  Disconnect (DISCONNECT -> DISC'D)   15-25 s          6-7 s
+  Longest single keydown              ~27 s (MFSK)     6 s
+  Typical keydown                     4 s              2 s
+  Gives up an unanswered call after   up to 300 s      ~55 s
+
+  Mercury at poor levels started on its MFSK floor (31 bps, 27 s frames)
+  and climbed (DATAC15 68 bps, DATAC3 321 bps) as the link improved.
+  Data2G moved between modes on its own (e.g. qpsk r1/3 for the call,
+  64-QAM r3/4 for data once the link was good).
+
+  Levels matter more than anything else: our first Mercury session ran
+  17 dB lopsided (one station much weaker in one direction) and spent
+  its first minutes at the slowest rate. Set both directions' levels
+  before judging a modem's speed.
+
+
+---------------------------------------------------------------------
+6. QTC'S TIMING PROFILES (transport.py, VARA_MODEMS)
+---------------------------------------------------------------------
+
+                     connect   reply-silence   login-nudge   disconnect
+                     timeout   floor           floor         wait
+  VARA HF / FM         90 s      none            20 s          60 s
+  Mercury             330 s      90 s            60 s         240 s
+  Data2G               90 s      30 s            20 s          60 s
+  VardeFM              60 s      30 s            20 s          60 s
+
+  - connect timeout: only a safety net; the modem reports DISCONNECTED
+    itself when it gives up. Must outlast the modem's own calling.
+  - reply-silence floor: the shortest silence QtC will wait for the BBS
+    before giving up on a reply. Must exceed the modem's longest frame
+    plus a turnaround, or QtC gives up in the middle of a frame.
+  - login-nudge floor: QtC sends 'A' to a BBS that goes quiet after its
+    banner. On Mercury the banner once arrived in two frames 29 s apart.
+  - Mercury's and Data2G's numbers come from the measurements above;
+    VardeFM's from its protocol document until it is tested.
+
+
+---------------------------------------------------------------------
+7. TESTING WITHOUT A REAL BBS
+---------------------------------------------------------------------
+
+  tests/fake_bbs_vara.py — run it on the ANSWERING station, next to its
+  modem. It sets MYCALL + LISTEN ON and answers like a small LinBPQ
+  mailbox: banner, prompt, OP, LM/L/LN, L> CATEGORY, LC, R <n> (BPQ's
+  real read format), SP/SB/S sends, K, B. Personal mail is addressed to
+  whoever connects, so QtC's Mail view downloads it.
+
+      python3 tests/fake_bbs_vara.py N0BBS-9                 # modem on 8300
+      python3 tests/fake_bbs_vara.py N0BBS-9 --port 8400
+      python3 tests/fake_bbs_vara.py N0BBS-9 --demo --modem Data2G
+      python3 tests/fake_bbs_vara.py N0BBS-9 --demo --start 501
+
+    --demo      a tidy mailbox: 3 new personal + 1 SITREP bulletin
+    --modem     names the modem in the demo text
+    --start N   renumber the mailbox (QtC skips a BBS + number it
+                already has, so use new numbers for a second run)
+
+  Stop it when you are done: it answers any call to its callsign, on the
+  air, by itself.
+
+  tests/modem_tune.py — hold a TUNE tone (Mercury / VARA syntax) while
+  you set levels:  python3 tests/modem_tune.py --port 8300 --level -15
+
+  Keep test mail out of your real mailbox — run the test copy with its
+  own data folder:
+      Linux:      XDG_DATA_HOME=~/qtc-dev-data python3 main_window.py
+      Windows:    $env:APPDATA = "$HOME\qtc-dev-data"; py main_window.py
+
+  Watching the traffic: QtC's Debug view (F4) shows every command it
+  sends to the modem and every reply (TX-CMD / RX-CMD), and the BBS text.
+
+  No-radio loopback (not yet tried with QtC — reports welcome):
+    VardeFM   vardefm sim-pair                (two modems, one simulated link)
+    Data2G    --audio-io pipe:IN,OUT          (two hosts through mkfifo pipes)
+    Mercury   -x fifo / -x sock test backends
+
+
+---------------------------------------------------------------------
+8. KNOWN OPEN ITEMS / HELP WANTED
+---------------------------------------------------------------------
+
+  - VardeFM on the air (VHF/UHF FM) — not yet tested.
+  - A real LinBPQ / BPQ32 BBS on the far end with each modem as its VARA
+    port. Our far end was the test mailbox in section 7. Mercury's docs
+    describe BPQ32-specific behaviour (scanning, PENDING) worth checking.
+  - YAPP file transfer over these modems — untested; its timeouts were
+    sized for VARA.
+  - Data2G-specific extras (DATA2G ON, CHAT ON for lower latency,
+    CLEANTXBUFFER) are not used by QtC yet.
+  - CAT / Hamlib keying (radios with built-in sound cards and CAT-only
+    PTT) — the modems support it; QtC leaves keying to them.
+  - Modem73: waiting for its connected (ARQ) mode.
+
+  If you test any of these, please open an Issue with: OS, modem and its
+  version (git commit), both stations' setup, what happened, and the
+  Debug view text (F4) around it. Remove passwords before posting.
+
+73

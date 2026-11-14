@@ -1247,8 +1247,14 @@ class BBSSession:
         # 'A' once so it lets go of the old listing and prints its prompt.
         # Silence is timed from the last byte received, not from connect,
         # so a slow node welcome with RF retries can't run the clock out.
+        # The nudge gets the modem's floor too: Mercury's slowest frames
+        # are ~27 s, and on air (2026-11-14) its banner arrived in two
+        # frames 29 s apart — the 20 s nudge would have sent 'A' over
+        # the second half.
         bbs_response = self._await_bbs_prompt(
-            self._reply_wait(self.LOGIN_QUIET_SECS), self.LOGIN_NUDGE_SECS)
+            self._reply_wait(self.LOGIN_QUIET_SECS),
+            max(self.LOGIN_NUDGE_SECS,
+                getattr(self.transport, "MIN_NUDGE_WAIT", 0)))
         self._log("SYS", f"BBS response: {bbs_response!r}")
 
         if ">" not in bbs_response:
