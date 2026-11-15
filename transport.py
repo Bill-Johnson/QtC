@@ -403,7 +403,19 @@ class TelnetTransport:
 #                    modems" is on (Bill, 2026-11-14)
 #   connect_timeout  QtC's safety net on CONNECT. The modem gives up and
 #                    says DISCONNECTED on its own; this only has to be
-#                    longer than the modem's own calling.
+#                    longer than the modem's own calling. With
+#                    modem_decides it is a SILENCE window instead: it
+#                    starts over on every line the modem sends.
+#   modem_decides    True: the modem, not a QtC clock, ends a call or a
+#                    session (Data2G's author, 2026-11-15: QtC timed out
+#                    calls his modem was still retrying). Any command-port
+#                    line (PTT, BUSY, MODE, BUFFER...) counts as "still
+#                    working": it restarts the connect wait and keeps
+#                    data-port reads waiting, up to MODEM_ACTIVITY_CAP
+#                    past the last data byte. VARA keeps its fixed clocks.
+#   connect_cap      hard limit on a modem_decides CONNECT, for a modem
+#                    that never stops reporting (a busy channel) - Abort
+#                    is not live while connecting.
 #   min_reply_wait   floor on every "silence while waiting for the BBS"
 #                    (BBSSession._reply_wait), like AGW's MIN_REPLY_WAIT.
 #                    Must exceed the modem's longest single frame plus a
@@ -424,23 +436,28 @@ VARA_MODEMS = {
     "vara_hf": dict(name="VARA HF", bw=["500", "2300"], bw_default="500",
                     bw_style="hf", experimental=False,
                     connect_timeout=90, min_reply_wait=0,
-                    min_nudge_wait=0, disconnect_wait=60),
+                    min_nudge_wait=0, disconnect_wait=60,
+                    modem_decides=False),
     "vara_fm": dict(name="VARA FM", bw=["NARROW", "WIDE"], bw_default="NARROW",
                     bw_style="fm", experimental=False,
                     connect_timeout=90, min_reply_wait=0,
-                    min_nudge_wait=0, disconnect_wait=60),
+                    min_nudge_wait=0, disconnect_wait=60,
+                    modem_decides=False),
     "mercury": dict(name="Mercury", bw=["500", "2300"], bw_default="500",
                     bw_style="hf", experimental=True,
                     connect_timeout=330, min_reply_wait=90,
-                    min_nudge_wait=60, disconnect_wait=240),
+                    min_nudge_wait=60, disconnect_wait=240,
+                    modem_decides=True, connect_cap=900),
     "data2g":  dict(name="Data2G", bw=["500", "2300"], bw_default="500",
                     bw_style="hf", experimental=True,
-                    connect_timeout=90, min_reply_wait=30,
-                    min_nudge_wait=20, disconnect_wait=60),
+                    connect_timeout=300, min_reply_wait=30,
+                    min_nudge_wait=20, disconnect_wait=60,
+                    modem_decides=True, connect_cap=900),
     "vardefm": dict(name="VardeFM", bw=[], bw_default="",
                     bw_style="none", experimental=True,
-                    connect_timeout=60, min_reply_wait=30,
-                    min_nudge_wait=20, disconnect_wait=60),
+                    connect_timeout=300, min_reply_wait=30,
+                    min_nudge_wait=20, disconnect_wait=60,
+                    modem_decides=True, connect_cap=900),
 }
 
 
@@ -516,6 +533,12 @@ class VaraTransport:
     RESP_OK           = "OK"
     RESP_WRONG        = "WRONG"
 
+    # modem_decides: how long modem activity alone (no data) may keep a
+    # data-port read waiting past its last byte. A connected modem that
+    # sends idle keep-alives must not hold QtC forever; its own
+    # DISCONNECTED is still what normally ends a dead link.
+    MODEM_ACTIVITY_CAP = 300
+
     def __init__(self, vara_host, cmd_port, data_port, mycall, target_call,
                  timeout=60, bandwidth="2300", vara_type="hf",
                  profile: dict = None):
@@ -537,6 +560,11 @@ class VaraTransport:
         self.MIN_REPLY_WAIT  = p.get("min_reply_wait", 0)
         self.MIN_NUDGE_WAIT  = p.get("min_nudge_wait", 0)
         self.disconnect_wait = p.get("disconnect_wait", 60)
+        self.modem_decides   = bool(p.get("modem_decides", False))
+        self.connect_cap     = p.get("connect_cap", 900)
+        # time.time() of the last command-port line from the modem (PTT,
+        # BUSY, MODE...). Only read when modem_decides.
+        self._last_modem_activity = 0.0
         if profile:
             self.timeout   = p.get("connect_timeout", timeout)
             self.vara_type = p.get("bw_style", self.vara_type)
@@ -729,6 +757,7 @@ class VaraTransport:
             line = self._read_cmd_line(timeout=1.0)
             if not line:
                 continue
+            self._last_modem_activity = time.time()
             self._emit("RX-CMD", line)
             with self._cmd_lock:
                 self._last_cmd_resp = line
@@ -932,11 +961,29 @@ class VaraTransport:
 
         # 6. Wait for CONNECTED (or failure) on cmd port
         self._emit("SYS", f"Waiting for {self.modem_name} connection to {self.target_call}…")
-        deadline = time.time() + self.timeout
-        while time.time() < deadline:
+        # VARA: a fixed self.timeout from CONNECT. modem_decides: the
+        # modem ends a failed call with DISCONNECTED; self.timeout is
+        # only a silence window that starts over on every line it sends,
+        # with connect_cap as the outer limit (2026-11-15).
+        start    = time.time()
+        last_act = start
+        timed_out_why = ""
+        while True:
+            now = time.time()
+            if now - last_act >= self.timeout:
+                timed_out_why = (
+                    f"no word from {self.modem_name} for {int(self.timeout)} s"
+                    if self.modem_decides else "")
+                break
+            if self.modem_decides and now - start >= self.connect_cap:
+                timed_out_why = (f"{self.modem_name} still calling after "
+                                 f"{int(self.connect_cap // 60)} min")
+                break
             line = self._read_cmd_line(timeout=2.0)
             if not line:
                 continue
+            if self.modem_decides:
+                last_act = time.time()
             self._emit("RX-CMD", line)
             upper = line.upper()
             if upper.startswith(self.RESP_CONNECTED):
@@ -963,7 +1010,9 @@ class VaraTransport:
         if not self.connected:
             self._abort_connect()
             raise ConnectionError(
-                f"Timed out waiting for {self.modem_name} connection to {self.target_call}")
+                f"Timed out waiting for {self.modem_name} connection to "
+                f"{self.target_call}"
+                + (f" ({timed_out_why})" if timed_out_why else ""))
 
         # 7. Start background cmd monitor thread
         self._stop_evt.clear()
@@ -1104,6 +1153,29 @@ class VaraTransport:
         with self._data_lock:
             return self._data_buf.decode(self._text_codec, errors="replace")
 
+    def _silence_over(self, data_deadline: float, timeout: float,
+                      last_data: float) -> bool:
+        """True once a data-port read has waited long enough.
+
+        `data_deadline` is the usual silence deadline (last data byte +
+        timeout). With modem_decides, a modem that is still keying,
+        hearing, or switching modes is still working on the link, so the
+        wait also runs to its last command-port line + timeout - but no
+        further than MODEM_ACTIVITY_CAP past the last data byte."""
+        now = time.time()
+        if now < data_deadline:
+            return False
+        if not self.modem_decides:
+            return True
+        if now - last_data >= max(timeout, self.MODEM_ACTIVITY_CAP):
+            return True
+        return now >= self._last_modem_activity + timeout
+
+    def last_link_activity(self) -> float:
+        """time.time() of the last command-port line from a modem_decides
+        modem; 0.0 otherwise (VARA keeps its data-only clocks)."""
+        return self._last_modem_activity if self.modem_decides else 0.0
+
     def read_until(self, expected: str, timeout: int = 30) -> str:
         """
         Read from VARA data port until expected string appears.
@@ -1117,6 +1189,7 @@ class VaraTransport:
 
         deadline = time.time() + timeout
         seen = -1
+        last_data = time.time()
         while True:
             with self._data_lock:
                 # User abort — return whatever's buffered now. The caller
@@ -1130,6 +1203,7 @@ class VaraTransport:
                     # Silence-based timeout — see read_until_any()
                     seen = len(self._data_buf)
                     deadline = time.time() + timeout
+                    last_data = time.time()
                 idx = self._data_buf.lower().find(expected_b.lower())
                 if idx >= 0:
                     end = idx + len(expected_b)
@@ -1139,7 +1213,7 @@ class VaraTransport:
                 lost = self._link_lost()
                 if lost:
                     raise ConnectionError(lost)
-                if time.time() >= deadline:
+                if self._silence_over(deadline, timeout, last_data):
                     result = self._data_buf
                     self._data_buf = b""
                     return result.decode(self._text_codec, errors="replace")
@@ -1168,6 +1242,7 @@ class VaraTransport:
 
         deadline = time.time() + timeout
         seen = -1
+        last_data = time.time()
         while True:
             with self._data_lock:
                 if self._abort.is_set():
@@ -1181,6 +1256,7 @@ class VaraTransport:
                     # can take minutes over one reply — never jump ahead.
                     seen = len(self._data_buf)
                     deadline = time.time() + timeout
+                    last_data = time.time()
                 low = self._data_buf.lower()
                 best_idx, best = -1, None
                 for entry, needle in needles:
@@ -1196,7 +1272,7 @@ class VaraTransport:
                 lost = self._link_lost()
                 if lost:
                     raise ConnectionError(lost)
-                if time.time() >= deadline:
+                if self._silence_over(deadline, timeout, last_data):
                     result = self._data_buf
                     self._data_buf = b""
                     return (result.decode(self._text_codec,
@@ -1229,12 +1305,14 @@ class VaraTransport:
         """
         deadline = time.time() + timeout
         seen = -1
+        last_data = time.time()
         while True:
             with self._data_lock:
                 if len(self._data_buf) != seen:
                     # Silence-based timeout — see read_until_any()
                     seen = len(self._data_buf)
                     deadline = time.time() + timeout
+                    last_data = time.time()
                 if len(self._data_buf) >= n:
                     result = self._data_buf[:n]
                     self._data_buf = self._data_buf[n:]
@@ -1242,7 +1320,7 @@ class VaraTransport:
                 lost = self._link_lost()
                 if lost:
                     raise ConnectionError(lost)
-                if time.time() >= deadline:
+                if self._silence_over(deadline, timeout, last_data):
                     result = self._data_buf
                     self._data_buf = b""
                     return result

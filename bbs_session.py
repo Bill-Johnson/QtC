@@ -1101,14 +1101,27 @@ class BBSSession:
         import time as _time
         bbs_response = ""
         last_rx      = _time.time()
+        last_data    = last_rx
         sent_abort   = False
+        # A modem that decides for itself (Data2G, Mercury, VardeFM) is
+        # still working on the link while it keys up or hears the far end,
+        # so that counts as "not quiet" too - no give-up, no 'A' nudge over
+        # a frame it is retrying (2026-11-15). Capped like the transport's
+        # reads so idle keep-alives can't hold the login open forever.
+        link_activity = getattr(self.transport, "last_link_activity",
+                                lambda: 0.0)
+        cap = max(quiet, getattr(self.transport, "MODEM_ACTIVITY_CAP", 0))
         while _time.time() - last_rx < quiet:
             if getattr(self.transport, "abort_requested", lambda: False)():
                 break
             chunk = self.transport.read_until(">", timeout=2)
             if chunk:
                 bbs_response += chunk
-                last_rx = _time.time()
+                last_rx = last_data = _time.time()
+            else:
+                act = link_activity()
+                if act > last_rx and act - last_data < cap:
+                    last_rx = act
             if (re.search(r"de\s+\S+>", bbs_response, re.IGNORECASE)
                     or re.search(r"(^|[\r\n])>\s*$", bbs_response)
                     or self._registration_field(bbs_response)):

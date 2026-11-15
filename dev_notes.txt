@@ -1,6 +1,6 @@
 QtC dev notes — experimental modems (Mercury, Data2G, VardeFM)
 =====================================================================
-QtC 0.16.0-dev · first on-air results 2026-11-14 · branch `dev`
+QtC 0.16.0-dev · first on-air results 2026-11-14 · updated 2026-11-15 · branch `dev`
 
 These notes are for testers and developers who want to try QtC with the
 new open-source HF/VHF modems. They record what we set up, what we
@@ -90,6 +90,16 @@ https://github.com/Bill-Johnson/QtC/issues
   e) Timing per modem. VARA's timeouts were too short for Mercury's
      slowest mode (see section 5), so each modem has its own profile.
 
+  f) The modem decides (2026-11-15). A Data2G tester saw QtC give up
+     on calls his modem was still retrying: QtC ended a CONNECT at a
+     fixed 90 s. For Mercury, Data2G and VardeFM, QtC now leaves that
+     to the modem: a failed call ends when the modem says DISCONNECTED.
+     Any line the modem sends on its command port (PTT, BUSY, MODE,
+     IAMALIVE...) counts as "still working", which restarts QtC's
+     safety net. The same goes for waiting on the BBS once connected:
+     while the modem is keying or hearing the other station, QtC keeps
+     waiting and won't nudge. VARA HF/FM keep their old fixed timers.
+
 
 ---------------------------------------------------------------------
 4. PER-MODEM SETUP NOTES
@@ -126,6 +136,15 @@ https://github.com/Bill-Johnson/QtC/issues
       turn the drive down from where Mercury was.
     - Unanswered, it gives up by itself after 5 CALLs (~55 s) and reports
       DISCONNECTED.
+    - RIG GOTCHA: Data2G opens the rig once, when it starts. If the radio
+      is off or its USB isn't up yet, the rig stays closed: the Settings
+      CAT and PTT tests still pass (they open it themselves), but every
+      call logs "PTT on failed: rig is not open" in Data2G's terminal and
+      nothing goes out. Data2G still reports PTT ON/OFF to QtC, so it
+      looks like a normal unanswered call. Start Data2G after the radio
+      is up, and check its terminal for "Rig: <your radio> at <port>".
+    - Also check the radio's mode: a radio left in CW keys up but sends
+      no audio from the sound card. Use USB (or the radio's data mode).
 
   VARDEFM
     - FM modem (VHF/UHF). Not yet tested on the air with QtC.
@@ -180,9 +199,16 @@ https://github.com/Bill-Johnson/QtC/issues
                      connect   reply-silence   login-nudge   disconnect
                      timeout   floor           floor         wait
   VARA HF / FM         90 s      none            20 s          60 s
-  Mercury             330 s      90 s            60 s         240 s
-  Data2G               90 s      30 s            20 s          60 s
-  VardeFM              60 s      30 s            20 s          60 s
+  Mercury             330 s*     90 s            60 s         240 s
+  Data2G              300 s*     30 s            20 s          60 s
+  VardeFM             300 s*     30 s            20 s          60 s
+
+  * The modem decides (section 3f): this is how long the modem may go
+    completely silent before QtC gives up, and it restarts on every
+    line the modem sends. An outer limit of 15 min stops a call that
+    never ends (Abort isn't available while connecting). Once
+    connected, modem activity can keep a wait for the BBS open up to
+    5 min past the last data received.
 
   - connect timeout: only a safety net; the modem reports DISCONNECTED
     itself when it gives up. Must outlast the modem's own calling.
