@@ -26,6 +26,14 @@ Transports
   separate Windows PC) — set its address in the BBS entry
 - Telnet — LAN / internet nodes for local testing; auto-disconnects after
   the mail check completes
+- Experimental modems — Data2G, Mercury and VardeFM, open-source modems
+  that use VARA's control scheme, so each is simply another choice in
+  the Mode and Transport drop-downs. Turn on Settings -> App ->
+  Experimental modems to see them. Each BBS entry keeps its own modem,
+  Host / Command port and timing, and QtC names the modem in the
+  toolbar, the BBS List and the status line, so it is always clear
+  which one you are on. A modem only talks to the same modem at the
+  other station, not to VARA — so the BBS must run the same modem
 - PTT — for VARA, RTS or DTR via serial port, with both lines set low
   before QtC opens the port, so opening it does not key the radio;
   defensive flow-control flags for Digirig / CP2105 setups. Packet modems
@@ -41,7 +49,13 @@ Mail
 - Auto-download of new personal mail when you connect from Mail view.
   Connecting from Terminal or Debug view logs in and stops there — you
   drive
-- Compose & reply — personal (P) and bulletin (B) message types
+- Compose & reply — personal (P) and bulletin (B) message types. A
+  missing callsign or subject is caught before the window closes, so
+  nothing you typed is lost
+- Drafts folder — close a message you are not ready to send and QtC
+  asks Save Draft / Discard / Cancel. Drafts stay on your computer and
+  never go to the BBS; open one later (Open Draft or double-click),
+  finish it, and OK moves it to the Outbox
 - Outbox queue — stage messages offline; everything queued goes out
   together on your next Send / Receive, with each message's size shown
   in the list
@@ -103,8 +117,8 @@ Address Book
 
 UI / UX
 - Three-pane main window — folder tree, message list, preview pane
-- Folder badges — Inbox (N new), Outbox (N), Bulletins (N new),
-  Notifications (N new)
+- Folder badges — Inbox (N new), Drafts (N), Outbox (N), Bulletins
+  (N new), Notifications (N new)
 - Keyboard-driven navigation — Tab/Shift+Tab cycles folders -> message
   list -> reading pane; Enter opens the body, Esc returns to the list;
   F2/F3/F4 switch Mail/Terminal/Debug; single-key list actions (N new,
@@ -292,13 +306,42 @@ Packet Setup (Direwolf / SoundModem)
 
 ------------------------------------------------------------------------
 
+Experimental Modems Setup (Data2G, Mercury, VardeFM)
+
+1. Settings -> App -> tick Experimental modems
+2. Settings -> BBS List -> Add/Edit — pick Data2G, Mercury or VardeFM
+   from the Transport drop-down; Host 127.0.0.1 (or the computer
+   running the modem); Command port = the modem's command port (8300
+   by default for all three). The data port is always the next number
+3. The modem keys the radio — set PTT in the modem, not in QtC
+   (Settings -> PTT stays None)
+   - Data2G: its Rig switch must be on for any PTT except VOX — with
+     Rig off it never keys, even with RTS selected
+   - Mercury: PTT is none unless you start it with
+     -P serial -A /dev/ttyUSB0 (or Hamlib) — or use VOX
+4. Start the modem before you click Connect
+5. The station at the other end must run the same modem — these do not
+   talk to VARA, or to each other
+
+Using more than one modem: give each its own Command port (for example
+Data2G on 8310, Mercury on 8320) and make a BBS entry for each one.
+Picking the entry picks the modem, and its name shows in the toolbar
+Mode list, the BBS List Type column and the status line
+("Connected · N0CALL-1 (Data2G BW500)").
+
+Measured settings, levels, timings and known quirks for each modem are
+in dev_notes.txt.
+
+------------------------------------------------------------------------
+
 Data Storage
 
   Platform             Location
   Linux / Pi           ~/.local/share/qtc/
   Windows              %APPDATA%\qtc\
 
-  messages.db — SQLite database (inbox, outbox, sent, bulletins, contacts)
+  messages.db — SQLite database (inbox, drafts, outbox, sent, bulletins,
+                contacts)
   config.json — all settings
 
 Both files are preserved when you reinstall or upgrade.
@@ -318,8 +361,8 @@ Source Files
   transport.py    — VARA HF, VARA FM, AGW packet (Direwolf / SoundModem),
                     and Telnet transports (single-reader pattern)
   ptt.py          — PTT control via serial RTS/DTR
-  database.py     — SQLite: inbox, outbox, sent, bulletins, watermarks,
-                    contacts
+  database.py     — SQLite: inbox, drafts, outbox, sent, bulletins,
+                    watermarks, contacts
   make_splash.py  — Pillow generator for qtc_splash.png — version-stamped
                     at install/build time
 
@@ -328,6 +371,9 @@ Source Files
 Known Limitations (Beta)
 
 - No rig control yet — set frequency manually on your radio
+- Experimental modems are in testing. Data2G and Mercury have passed
+  full mail sessions on HF; VardeFM has not yet been tested on the air;
+  YAPP file transfer over them is untested
 - YAPP upload not yet implemented (download only)
 - YAPP over Telnet is unreliable — RF paths (VARA HF / FM, packet) are
   the supported transport for file transfer

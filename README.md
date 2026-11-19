@@ -22,11 +22,17 @@ three-pane GUI.
 
 Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 
-**New on `dev`:** three experimental open-source modems that speak VARA's TCP
-interface — **[Mercury](https://github.com/Rhizomatica/mercury)**,
-**[Data2G](https://github.com/arodland/Data2G)** and
-**[VardeFM](https://github.com/notepid/vardeFM)** — behind a Settings switch.
-Mercury and Data2G have completed full BBS mail sessions over HF with QtC.
+**New on `dev`:** three experimental open-source modems —
+**[Data2G](https://github.com/arodland/Data2G)**,
+**[Mercury](https://github.com/Rhizomatica/mercury)** and
+**[VardeFM](https://github.com/notepid/vardeFM)**. They use the same control
+scheme as VARA, so they are **one pick from a drop-down**: turn on
+**Settings → App → Experimental modems** and they appear right beside VARA in
+the Mode and Transport lists, with nothing extra to set up in QtC.
+Data2G and Mercury have completed full BBS mail sessions over HF with QtC.
+
+**Run more than one high-speed modem?** QtC always tells you which one is in use. Each BBS entry remembers its own modem, Host and Command port, so choosing the BBS chooses the modem. The modem's name is shown in the toolbar **Mode** list, in the **Type** column of the BBS List, and in the status line while you connect and once you are on (*Connected · N0CALL-1 (Data2G BW500)*).
+
 What we measured, and how to set each one up, is in **[dev_notes.txt](dev_notes.txt)**.
 Feedback is very welcome: open an [Issue](https://github.com/Bill-Johnson/QtC/issues).
 
@@ -122,7 +128,7 @@ with your OS, the modem and its version, what you did, and the Debug view text
 ### New on `dev` — experimental modems
 
 ![New modems in the BBS entry dialog](screenshots/dev_1_New_Modems.png)
-*Settings → BBS List → Edit — with **Experimental modems** turned on, Mercury, Data2G and VardeFM join VARA, Telnet and packet in the Transport list*
+*Settings → BBS List → Edit — with **Experimental modems** turned on, Data2G, Mercury and VardeFM are drop-down choices in the Transport list, right beside VARA, Telnet and packet*
 
 ![Mail and bulletins brought in over Mercury and Data2G](screenshots/dev_2_Mail_and_Bulletins.png)
 *Mail view after sessions over Mercury and Data2G — new personal mail in the Inbox and new SITREP bulletins, downloaded automatically (test mailbox, fake callsigns)*
@@ -180,13 +186,14 @@ with your OS, the modem and its version, what you did, and the Debug view text
 - **VARA FM** — packet-voice frequencies with **NARROW / WIDE** bandwidth control; same UI as HF
 - **AX.25 packet** — 300 baud HF and 1200 baud VHF through **Direwolf** or **UZ7HO SoundModem / QtSoundModem**, using the modem's AGW port. The modem can run on another computer on your network (many operators keep SoundModem on a separate Windows PC) — set its address in the BBS entry
 - **Telnet** — LAN / internet nodes for local testing; auto-disconnects after the mail check completes
-- **Experimental modems (dev)** — **Mercury**, **Data2G** and **VardeFM**, open-source modems that use VARA's TCP interface. Turn on **Settings → App → Experimental modems** to see them. Each keeps its own Host / Command port per BBS entry and its own timing. They talk only to the same modem at the other station, not to VARA — so the BBS must run the same modem. See [Experimental Modems Setup](#experimental-modems-setup-dev) and [dev_notes.txt](dev_notes.txt)
+- **Experimental modems (dev)** — **Data2G**, **Mercury** and **VardeFM**, open-source modems that use VARA's control scheme, so each is simply another choice in the Mode and Transport drop-downs. Turn on **Settings → App → Experimental modems** to see them. Each BBS entry keeps its own modem, Host / Command port and timing, and QtC names the modem in the toolbar, the BBS List and the status line, so it is always clear which one you are on. A modem only talks to the same modem at the other station, not to VARA — so the BBS must run the same modem. See [Experimental Modems Setup](#experimental-modems-setup-dev) and [dev_notes.txt](dev_notes.txt)
 - **PTT** — for VARA, RTS or DTR via serial port, with both lines set low before QtC opens the port, so opening it does not key the radio; defensive flow-control flags for Digirig / CP2105 setups. Packet modems key the radio themselves
 
 ### Mail
 - **Bounded mail check** — every listing is limited by something you control, never by how busy the BBS is: `LM` lists your own mailbox, `L> CATEGORY` lists one page of each bulletin category you subscribe to, and `OP` sets the BBS page length (20 by default) so a long listing pauses instead of streaming. Only personal mail addressed to your callsign is auto-downloaded — never sysop chatter or system traffic
 - **Auto-download** of new personal mail when you connect from Mail view. Connecting from Terminal or Debug view logs in and stops there — you drive
-- **Compose & reply** — personal (P) and bulletin (B) message types
+- **Compose & reply** — personal (P) and bulletin (B) message types. A missing callsign or subject is caught before the window closes, so nothing you typed is lost
+- **📝 Drafts folder** — close a message you are not ready to send and QtC asks **Save Draft / Discard / Cancel**. Drafts stay on your computer and never go to the BBS; open one later (**Open Draft** or double-click), finish it, and OK moves it to the Outbox
 - **Outbox queue** — stage messages offline; everything queued goes out together on your next **Send / Receive**, with each message's size shown in the list
 - **Hierarchical addressing (HA)** — full support for routed addresses (e.g. `N0CALL.#REGION.ST.USA.NOAM`) in My Station, the address book, and Compose
 
@@ -222,7 +229,7 @@ with your OS, the modem and its version, what you did, and the Debug view text
 
 ### UI / UX
 - Three-pane main window — folder tree, message list, preview pane
-- Folder badges — Inbox (N new), Outbox (N), Bulletins (N new), Notifications (N new)
+- Folder badges — Inbox (N new), Drafts (N), Outbox (N), Bulletins (N new), Notifications (N new)
 - **Keyboard-driven navigation** — Tab/Shift+Tab cycles folders → message list → reading pane; Enter opens the body, Esc returns to the list; F2/F3/F4 switch Mail/Terminal/Debug; single-key list actions (N new, R reply, D/Del delete, F search, M mark-all-read) plus Ctrl shortcuts that work anywhere. **Help → Keyboard Shortcuts (F1)** shows the full cheat sheet
 - **Character-set selector** — decode BBS content as UTF-8 (default), CP437 (DOS graphics), or CP850 (DOS Latin-1) in Settings → App, so box-drawing / line-art bulletins render correctly
 - **⏹ Abort button** — stop a mail or bulletin download that QtC is running and return the BBS to its command prompt with the BBS's own `A` command. You stay connected. It is greyed out during a YAPP file transfer, which cannot be stopped, and in Terminal view, where the **A** quick button does the same job
@@ -397,6 +404,11 @@ On your first connection QtC will ask whether to download all personal messages 
 4. Start the modem **before** you click Connect
 5. The station at the other end must run the **same modem** — these do not talk to VARA, or to each other
 
+**Using more than one modem:** give each its own Command port (for example
+Data2G on 8310, Mercury on 8320) and make a BBS entry for each one. Picking
+the entry picks the modem, and its name shows in the toolbar **Mode** list,
+the BBS List **Type** column and the status line.
+
 Measured settings, levels, timings and known quirks for each modem are in
 **[dev_notes.txt](dev_notes.txt)**.
 
@@ -428,7 +440,7 @@ sqlite3 ~/.local/share/qtc/data/messages.db "DELETE FROM bulletin_tombstones; DE
 | `bbs_session.py` | BBS login, mail check, message download / send, YAPP file transfer |
 | `transport.py` | VARA HF, VARA FM, AGW packet (Direwolf / SoundModem), and Telnet transports (single-reader pattern) |
 | `ptt.py` | PTT control via serial RTS/DTR |
-| `database.py` | SQLite — inbox, outbox, sent, bulletins, watermarks, contacts |
+| `database.py` | SQLite — inbox, drafts, outbox, sent, bulletins, watermarks, contacts |
 | `make_splash.py` | Pillow generator for `qtc_splash.png` — version-stamped at install/build time |
 
 ---
@@ -436,7 +448,7 @@ sqlite3 ~/.local/share/qtc/data/messages.db "DELETE FROM bulletin_tombstones; DE
 ## Known Limitations (Beta)
 
 **Dev branch:**
-- Experimental modems are in testing. Mercury and Data2G have passed full mail sessions on HF; **VardeFM** has not yet been tested on the air; **Modem73** is not supported (it has no connected mode yet)
+- Experimental modems are in testing. Data2G and Mercury have passed full mail sessions on HF; **VardeFM** has not yet been tested on the air; **Modem73** is not supported (it has no connected mode yet)
 - YAPP file transfer over the experimental modems is untested
 - No release downloads for `-dev` builds — run from a git clone (see the top of this page)
 

@@ -7,14 +7,15 @@ only place that records what changed and when.
 
 
 ========================================================================
-0.16.0-dev  (2026-11-14)  — development branch, not a release
+0.16.0-dev  (2026-11-18)  — development branch, not a release
 ========================================================================
 
 WHAT THIS IS
   The public dev branch. Run it from a git clone (see README.md); there
   are no release downloads for -dev builds. It adds three experimental
-  open-source modems that use VARA's TCP interface — Mercury, Data2G and
-  VardeFM — behind a Settings switch, and the fixes that made them work.
+  open-source modems that use VARA's control scheme — Mercury, Data2G
+  and VardeFM — as drop-down choices behind a Settings switch, and the
+  fixes that made them work.
   What we measured on the air is in dev_notes.txt.
 
 NEW
@@ -27,8 +28,28 @@ NEW
   - Host and Command port per BBS entry for VARA HF/FM and the new
     modems (data port = command port + 1), like the packet entries.
     Older entries keep using the config.json values.
+  - The modem decides when a call or session has failed (Mercury,
+    Data2G, VardeFM). QtC no longer gives up on a connect at a fixed
+    90 s while the modem is still retrying; it waits as long as the
+    modem keeps reporting activity, and the modem's own DISCONNECTED
+    ends a failed call. Reads and the login wait work the same way.
+    Hard limits stay in place for a modem that never goes quiet.
+    VARA HF / FM are unchanged.
+  - Drafts folder. Closing a message you have typed in now asks Save
+    Draft / Discard / Cancel. Drafts stay on your computer and never go
+    to the BBS; Open Draft (or double-click) reopens one, and OK moves
+    it to the Outbox.
 
 FIXED
+  - A missing To: callsign closed the Compose window and lost the
+    message. To: and Subject: are now checked while the window is
+    still open, and a blank Subject is no longer allowed.
+  - Deleting a message could also delete an unrelated message in
+    another folder that had the same internal number (for example an
+    Outbox message taking an Inbox message with it). Delete now only
+    touches the folder you are in.
+  - The YAPP Get File window stays open when the filename is blank or
+    has spaces, instead of closing and warning afterwards.
   - Modem commands end in CR only, as the VARA spec says. Mercury
     rejected every command after the first with CR+LF.
   - Each modem command now waits for its OK / WRONG reply; a refused

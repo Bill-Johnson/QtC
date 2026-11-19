@@ -1,4 +1,4 @@
-# QtC v0.15.0-beta — database.py  (built 2026-09-23)
+# QtC v0.15.0-beta — database.py  (built 2026-11-18)
 # VARA BBS Client — A modern BBS client for LinBPQ/BPQ32 nodes
 # via VARA HF, VARA FM, and Telnet.
 #
@@ -326,12 +326,23 @@ class MessageDatabase:
                 "UPDATE inbox SET read=1 WHERE read=0 AND bbs_id=?",
                 (self.SYSTEM_BBS_ID,))
 
-    def delete_message(self, row_id: int):
-        """Delete from whichever table contains this id (inbox first, then outbox/sent)."""
+    # Which table each Mail-view folder lives in. Notifications are inbox
+    # rows (see get_notifications).
+    _FOLDER_TABLE = {"inbox": "inbox", "notifications": "inbox",
+                     "outbox": "outbox", "sent": "sent", "drafts": "drafts"}
+
+    def delete_message(self, row_id: int, folder: str):
+        """Delete one row from the table behind `folder`.
+
+        Every table numbers its rows from 1 on its own, so an id alone does
+        not say which message it is. This used to delete that id from inbox,
+        outbox AND sent: deleting Outbox #3 also deleted Inbox #3 and Sent #3
+        (found 2026-11-18). The folder is required so that cannot come back."""
+        table = self._FOLDER_TABLE.get(folder)
+        if table is None:
+            raise ValueError(f"delete_message: unknown folder {folder!r}")
         with self._conn() as conn:
-            conn.execute("DELETE FROM inbox  WHERE id=?", (row_id,))
-            conn.execute("DELETE FROM outbox WHERE id=?", (row_id,))
-            conn.execute("DELETE FROM sent   WHERE id=?", (row_id,))
+            conn.execute(f"DELETE FROM {table} WHERE id=?", (row_id,))
 
     # ── Outbox ─────────────────────────────────────────────────────
 
@@ -385,17 +396,29 @@ class MessageDatabase:
     # ── Drafts ─────────────────────────────────────────────────────
 
     def save_draft(self, to_call: str, subject: str, body: str,
-                   msg_type: str = "P", at_bbs: str = ""):
+                   msg_type: str = "P", at_bbs: str = "",
+                   draft_id: int = None) -> int:
+        """Save a draft and return its id. With draft_id, overwrite that
+        draft in place (re-saving an opened draft must not make a copy).
+        created_at is bumped either way, so it reads as "last saved"."""
+        vals = (to_call.upper(), at_bbs.upper(), subject, body, msg_type)
         with self._conn() as conn:
-            conn.execute(
+            if draft_id is not None:
+                cur = conn.execute(
+                    "UPDATE drafts SET to_call=?, at_bbs=?, subject=?, body=?, "
+                    "msg_type=?, created_at=CURRENT_TIMESTAMP WHERE id=?",
+                    vals + (draft_id,))
+                if cur.rowcount:
+                    return draft_id
+            cur = conn.execute(
                 "INSERT INTO drafts (to_call, at_bbs, subject, body, msg_type) "
-                "VALUES (?,?,?,?,?)",
-                (to_call.upper(), at_bbs.upper(), subject, body, msg_type))
+                "VALUES (?,?,?,?,?)", vals)
+            return cur.lastrowid
 
     def get_drafts(self) -> list:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT * FROM drafts ORDER BY created_at DESC").fetchall()
+                "SELECT * FROM drafts ORDER BY created_at DESC, id DESC").fetchall()
             return [dict(r) for r in rows]
 
     def delete_draft(self, row_id: int):

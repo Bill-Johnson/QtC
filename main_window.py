@@ -1,4 +1,4 @@
-# QtC v0.16.0-dev — main_window.py  (built 2026-11-14)
+# QtC v0.16.0-dev — main_window.py  (built 2026-11-18)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -1172,9 +1172,12 @@ class _ContactEditDialog(QDialog):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ComposeDialog(QDialog):
-    def __init__(self, parent=None, reply_to=None, contacts_db=None, font_size=10):
+    def __init__(self, parent=None, reply_to=None, contacts_db=None, font_size=10,
+                 draft=None):
         super().__init__(parent)
         self.cdb = contacts_db
+        # Set when the user closes with "Save Draft" — the caller saves it.
+        self.save_as_draft = False
         self._contacts = []   # cached for dropdown
         self._font_size = font_size
         self.setWindowTitle("Compose Message")
@@ -1249,6 +1252,15 @@ class ComposeDialog(QDialog):
                 f"> {l}" for l in (reply_to.get("body", "") or "").splitlines())
             self.body_edit.setPlainText(f"\n\n--- Original ---\n{quoted}")
 
+        if draft:
+            self.setWindowTitle("Compose Message — Draft")
+            self.to_edit.setText(draft.get("to_call") or "")
+            self.at_bbs_edit.setText(draft.get("at_bbs") or "")
+            self.subject_edit.setText(draft.get("subject") or "")
+            self.type_combo.setCurrentIndex(
+                1 if draft.get("msg_type") == "B" else 0)
+            self.body_edit.setPlainText(draft.get("body") or "")
+
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
             QDialogButtonBox.StandardButton.Cancel)
@@ -1259,6 +1271,11 @@ class ComposeDialog(QDialog):
         # Cache top contacts for dropdown
         if self.cdb:
             self._contacts = self.cdb.get_top(5)
+
+        # What the window held when it opened (a reply's quote, an opened
+        # draft). Closing without changing any of it is not "losing work",
+        # so it closes without asking.
+        self._opened_with = self.get_values()
 
     def _show_dropdown(self):
         """Show a popup menu with top contacts for quick selection."""
@@ -1326,6 +1343,63 @@ class ComposeDialog(QDialog):
             self._contacts = self.cdb.get_top(5)
             QMessageBox.information(self, "Saved",
                 f"{v['callsign']} added to address book.")
+
+    def accept(self):
+        # Validate HERE, while the dialog is still open. The caller used to
+        # check after exec() returned, so a missing callsign warned and then
+        # threw away everything typed (Bill, 2026-11-18). Reply had no check
+        # at all.
+        if not self.to_edit.text().strip():
+            QMessageBox.warning(self, "Missing Field",
+                "Please enter a To: callsign.")
+            self.to_edit.setFocus()
+            return
+        # A blank title is the kind of thing an old BBS handles badly, and
+        # it is easy to fix here and hard to fix once it is on the air
+        # (Bill, 2026-11-18: no blank subject lines).
+        if not self.subject_edit.text().strip():
+            QMessageBox.warning(self, "Missing Field",
+                "Please enter a Subject.")
+            self.subject_edit.setFocus()
+            return
+        super().accept()
+
+    def _has_unsaved_work(self) -> bool:
+        v = self.get_values()
+        if v == self._opened_with:
+            return False
+        return any(str(v[k]).strip() for k in ("to_call", "at_bbs",
+                                                "subject", "body"))
+
+    def reject(self):
+        """Cancel, Escape and the window's X all land here. If anything was
+        typed, ask before throwing it away (Bill, 2026-11-18)."""
+        if not self._has_unsaved_work():
+            super().reject()
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Close Message")
+        box.setText("Save this message as a draft?")
+        box.setInformativeText(
+            "Drafts stay in the Drafts folder until you open and send "
+            "them. Nothing is sent to the BBS.")
+        b_draft   = box.addButton("Save Draft",
+                                  QMessageBox.ButtonRole.AcceptRole)
+        b_discard = box.addButton("Discard",
+                                  QMessageBox.ButtonRole.DestructiveRole)
+        b_cancel  = box.addButton("Cancel",
+                                  QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(b_draft)
+        box.setEscapeButton(b_cancel)   # Escape = keep editing, never lose it
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is b_draft:
+            self.save_as_draft = True
+            super().reject()
+        elif clicked is b_discard:
+            super().reject()
+        # Cancel (or Escape): stay open, nothing lost
 
     def get_values(self):
         return {
@@ -1632,6 +1706,7 @@ class MailView(QWidget):
         self.folder_tree.setMinimumWidth(135)
 
         self._fi = QTreeWidgetItem(self.folder_tree, ["📥  Inbox"])
+        self._fd = QTreeWidgetItem(self.folder_tree, ["📝  Drafts"])
         self._fo = QTreeWidgetItem(self.folder_tree, ["📤  Outbox"])
         self._fs = QTreeWidgetItem(self.folder_tree, ["📨  Sent"])
         self._fn = QTreeWidgetItem(self.folder_tree, ["🔔  Notifications"])
@@ -1664,7 +1739,7 @@ class MailView(QWidget):
         self._search_edit.textChanged.connect(self._on_search_changed)
         self._search_scope = QComboBox()
         self._search_scope.addItems(
-            ["All folders", "Inbox", "Outbox", "Sent",
+            ["All folders", "Inbox", "Drafts", "Outbox", "Sent",
              "Notifications", "Bulletins"])
         self._search_scope.setFixedWidth(120)
         self._search_scope.currentIndexChanged.connect(self._on_search_changed)
@@ -1701,6 +1776,7 @@ class MailView(QWidget):
         self.msg_table.setAlternatingRowColors(True)
         self.msg_table.verticalHeader().setVisible(False)
         self.msg_table.currentCellChanged.connect(self._row_selected)
+        self.msg_table.cellDoubleClicked.connect(self._on_double_click)
         self.msg_table.selectionModel().selectionChanged.connect(
             self._on_selection_changed)
         v.addWidget(self.msg_table)
@@ -1856,6 +1932,14 @@ class MailView(QWidget):
         sc_back.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         sc_back.activated.connect(self.msg_table.setFocus)
 
+    def _on_double_click(self, row, _col):
+        """Double-clicking a draft opens it (same as Open Draft). Other
+        folders keep their old do-nothing behaviour."""
+        it = self.msg_table.item(row, 1)
+        if it and (it.data(Qt.ItemDataRole.UserRole + 1)
+                   or self._current_folder()) == "drafts":
+            self.sig_reply.emit()
+
     def _kb_enter_reading_pane(self):
         if self.msg_table.currentRow() >= 0:
             self.preview_body.setFocus()
@@ -1864,6 +1948,7 @@ class MailView(QWidget):
         if current is None:
             return
         if   current is self._fi: self.sig_folder_changed.emit("inbox")
+        elif current is self._fd: self.sig_folder_changed.emit("drafts")
         elif current is self._fo: self.sig_folder_changed.emit("outbox")
         elif current is self._fs: self.sig_folder_changed.emit("sent")
         elif current is self._fn: self.sig_folder_changed.emit("notifications")
@@ -1959,9 +2044,10 @@ class MailView(QWidget):
         results = []
 
         scope_map = {
-            "All folders":   ["inbox", "outbox", "sent",
+            "All folders":   ["inbox", "drafts", "outbox", "sent",
                               "notifications", "bulletins"],
             "Inbox":         ["inbox"],
+            "Drafts":        ["drafts"],
             "Outbox":        ["outbox"],
             "Sent":          ["sent"],
             "Notifications": ["notifications"],
@@ -2050,17 +2136,22 @@ class MailView(QWidget):
             if not it:
                 continue
             row_id = it.data(Qt.ItemDataRole.UserRole)
-            if row_id is None or row_id in seen:
+            if row_id is None:
                 continue
-            seen.add(row_id)
             folder_override = it.data(Qt.ItemDataRole.UserRole + 1)
             folder = folder_override if folder_override else self._current_folder()
+            # Key on (id, folder): ids repeat across tables, so search
+            # results can hold Inbox #3 and Sent #3 side by side.
+            if (row_id, folder) in seen:
+                continue
+            seen.add((row_id, folder))
             result.append((row_id, folder))
         return result
 
     def _current_folder(self):
         cur = self.folder_tree.currentItem()
         if   cur is self._fi: return "inbox"
+        elif cur is self._fd: return "drafts"
         elif cur is self._fo: return "outbox"
         elif cur is self._fs: return "sent"
         elif cur is self._fn: return "notifications"
@@ -2069,8 +2160,9 @@ class MailView(QWidget):
     # ── Public methods called by MainWindow ────────────────────
 
     def update_folder_counts(self, unread: int, pending: int, sent: int = 0,
-                             notifications: int = 0):
+                             notifications: int = 0, drafts: int = 0):
         self._fi.setText(0, f"📥  Inbox ({unread} new)" if unread else "📥  Inbox")
+        self._fd.setText(0, f"📝  Drafts ({drafts})"  if drafts  else "📝  Drafts")
         self._fo.setText(0, f"📤  Outbox ({pending})"   if pending else "📤  Outbox")
         self._fs.setText(0, f"📨  Sent ({sent})"        if sent    else "📨  Sent")
         self._fn.setText(
@@ -2103,10 +2195,14 @@ class MailView(QWidget):
         # No composing or replying to bulletins or QtC notifications
         self.btn_new.setVisible(not is_bulletin and not is_notif)
         self.btn_reply.setVisible(not is_bulletin and not is_notif)
+        self.btn_reply.setText("✏  Open Draft" if folder == "drafts"
+                               else "↩  Reply")
         self.btn_delete.setVisible(True)
 
         if folder == "outbox":
             self._fill_outbox(rows)
+        elif folder == "drafts":
+            self._fill_outbox(rows, icon="📝", when="Saved")
         elif is_bulletin:
             self._fill_bulletins(rows, folder=folder)
         else:
@@ -2172,23 +2268,23 @@ class MailView(QWidget):
                 self.msg_table.setItem(r, c, it)
         self.msg_table.resizeRowsToContents()
 
-    def _fill_outbox(self, rows):
+    def _fill_outbox(self, rows, icon: str = "📤", when: str = "Queued"):
         # Size replaced a "Status" column that could only ever read
         # "Pending" — the outbox folder shows pending rows and nothing
         # else, so it never told anyone anything (Bill, 2026-09-23).
         # Bytes, counted the same way mark_sent() counts them, so the
         # number does not change when the message moves to Sent.
         self.msg_table.setHorizontalHeaderLabels(
-            ["", "To", "Subject", "Queued", "Size"])
+            ["", "To", "Subject", when, "Size"])
         for rd in rows:
             r = self.msg_table.rowCount()
             self.msg_table.insertRow(r)
-            dot = QTableWidgetItem("📤")
+            dot = QTableWidgetItem(icon)
             dot.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.msg_table.setItem(r, 0, dot)
             size_str = str(len((rd.get("body") or "").encode("utf-8")))
             for c, v in enumerate(
-                    [rd["to_call"], rd["subject"] or "",
+                    [rd["to_call"] or "", rd["subject"] or "",
                      (rd["created_at"] or "")[:16], size_str], start=1):
                 it = QTableWidgetItem(v)
                 it.setData(Qt.ItemDataRole.UserRole, rd["id"])
@@ -2224,9 +2320,13 @@ class MailView(QWidget):
         """Show message in preview pane, updating button states."""
         is_bulletin = folder == "bulletins" or folder.startswith("bulletin:")
         self.btn_delete.setEnabled(True)   # enabled for all folders including bulletins
-        self.btn_reply.setEnabled(folder == "inbox")
+        self.btn_reply.setEnabled(folder in ("inbox", "drafts"))
 
-        if folder == "outbox":
+        if folder == "drafts":
+            h = (f"<b>Draft to:</b> {rd.get('to_call') or '(none)'} &nbsp;"
+                 f"<b>Subject:</b> {rd.get('subject') or '(none)'} &nbsp;"
+                 f"<b>Saved:</b> {str(rd.get('created_at',''))[:16]}")
+        elif folder == "outbox":
             h = (f"<b>To:</b> {rd.get('to_call','')} &nbsp;"
                  f"<b>Subject:</b> {rd.get('subject') or '(none)'} &nbsp;"
                  f"<b>Queued:</b> {str(rd.get('created_at',''))[:16]}")
@@ -4774,6 +4874,7 @@ class MainWindow(QMainWindow):
         self.worker  = None
         self._current_folder = "inbox"
         self._current_row_id = None
+        self._current_row_folder = ""
 
         # Persistent lightweight VARA command connection for pre-session config
         from transport import VaraControl
@@ -5989,7 +6090,27 @@ class MainWindow(QMainWindow):
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
             QDialogButtonBox.StandardButton.Cancel)
-        btns.accepted.connect(dlg.accept)
+        # Validate before closing, so a bad filename keeps the dialog open
+        # with what was typed instead of closing it and warning afterwards.
+        def _try_accept():
+            name = filename_edit.text().strip()
+            if not name:
+                QMessageBox.warning(dlg, "No Filename",
+                    "Enter a filename to download.")
+                filename_edit.setFocus()
+                return
+            if " " in name:
+                QMessageBox.warning(
+                    dlg, "Filename Contains Spaces",
+                    "LinBPQ YAPP does not support filenames with spaces.\n"
+                    "The BBS will report 'File not found'.\n\n"
+                    "Please rename the file on the BBS or use 'read <filename>' "
+                    "to display it as plain text.")
+                filename_edit.setFocus()
+                return
+            dlg.accept()
+
+        btns.accepted.connect(_try_accept)
         btns.rejected.connect(dlg.reject)
         layout.addWidget(btns)
 
@@ -6007,19 +6128,6 @@ class MainWindow(QMainWindow):
 
         filename = filename_edit.text().strip()
         save_dir = savedir_edit.text().strip() or self._downloads_dir
-
-        if not filename:
-            QMessageBox.warning(self, "No Filename", "Enter a filename to download.")
-            return
-
-        if " " in filename:
-            QMessageBox.warning(
-                self, "Filename Contains Spaces",
-                "LinBPQ YAPP does not support filenames with spaces.\n"
-                "The BBS will report 'File not found'.\n\n"
-                "Please rename the file on the BBS or use 'read <filename>' "
-                "to display it as plain text.")
-            return
 
         # A file transfer runs to completion once it starts — there is no
         # Abort for it (see _ABORT_TIP_YAPP), and over RF that is real
@@ -6712,6 +6820,7 @@ class MainWindow(QMainWindow):
     def _refresh_folder(self, folder: str):
         self._current_folder = folder
         if   folder == "inbox":    rows = self.db.get_inbox()
+        elif folder == "drafts":   rows = self.db.get_drafts()
         elif folder == "outbox":   rows = self.db.get_outbox()
         elif folder == "sent":     rows = self.db.get_sent()
         elif folder == "notifications": rows = self.db.get_notifications()
@@ -6724,6 +6833,7 @@ class MainWindow(QMainWindow):
         self.mail_view.load_table(rows, folder)
         # Sync folder tree selection
         item_map = {"inbox":         self.mail_view._fi,
+                    "drafts":        self.mail_view._fd,
                     "outbox":        self.mail_view._fo,
                     "sent":          self.mail_view._fs,
                     "notifications": self.mail_view._fn,
@@ -6739,9 +6849,12 @@ class MainWindow(QMainWindow):
 
     def _on_row_selected(self, row_id: int, folder: str):
         self._current_row_id = row_id
+        self._current_row_folder = folder
 
         if folder == "inbox":
             rows = self.db.get_inbox()
+        elif folder == "drafts":
+            rows = self.db.get_drafts()
         elif folder == "outbox":
             rows = self.db.get_outbox()
         elif folder == "notifications":
@@ -6784,24 +6897,58 @@ class MainWindow(QMainWindow):
             body=v["body"],            msg_type=v["msg_type"],
             at_bbs=v.get("at_bbs", ""))
 
-    def _on_new_message(self):
+    def _run_compose(self, reply_to=None, draft=None):
+        """Open Compose and act on how it closed. Returns the queued
+        message's values, or None if nothing was queued.
+
+        OK      → Outbox (and an opened draft is removed — it is the Outbox
+                  copy now, so it must not be sendable twice)
+        Draft   → Drafts folder; an opened draft is updated in place
+        Discard → nothing saved; an opened draft is left as it was"""
         font_size = self.config.get("app", {}).get("font_size", 10)
-        dlg = ComposeDialog(parent=self, contacts_db=self.cdb, font_size=font_size)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
+        dlg = ComposeDialog(parent=self, reply_to=reply_to, draft=draft,
+                            contacts_db=self.cdb, font_size=font_size)
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
         v = dlg.get_values()
-        if not v["to_call"]:
-            QMessageBox.warning(self, "Missing Field",
-                "Please enter a To: callsign.")
-            return
-        self._queue_outgoing(v)
-        self._refresh_folder("outbox")   # switch to outbox so user sees queued msg
+        draft_id = draft.get("id") if draft else None
+
+        if not accepted:
+            if dlg.save_as_draft:
+                self.db.save_draft(v["to_call"], v["subject"], v["body"],
+                                   msg_type=v["msg_type"], at_bbs=v["at_bbs"],
+                                   draft_id=draft_id)
+                self._update_folder_counts()
+                if self._current_folder == "drafts":
+                    self._refresh_folder("drafts")
+            return None
+
+        self._queue_outgoing(v)   # ComposeDialog.accept() required To + Subject
+        if draft_id is not None:
+            self.db.delete_message(draft_id, "drafts")
         self._update_folder_counts()
         if self.worker and self.worker.session:
             self.mail_view.enable_send_outbox(True)
+        return v
+
+    def _on_new_message(self):
+        v = self._run_compose()
+        if not v:
+            return
+        self._refresh_folder("outbox")   # switch to outbox so user sees queued msg
         QMessageBox.information(self, "Queued",
             f"Message to {v['to_call']} saved to outbox.\n"
-            f"It goes out on your next Send / Receive.")
+            "It goes out on your next Send / Receive.")
+
+    def _on_open_draft(self):
+        for rd in self.db.get_drafts():
+            if rd["id"] == self._current_row_id:
+                v = self._run_compose(draft=dict(rd))
+                if v:
+                    self._refresh_folder("outbox")
+                    QMessageBox.information(self, "Queued",
+                        f"Message to {v['to_call']} saved to outbox.\n"
+                        "It goes out on your next Send / Receive.")
+                return
 
     def _on_mark_all_read(self):
         folder = self._current_folder
@@ -6821,6 +6968,7 @@ class MainWindow(QMainWindow):
             return
         all_rows = {
             "inbox":         self.db.get_inbox(),
+            "drafts":        self.db.get_drafts(),
             "outbox":        self.db.get_outbox(),
             "sent":          self.db.get_sent(),
             "notifications": self.db.get_notifications(),
@@ -6831,17 +6979,13 @@ class MainWindow(QMainWindow):
     def _on_reply(self):
         if not self._current_row_id:
             return
-        font_size = self.config.get("app", {}).get("font_size", 10)
+        # In Drafts the same button reads "Open Draft"
+        if getattr(self, "_current_row_folder", "") == "drafts":
+            self._on_open_draft()
+            return
         for rd in self.db.get_inbox():
             if rd["id"] == self._current_row_id:
-                dlg = ComposeDialog(parent=self, reply_to=dict(rd),
-                                    contacts_db=self.cdb, font_size=font_size)
-                if dlg.exec() == QDialog.DialogCode.Accepted:
-                    v = dlg.get_values()
-                    self._queue_outgoing(v)
-                    self._update_folder_counts()   # updates outbox badge count only
-                    if self.worker and self.worker.session:
-                        self.mail_view.enable_send_outbox(True)
+                if self._run_compose(reply_to=dict(rd)):
                     QMessageBox.information(self, "Queued",
                         "Reply saved to outbox.")
                 break
@@ -6879,8 +7023,9 @@ class MainWindow(QMainWindow):
             for row_id, folder in bulletin_ids:
                 self.db.delete_bulletin(row_id)
             for row_id, folder in msg_ids:
-                self.db.delete_message(row_id)
+                self.db.delete_message(row_id, folder)
             self._current_row_id = None
+            self._current_row_folder = ""
             self.mail_view.preview_header.setText("")
             self.mail_view.preview_body.clear()
             self._refresh_folder(self._current_folder)
@@ -7435,7 +7580,9 @@ class MainWindow(QMainWindow):
         notifs  = self.db.get_notification_unread_count()
         pending = len(self.db.get_pending_outbox())
         sent    = len(self.db.get_sent())
-        self.mail_view.update_folder_counts(unread, pending, sent, notifs)
+        drafts  = len(self.db.get_drafts())
+        self.mail_view.update_folder_counts(unread, pending, sent, notifs,
+                                            drafts)
         # Update bulletin category subfolders
         cats = self.db.get_bulletin_categories()
         self.mail_view.update_bulletin_categories(cats)
