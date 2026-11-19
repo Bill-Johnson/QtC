@@ -1467,6 +1467,14 @@ class AGWTransport:
     read_all_pending  = VaraTransport.read_all_pending
     read_raw_bytes    = VaraTransport.read_raw_bytes
     peek_input        = VaraTransport.peek_input
+    # The borrowed readers ask these about modem activity. AGW has no
+    # such clock (modem_decides stays False), but they must exist: a737367
+    # added the call and AGW reads crashed with AttributeError until
+    # 2026-11-18 (tests/test_agw_reads.py).
+    _silence_over      = VaraTransport._silence_over
+    last_link_activity = VaraTransport.last_link_activity
+    modem_decides        = False
+    _last_modem_activity = 0.0
 
     # ── Internal helpers ──────────────────────────────────────────
 

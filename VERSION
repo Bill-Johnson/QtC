@@ -41,6 +41,9 @@ NEW
     it to the Outbox.
 
 FIXED
+  - Packet through Direwolf or (Qt)SoundModem stopped working on this
+    dev branch after the "modem decides" change: the first BBS reply
+    that took a moment to arrive crashed the session. Fixed.
   - A missing To: callsign closed the Compose window and lost the
     message. To: and Subject: are now checked while the window is
     still open, and a blank Subject is no longer allowed.
