@@ -63,6 +63,15 @@ FIXED
   - Settings no longer locks up on a bad Home BBS; the Inbox keeps its
     selection on refresh. (Unreleased fixes from after 0.15.0.)
   - Test PTT reports errors without crashing.
+  - A message could be sent to the BBS twice: answering "send now?" on
+    connect and then pressing Send / Receive a moment later queued the
+    same Outbox message again. Send / Receive now waits for a send that
+    is already going out, then does its mail check.
+  - Only one QtC can run at a time on the same data folder. A second
+    start says "QtC is already running" and closes before it touches
+    anything. A crash or power loss never leaves you locked out. A
+    test copy with its own XDG_DATA_HOME still runs beside the daily
+    one.
 
 FOR DEVELOPERS
   - tests/fake_bbs_vara.py: a small LinBPQ-style mailbox behind any

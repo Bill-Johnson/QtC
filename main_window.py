@@ -1,4 +1,4 @@
-# QtC v0.16.0-dev — main_window.py  (built 2026-11-18)
+# QtC v0.16.0-dev — main_window.py  (built 2026-11-20)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -4922,6 +4922,7 @@ class MainWindow(QMainWindow):
         self._logged_in = False
         self._login_only_connect = False   # last Connect was from Terminal/Debug
         self._sr_active       = False   # a Send / Receive round trip is running
+        self._sending_batch   = False   # an Outbox batch is going out now
         self._pending_outbox  = False   # outbox ready, waiting for Mail view switch
         self._send_total      = 0
         self._send_current    = 0
@@ -6020,6 +6021,7 @@ class MainWindow(QMainWindow):
         # A link that drops mid Send / Receive must not leave the flag set,
         # or the next one would be refused as "already running".
         self._sr_active       = False
+        self._sending_batch   = False
         self._prog_bar.setVisible(False)
         self._prog_detail.setVisible(False)
         self.status_label.setVisible(True)
@@ -6699,6 +6701,20 @@ class MainWindow(QMainWindow):
             self._set_status("Send / Receive already running…", connected=True)
             return
 
+        if getattr(self, "_sending_batch", False):
+            # The connect's "send now?" (or an earlier press) is already
+            # sending the Outbox. Its rows stay 'pending' until the BBS
+            # confirms each one, so starting another send here put the same
+            # message on the BBS twice (seen on air 2026-11-18).
+            # Join that batch instead: when it finishes, _on_send_result
+            # sees _sr_active and runs the mail check.
+            self._sr_active = True
+            line = ("\n[S/R] Outbox already sending — will check mail when "
+                    "it finishes\n")
+            self.terminal.append(line, "#aaffff")
+            self.debug_view.append(line, "#aaffff")
+            return
+
         self._sr_active = True
         pending = self.db.get_pending_outbox()
         line = ("\n[S/R] Send / Receive — "
@@ -6738,6 +6754,12 @@ class MainWindow(QMainWindow):
         self._auto_disconnect_if_done()
 
     def _on_send_outbox(self):
+        if getattr(self, "_sending_batch", False):
+            # Already going out — its rows are still 'pending' until each is
+            # confirmed, so queuing them again would send them twice.
+            self.debug_view.append(
+                "[SEND] Outbox already sending — not queued again\n", "#888888")
+            return
         pending = self.db.get_pending_outbox()
         if not pending:
             if self._sr_active:
@@ -6753,6 +6775,7 @@ class MainWindow(QMainWindow):
                 "Connect to your home BBS first.")
             return
         total = len(pending)
+        self._sending_batch = True
         self._set_status(f"Sending {total} outbox message(s)…", connected=True)
         self._send_total   = total
         self._send_current = 0
@@ -6806,6 +6829,7 @@ class MainWindow(QMainWindow):
         self._send_done = getattr(self, "_send_done", 0) + 1
         if self._send_done < total:
             return
+        self._sending_batch = False
         self.worker.sig_progress.emit("done", 0, 0, "")
         if self._sr_active:
             self._sr_mail_check()       # second leg: LM + download
@@ -7730,6 +7754,31 @@ def main():
             _apply_dark_palette(app)
     except Exception:
         pass   # if config can't be read yet, default light mode is fine
+
+    # One QtC per data folder. Two copies would share config.json and
+    # messages.db (last one closed overwrites the other's settings) and
+    # could both reach for the modem ports / PTT. The lock lives in
+    # _APP_DIR, so a test copy with its own XDG_DATA_HOME still runs
+    # beside the daily one.
+    #   setStaleLockTime(0) is essential: the 30 s default would let a
+    #   second launch steal the lock from a copy that has simply been
+    #   open a while. With 0, Qt still clears a lock whose process is
+    #   gone (crash, power loss), so nobody gets locked out.
+    from PyQt6.QtCore import QLockFile
+    _lock = QLockFile(os.path.join(_APP_DIR, "qtc.lock"))
+    _lock.setStaleLockTime(0)
+    if not _lock.tryLock(0):
+        if _lock.error() == QLockFile.LockError.LockFailedError:
+            QMessageBox.information(
+                None, "QtC is already running",
+                "QtC is already running.\n\n"
+                "Look for its window on your taskbar.")
+            return 1
+        # PermissionError / UnknownError: can't tell — don't block the user.
+        print(f"QtC: could not create {_lock.fileName()} "
+              f"({_lock.error().name}); continuing without the "
+              f"single-instance check.", flush=True)
+    app._qtc_lock = _lock   # held until the process exits
 
     # Resolve resource paths — works both as a script and as a frozen exe.
     # PyInstaller 6 one-folder layout puts datas in _internal/ (sys._MEIPASS),
