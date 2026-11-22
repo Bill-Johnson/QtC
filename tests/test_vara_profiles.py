@@ -11,8 +11,7 @@ it off (seen on air). Checks:
   * BBSSession floors reply waits and the login 'A' nudge by the profile
   * VardeFM sends no bandwidth command at all
   * host/port: a modem's own keys, else VARA HF's
-  * the Experimental switch decides which modems are offered, and an
-    entry already saved with one still shows
+  * every modem is always offered (no Experimental switch, Issue #7)
 """
 import os, sys, socket, threading, time, types
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -149,27 +148,22 @@ check("VARA FM keeps its fm_ keys",
 check("empty config -> 8300/8301",
       vara_address({}, "data2g") == ("127.0.0.1", 8300, 8301))
 
-# 6. Experimental switch
-off = {"app": {"experimental_modems": False}}
-on  = {"app": {"experimental_modems": True}}
-check("switch off: only VARA HF / FM offered",
-      mw.vara_modem_names(off) == ["VARA HF", "VARA FM"])
-check("switch on: Mercury, Data2G, VardeFM offered too",
-      mw.vara_modem_names(on) == ["VARA HF", "VARA FM", "Mercury", "Data2G", "VardeFM"])
-check("switch off, entry saved with Mercury: Mercury still shown",
-      "Mercury" in mw.vara_modem_names(off, extra="Mercury"))
+# 6. Every modem always offered (Experimental switch removed, Issue #7)
+ALL = ["VARA HF", "VARA FM", "Mercury", "Data2G", "VardeFM"]
+check("all modems offered with no config", mw.vara_modem_names({}) == ALL)
+check("an old config with experimental_modems: False is ignored",
+      mw.vara_modem_names({"app": {"experimental_modems": False}}) == ALL)
+check("no Experimental checkbox helper left", not hasattr(mw, "experimental_modems_on"))
 
-parent_off = types.SimpleNamespace(_cfg=off)
-parent_on  = types.SimpleNamespace(_cfg=on)
 D = mw._BBSEntryDialog
 keys = lambda d: [k for _, k in d.TRANSPORTS]
-check("entry dialog, switch off: no experimental modems",
-      not {"mercury", "data2g", "vardefm"} & set(keys(D())))
+check("entry dialog offers Mercury, Data2G and VardeFM",
+      {"mercury", "data2g", "vardefm"} <= set(keys(D())))
 d_on = D(parent=None)
 check("entry dialog keeps Telnet and packet",
       {"telnet", "direwolf", "soundmodem"} <= set(keys(d_on)))
 d_merc = D(entry={"transport": "mercury", "callsign": "N0BBS-1", "bw": "500"})
-check("editing a Mercury entry with the switch off still offers Mercury",
+check("editing a Mercury entry offers Mercury",
       "mercury" in keys(d_merc) and d_merc.get_entry()["transport"] == "mercury")
 d_v = D(entry={"transport": "vardefm", "callsign": "N0BBS-1"})
 check("VardeFM entry: bandwidth box disabled and empty",
@@ -194,7 +188,7 @@ check("blank saved fields fall back",
 
 from PyQt6.QtWidgets import QWidget
 parent = QWidget()          # a dialog's parent must be a real widget
-parent._cfg = {"vara": vcfg, "app": {"experimental_modems": True}}
+parent._cfg = {"vara": vcfg}
 d = D(entry={"transport": "mercury", "callsign": "N0BBS-9", "bw": "500"}, parent=parent)
 check("dialog prefills host 127.0.0.1 and port from config",
       (d.e_vara_host.text(), d.e_vara_port.text()) == ("127.0.0.1", "8300"))

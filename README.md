@@ -26,9 +26,9 @@ Developed by **Bill Johnson KC9MTP** — Valparaiso, Indiana.
 **[Data2G](https://github.com/arodland/Data2G)**,
 **[Mercury](https://github.com/Rhizomatica/mercury)** and
 **[VardeFM](https://github.com/notepid/vardeFM)**. They use the same control
-scheme as VARA, so they are **one pick from a drop-down**: turn on
-**Settings → App → Experimental modems** and they appear right beside VARA in
-the Mode and Transport lists, with nothing extra to set up in QtC.
+scheme as VARA, so they are **one pick from a drop-down**: they are always
+listed right beside VARA in the Mode and Transport lists, with nothing extra
+to set up in QtC.
 Data2G and Mercury have completed full BBS mail sessions over HF with QtC.
 
 **Run more than one high-speed modem?** QtC always tells you which one is in use. Each BBS entry remembers its own modem, Host and Command port, so choosing the BBS chooses the modem. The modem's name is shown in the toolbar **Mode** list, in the **Type** column of the BBS List, and in the status line while you connect and once you are on (*Connected · N0CALL-1 (Data2G BW500)*).
@@ -128,7 +128,7 @@ with your OS, the modem and its version, what you did, and the Debug view text
 ### New on `dev` — experimental modems
 
 ![New modems in the BBS entry dialog](screenshots/dev_1_New_Modems.png)
-*Settings → BBS List → Edit — with **Experimental modems** turned on, Data2G, Mercury and VardeFM are drop-down choices in the Transport list, right beside VARA, Telnet and packet*
+*Settings → BBS List → Edit — Data2G, Mercury and VardeFM are drop-down choices in the Transport list, right beside VARA, Telnet and packet*
 
 ![Mail and bulletins brought in over Mercury and Data2G](screenshots/dev_2_Mail_and_Bulletins.png)
 *Mail view after sessions over Mercury and Data2G — new personal mail in the Inbox and new SITREP bulletins, downloaded automatically (test mailbox, fake callsigns)*
@@ -186,7 +186,7 @@ with your OS, the modem and its version, what you did, and the Debug view text
 - **VARA FM** — packet-voice frequencies with **NARROW / WIDE** bandwidth control; same UI as HF
 - **AX.25 packet** — 300 baud HF and 1200 baud VHF through **Direwolf** or **UZ7HO SoundModem / QtSoundModem**, using the modem's AGW port. The modem can run on another computer on your network (many operators keep SoundModem on a separate Windows PC) — set its address in the BBS entry
 - **Telnet** — LAN / internet nodes for local testing; auto-disconnects after the mail check completes
-- **Experimental modems (dev)** — **Data2G**, **Mercury** and **VardeFM**, open-source modems that use VARA's control scheme, so each is simply another choice in the Mode and Transport drop-downs. Turn on **Settings → App → Experimental modems** to see them. Each BBS entry keeps its own modem, Host / Command port and timing, and QtC names the modem in the toolbar, the BBS List and the status line, so it is always clear which one you are on. A modem only talks to the same modem at the other station, not to VARA — so the BBS must run the same modem. See [Experimental Modems Setup](#experimental-modems-setup-dev) and [dev_notes.txt](dev_notes.txt)
+- **Experimental modems (dev)** — **Data2G**, **Mercury** and **VardeFM**, open-source modems that use VARA's control scheme, so each is simply another choice in the Mode and Transport drop-downs, always listed beside VARA. Each BBS entry keeps its own modem, Host / Command port and timing, and QtC names the modem in the toolbar, the BBS List and the status line, so it is always clear which one you are on. A modem only talks to the same modem at the other station, not to VARA — so the BBS must run the same modem. See [Experimental Modems Setup](#experimental-modems-setup-dev) and [dev_notes.txt](dev_notes.txt)
 - **PTT** — for VARA, RTS or DTR via serial port, with both lines set low before QtC opens the port, so opening it does not key the radio; defensive flow-control flags for Digirig / CP2105 setups. Packet modems key the radio themselves
 
 ### Mail
@@ -240,6 +240,7 @@ with your OS, the modem and its version, what you did, and the Debug view text
 - **Terminal view** — clean dumb terminal for manual BBS commands, with a YAPP file-download button and quick buttons for the common commands. Enter on an empty line sends a bare carriage return, which is how you answer the BBS's page prompt when a listing stops at the OP limit
 - **Debug view** — verbose session log with a *Save Log…* export for capturing RF transfer traces. The log is only written when you save it, so save before you close QtC
 - **Dark mode** — full Fusion dark palette, toggled in Settings → App
+- **Remembers your window sizes** *(new on `dev`)* — the main window, the Mail view dividers, the From / Date / Size column widths (now draggable) and each dialog open the way you last left them. Kept in `window_state.json` beside `config.json`
 - Adjustable message font with live preview
 - Splash screen during launch
 
@@ -393,16 +394,15 @@ On your first connection QtC will ask whether to download all personal messages 
 
 ## Experimental Modems Setup (dev)
 
-1. **Settings → App →** tick **Experimental modems**
-2. **Settings → BBS List → Add/Edit** — Transport **Mercury**, **Data2G** or **VardeFM**;
+1. **Settings → BBS List → Add/Edit** — Transport **Mercury**, **Data2G** or **VardeFM**;
    **Host** `127.0.0.1` (or the computer running the modem); **Command port** = the
    modem's command port (8300 by default for all three — use a different one if you
    run two modems on one computer). The data port is always the next number
-3. **The modem keys the radio** — set PTT in the modem, not in QtC (Settings → PTT stays *None*)
+2. **The modem keys the radio** — set PTT in the modem, not in QtC (Settings → PTT stays *None*)
    - **Data2G:** its **Rig** switch must be **on** for any PTT except VOX — with Rig off it never keys, even with RTS selected
    - **Mercury:** PTT is *none* unless you start it with `-P serial -A /dev/ttyUSB0` (or Hamlib) — or use VOX
-4. Start the modem **before** you click Connect
-5. The station at the other end must run the **same modem** — these do not talk to VARA, or to each other
+3. Start the modem **before** you click Connect
+4. The station at the other end must run the **same modem** — these do not talk to VARA, or to each other
 
 **Using more than one modem:** give each its own Command port (for example
 Data2G on 8310, Mercury on 8320) and make a BBS entry for each one. Picking

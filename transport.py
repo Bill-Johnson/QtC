@@ -399,8 +399,9 @@ class TelnetTransport:
 #                    its own width (VardeFM's --mode) and QtC sends none
 #   bw_style         wire form: "hf" -> BW500, "fm" -> bare NARROW/WIDE,
 #                    "none" -> no bandwidth command
-#   experimental     only offered when Settings > App > "Experimental
-#                    modems" is on (Bill, 2026-11-14)
+#   experimental     still being tested; needs the full timing set below.
+#                    Always offered in the Mode lists (the Settings switch
+#                    was removed 2026-11-22, Issue #7)
 #   connect_timeout  QtC's safety net on CONNECT. The modem gives up and
 #                    says DISCONNECTED on its own; this only has to be
 #                    longer than the modem's own calling. With

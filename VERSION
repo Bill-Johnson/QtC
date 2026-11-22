@@ -14,14 +14,19 @@ WHAT THIS IS
   The public dev branch. Run it from a git clone (see README.md); there
   are no release downloads for -dev builds. It adds three experimental
   open-source modems that use VARA's control scheme — Mercury, Data2G
-  and VardeFM — as drop-down choices behind a Settings switch, and the
-  fixes that made them work.
+  and VardeFM — as drop-down choices right beside VARA, and the fixes
+  that made them work.
   What we measured on the air is in dev_notes.txt.
 
 NEW
-  - Settings > App > "Experimental modems" (off by default) adds
-    Mercury, Data2G and VardeFM to the Mode lists and the BBS entry
-    dialog.
+  - Mercury, Data2G and VardeFM are always in the Mode lists and the
+    BBS entry dialog, beside VARA. (Early dev builds hid them behind a
+    Settings > App > "Experimental modems" switch, which confused
+    people; it is gone. Issue #7.)
+  - QtC remembers your window sizes until you change them: the main
+    window (and maximized), the Mail view dividers, the From / Date /
+    Size column widths (now draggable) and each dialog. Kept in
+    window_state.json beside config.json, never inside it.
   - Each VARA-protocol modem has its own timing profile: connect
     timeout, reply-silence floor, login-nudge floor and disconnect wait.
     VARA HF / FM keep exactly the values they always had.
@@ -77,7 +82,8 @@ FOR DEVELOPERS
   - tests/fake_bbs_vara.py: a small LinBPQ-style mailbox behind any
     VARA-protocol modem, for testing without a real BBS.
   - tests/modem_tune.py: hold a TUNE tone while setting levels.
-  - New offline tests: test_vara_cmd_handshake.py, test_vara_profiles.py.
+  - New offline tests: test_vara_cmd_handshake.py, test_vara_profiles.py,
+    test_window_sizes.py.
 
 ========================================================================
 0.15.0-beta  (2026-10-04)

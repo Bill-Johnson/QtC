@@ -28,8 +28,8 @@ Transports
   the mail check completes
 - Experimental modems — Data2G, Mercury and VardeFM, open-source modems
   that use VARA's control scheme, so each is simply another choice in
-  the Mode and Transport drop-downs. Turn on Settings -> App ->
-  Experimental modems to see them. Each BBS entry keeps its own modem,
+  the Mode and Transport drop-downs, always listed beside VARA (no
+  switch to turn on). Each BBS entry keeps its own modem,
   Host / Command port and timing, and QtC names the modem in the
   toolbar, the BBS List and the status line, so it is always clear
   which one you are on. A modem only talks to the same modem at the
@@ -148,6 +148,10 @@ UI / UX
   capturing RF transfer traces. The log is only written when you save
   it, so save before you close QtC
 - Dark mode — full Fusion dark palette, toggled in Settings -> App
+- Remembers your window sizes (new on dev) — the main window, the Mail
+  view dividers, the From / Date / Size column widths (now draggable)
+  and each dialog open the way you last left them. Kept in
+  window_state.json beside config.json
 - Adjustable message font with live preview
 - Splash screen during launch
 
@@ -308,19 +312,18 @@ Packet Setup (Direwolf / SoundModem)
 
 Experimental Modems Setup (Data2G, Mercury, VardeFM)
 
-1. Settings -> App -> tick Experimental modems
-2. Settings -> BBS List -> Add/Edit — pick Data2G, Mercury or VardeFM
+1. Settings -> BBS List -> Add/Edit — pick Data2G, Mercury or VardeFM
    from the Transport drop-down; Host 127.0.0.1 (or the computer
    running the modem); Command port = the modem's command port (8300
    by default for all three). The data port is always the next number
-3. The modem keys the radio — set PTT in the modem, not in QtC
+2. The modem keys the radio — set PTT in the modem, not in QtC
    (Settings -> PTT stays None)
    - Data2G: its Rig switch must be on for any PTT except VOX — with
      Rig off it never keys, even with RTS selected
    - Mercury: PTT is none unless you start it with
      -P serial -A /dev/ttyUSB0 (or Hamlib) — or use VOX
-4. Start the modem before you click Connect
-5. The station at the other end must run the same modem — these do not
+3. Start the modem before you click Connect
+4. The station at the other end must run the same modem — these do not
    talk to VARA, or to each other
 
 Using more than one modem: give each its own Command port (for example

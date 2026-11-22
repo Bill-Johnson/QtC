@@ -18,7 +18,7 @@ APP_VERSION = "0.16.0-dev"  # keep in sync with header comment
 QtC — Main Window (PyQt6)
 v0.2 — Quick-connect bar, auto-download, terminal swap button
 """
-import sys, json, os, copy, re, time, threading
+import sys, json, os, copy, re, time, threading, base64
 from datetime import datetime, timedelta
 
 from PyQt6.QtWidgets import (
@@ -48,19 +48,13 @@ AGW_MODEMS = {"direwolf": "Direwolf", "soundmodem": "(Qt)SoundModem"}
 VARA_BY_NAME = {p["name"]: k for k, p in VARA_MODEMS.items()}
 
 
-def experimental_modems_on(config: dict) -> bool:
-    """Settings > App > Experimental modems (Bill, 2026-11-14)."""
-    return bool((config or {}).get("app", {}).get("experimental_modems", False))
-
-
-def vara_modem_names(config: dict, extra: str = "") -> list:
-    """VARA-protocol modem names to offer: the standard ones, plus the
-    experimental ones when that switch is on. `extra` (a name) is always
-    included, so an entry saved with an experimental modem still shows
-    correctly after the switch is turned off."""
-    show_exp = experimental_modems_on(config)
-    return [p["name"] for p in VARA_MODEMS.values()
-            if show_exp or not p["experimental"] or p["name"] == extra]
+def vara_modem_names(config: dict = None, extra: str = "") -> list:
+    """VARA-protocol modem names to offer: all of them, always.
+    The Settings > App "Experimental modems" switch was removed
+    (Bill, 2026-11-22, Issue #7): it hid Data2G etc. and confused users.
+    Should an Advanced view come later, all modems stay on the simple
+    side. `config` / `extra` are kept so callers need not change."""
+    return [p["name"] for p in VARA_MODEMS.values()]
 
 
 AGW_DEFAULT_PORT = 8000   # Direwolf and QtSoundModem both default here
@@ -130,6 +124,94 @@ def _write_default_config():
 def save_config(cfg):
     with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=4)
+
+
+# ── Remembered window sizes (Bill, 2026-11-22) ───────────────────────────────
+# Any resize holds until the user changes it again: the main window, the
+# Mail view dividers and message-list columns, and each dialog. Kept in
+# window_state.json beside config.json, never IN config.json, so a crash
+# or half-written save can't touch settings or the BBS list. A missing or
+# broken file just means the built-in default sizes.
+
+def _ui_state_path() -> str:
+    # Follows _CONFIG_PATH at call time (tests point that at a temp dir).
+    return os.path.join(os.path.dirname(_CONFIG_PATH), "window_state.json")
+
+
+def load_ui_state() -> dict:
+    try:
+        with open(_ui_state_path(), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_ui_state(updates: dict):
+    """Merge `updates` into window_state.json. Written to a temp file and
+    swapped in, so the file is never half-written. Never raises."""
+    try:
+        d = load_ui_state()
+        d.update(updates)
+        path = _ui_state_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+        os.replace(tmp, path)
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _int_list(v, n: int):
+    """v if it is a list of n positive ints, else None."""
+    if (isinstance(v, list) and len(v) == n
+            and all(isinstance(x, int) and not isinstance(x, bool) and x > 0
+                    for x in v)):
+        return v
+    return None
+
+
+def _fit_to_screen(widget, w: int, h: int):
+    """Shrink (w, h) to the screen's usable area — a size saved on a big
+    monitor must still fit on a laptop."""
+    screen = widget.screen() or QApplication.primaryScreen()
+    if screen is None:
+        return w, h
+    a = screen.availableGeometry()
+    return min(w, a.width()), min(h, a.height())
+
+
+class _RememberSize:
+    """Mixin for a QDialog: reopen at the size the user last left it.
+    Size only, not position: Qt centres a dialog over the main window,
+    which beats an old spot (and Wayland ignores positions anyway).
+    Set _REMEMBER_HEIGHT = False for a dialog whose height follows its
+    content; then only the width is kept."""
+    _REMEMBER_HEIGHT = True
+
+    def setVisible(self, visible):
+        # Before the first show, so Qt centres the dialog at its real size.
+        if visible and not getattr(self, "_size_restored", False):
+            self._size_restored = True
+            dl = load_ui_state().get("dialogs")
+            wh = _int_list(dl.get(type(self).__name__), 2) \
+                if isinstance(dl, dict) else None
+            if wh:
+                w, h = _fit_to_screen(self, *wh)
+                if not self._REMEMBER_HEIGHT:
+                    h = self.height()
+                self.resize(max(w, self.minimumWidth()),
+                            max(h, self.minimumHeight()))
+        super().setVisible(visible)
+
+    def done(self, r):
+        # Only a dialog that was really shown has a size worth keeping.
+        if getattr(self, "_size_restored", False):
+            dl = load_ui_state().get("dialogs")
+            dl = dict(dl) if isinstance(dl, dict) else {}
+            dl[type(self).__name__] = [self.width(), self.height()]
+            save_ui_state({"dialogs": dl})
+        super().done(r)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -972,7 +1054,7 @@ class SessionWorker(QThread):
 # Address Book Dialog
 # ─────────────────────────────────────────────────────────────────────────────
 
-class AddressBookDialog(QDialog):
+class AddressBookDialog(_RememberSize, QDialog):
     """Full address book management window — File → Address Book."""
 
     contact_selected = pyqtSignal(dict)   # emits contact dict when user clicks Select
@@ -1113,7 +1195,7 @@ class AddressBookDialog(QDialog):
             self._refresh()
 
 
-class _ContactEditDialog(QDialog):
+class _ContactEditDialog(_RememberSize, QDialog):
     """Add / edit a single contact."""
 
     def __init__(self, contact: dict = None, parent=None):
@@ -1171,7 +1253,7 @@ class _ContactEditDialog(QDialog):
 # Compose Dialog
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ComposeDialog(QDialog):
+class ComposeDialog(_RememberSize, QDialog):
     def __init__(self, parent=None, reply_to=None, contacts_db=None, font_size=10,
                  draft=None):
         super().__init__(parent)
@@ -1698,6 +1780,7 @@ class MailView(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
 
         h = QSplitter(Qt.Orientation.Horizontal)
+        self._split_h = h          # folder list | messages (remembered)
 
         # ── Folder tree ───────────────────────────────────────
         self.folder_tree = QTreeWidget()
@@ -1727,6 +1810,7 @@ class MailView(QWidget):
         rl.setContentsMargins(0, 0, 0, 0)
 
         v = QSplitter(Qt.Orientation.Vertical)
+        self._split_v = v          # message list / preview (remembered)
 
         # Search bar — hidden by default, shown when search button clicked
         self._search_bar = QWidget()
@@ -1759,10 +1843,12 @@ class MailView(QWidget):
         self.msg_table.setHorizontalHeaderLabels(["", "From", "Subject", "Date", "Size"])
         hh = self.msg_table.horizontalHeader()
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        # From / Date / Size can be dragged wider (remembered, 2026-11-22);
+        # Subject takes whatever is left.
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
         self.msg_table.setColumnWidth(0, 20)
         self.msg_table.setColumnWidth(1, 115)
         self.msg_table.setColumnWidth(3, 72)
@@ -2419,7 +2505,7 @@ class MailView(QWidget):
 # Settings Dialog
 # ─────────────────────────────────────────────────────────────────────────────
 
-class BulletinSelectDialog(QDialog):
+class BulletinSelectDialog(_RememberSize, QDialog):
     """
     Checkbox selection dialog shown when new bulletins are found.
     User can select which to download, see sizes and estimated time.
@@ -2542,7 +2628,7 @@ class BulletinSelectDialog(QDialog):
         return result
 
 
-class SettingsDialog(QDialog):
+class SettingsDialog(_RememberSize, QDialog):
     """
     Full settings editor — covers User Identity, BBS List, and App preferences.
     Reads/writes the config dict in-memory; caller saves to disk on Accept.
@@ -4067,17 +4153,6 @@ class SettingsDialog(QDialog):
         codec_row.addStretch()
 
         form.addRow("", self.chk_dark_mode)
-        # Experimental modems (Bill, 2026-11-14): Mercury, Data2G and
-        # VardeFM speak VARA's TCP interface. Off by default so the Mode
-        # lists stay simple for new users.
-        self.chk_experimental = QCheckBox(
-            "Experimental modems  (Mercury, Data2G, VardeFM)")
-        self.chk_experimental.setChecked(experimental_modems_on(self._cfg))
-        self.chk_experimental.setToolTip(
-            "Adds Mercury, Data2G and VardeFM to the Mode lists. They use\n"
-            "VARA's connection method but only talk to the same modem on\n"
-            "the other station. Still being tested.")
-        form.addRow("", self.chk_experimental)
         form.addRow("Message font size:", font_row)
         form.addRow("", self._font_preview)
         form.addRow("Character set:", codec_row)
@@ -4136,7 +4211,6 @@ class SettingsDialog(QDialog):
         # App tab
         self._cfg.setdefault("app", {})
         self._cfg["app"]["dark_mode"]            = self.chk_dark_mode.isChecked()
-        self._cfg["app"]["experimental_modems"]  = self.chk_experimental.isChecked()
         self._cfg["app"]["font_size"]            = self.spin_font.value()
         self._cfg["app"]["data_dir"]             = self.e_data_dir.text().strip() or "data"
         self._cfg["app"]["text_codec"]           = self.combo_codec.currentData()
@@ -4286,12 +4360,13 @@ class SettingsDialog(QDialog):
 # BBS Entry sub-dialog  (used by SettingsDialog BBS tab)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _BBSEntryDialog(QDialog):
+class _BBSEntryDialog(_RememberSize, QDialog):
     """Add or edit a single BBS entry."""
 
-    # The VARA-protocol rows are added per dialog (see __init__): the
-    # experimental modems only show when that switch is on, or when the
-    # entry being edited already uses one.
+    _REMEMBER_HEIGHT = False   # rows change with the transport
+
+    # The VARA-protocol rows (every modem in transport.VARA_MODEMS) are
+    # added per dialog in __init__, ahead of these.
     TRANSPORTS = [
         ("Telnet",       "telnet"),
         ("Direwolf",     "direwolf"),
@@ -4304,17 +4379,9 @@ class _BBSEntryDialog(QDialog):
         self.setWindowTitle("Edit BBS Entry" if entry else "Add BBS Entry")
         self.setMinimumWidth(420)
         e = entry or {}
-        # Experimental modems: the live checkbox when opened from Settings
-        # (so ticking it takes effect before OK), else the saved config.
-        if parent is not None and hasattr(parent, "chk_experimental"):
-            show_exp = parent.chk_experimental.isChecked()
-        else:
-            cfg = getattr(parent, "_cfg", None) or getattr(parent, "config", None)
-            show_exp = experimental_modems_on(cfg)
-        cur_key = e.get("transport", "vara_hf")
+        # Every VARA-protocol modem is always offered (Issue #7, 2026-11-22).
         self.TRANSPORTS = [
             (p["name"], k) for k, p in VARA_MODEMS.items()
-            if show_exp or not p["experimental"] or k == cur_key
         ] + list(type(self).TRANSPORTS)
         # Derive note color from parent's dark mode setting if available
         dark = False
@@ -4593,7 +4660,10 @@ class _BBSEntryDialog(QDialog):
             }
             self.future_label.setText(label_map.get(key, "Coming soon."))
 
-        self.adjustSize()
+        # Height fits this transport's rows; width stays where the user
+        # left it (remembered — see _RememberSize).
+        hint = self.sizeHint()
+        self.resize(max(self.width(), hint.width()), hint.height())
 
     def _on_accept(self):
         if not self.e_callsign.text().strip():
@@ -4979,6 +5049,52 @@ class MainWindow(QMainWindow):
         self._mc_retry_timer = QTimer(self)
         self._mc_retry_timer.setInterval(1000)   # 1s status countdown tick
         self._mc_retry_timer.timeout.connect(self._mc_retry_tick)
+        self._restore_window_state()
+
+    # ── Remembered sizes (2026-11-22) ─────────────────────────────
+
+    # Mail view message-list columns that are remembered: From, Date, Size.
+    _MSG_COLS = (1, 3, 4)
+
+    def _restore_window_state(self):
+        """Put back the size (and maximized) the window was closed at, the
+        Mail view dividers and the message-list column widths. Anything
+        missing or odd is skipped and the default stays."""
+        st = load_ui_state()
+        g = st.get("main_geometry")
+        if isinstance(g, str):
+            try:
+                from PyQt6.QtCore import QByteArray
+                self.restoreGeometry(QByteArray(base64.b64decode(g)))
+                if not self.isMaximized():
+                    w, h = _fit_to_screen(self, self.width(), self.height())
+                    self.resize(max(w, self.minimumWidth()),
+                                max(h, self.minimumHeight()))
+            except (ValueError, TypeError):
+                pass
+        mv = getattr(self, "mail_view", None)
+        if mv is None:
+            return
+        for key, split in (("mail_split_h", mv._split_h),
+                           ("mail_split_v", mv._split_v)):
+            sizes = _int_list(st.get(key), split.count())
+            if sizes:
+                split.setSizes(sizes)
+        cols = _int_list(st.get("mail_columns"), len(self._MSG_COLS))
+        if cols:
+            for c, w in zip(self._MSG_COLS, cols):
+                mv.msg_table.setColumnWidth(c, max(w, 30))
+
+    def _save_window_state(self):
+        mv = self.mail_view
+        save_ui_state({
+            "main_geometry": base64.b64encode(
+                bytes(self.saveGeometry())).decode("ascii"),
+            "mail_split_h": mv._split_h.sizes(),
+            "mail_split_v": mv._split_v.sizes(),
+            "mail_columns": [mv.msg_table.columnWidth(c)
+                             for c in self._MSG_COLS],
+        })
 
     # ── Menu bar ──────────────────────────────────────────────────
 
@@ -5409,8 +5525,7 @@ class MainWindow(QMainWindow):
             mode_str = {**{k: p["name"] for k, p in VARA_MODEMS.items()},
                         **AGW_MODEMS}.get(transport, "VARA FM")
             self.mode_combo.blockSignals(True)
-            # An entry saved with an experimental modem keeps working
-            # after the switch is turned off: add its name back.
+            # Safety net: rebuild the list if the name is somehow missing.
             if self.mode_combo.findText(mode_str) < 0:
                 self._fill_mode_combo(extra=mode_str)
             self.mode_combo.setCurrentText(mode_str)
@@ -5432,8 +5547,7 @@ class MainWindow(QMainWindow):
                    for p in VARA_MODEMS.values() if p["bw"]}
 
     def _fill_mode_combo(self, extra: str = ""):
-        """(Re)build the toolbar Mode list: VARA-protocol modems (the
-        experimental ones only when Settings says so), then packet.
+        """(Re)build the toolbar Mode list: VARA-protocol modems, then packet.
         Keeps the current choice when it is still offered."""
         cur = self.mode_combo.currentText()
         names = vara_modem_names(self.config, extra=extra or cur)
@@ -7657,6 +7771,11 @@ class MainWindow(QMainWindow):
             self.worker.do_disconnect()
             QTimer.singleShot(self.CLOSE_DISCONNECT_CAP_MS, self.close)
             return
+        # Remember sizes. Never let this stop QtC from closing.
+        try:
+            self._save_window_state()
+        except Exception:
+            pass
         # Stop the Mail-Call scheduler so its QTimer doesn't keep ticking
         # during the shutdown teardown.
         if hasattr(self, "_mc_scheduler"):

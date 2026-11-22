@@ -53,8 +53,8 @@ https://github.com/Bill-Johnson/QtC/issues
   Each modem adds lines of its own (Mercury: REGISTERED, BITRATE, SN;
   Data2G: MODE <name>, REGISTERED). QtC logs and ignores those.
 
-  In QtC: Settings > App > tick "Experimental modems". The BBS entry
-  dialog then offers Mercury, Data2G and VardeFM, each with its own
+  In QtC: the BBS entry dialog always offers Mercury, Data2G and
+  VardeFM (the Settings > App switch was removed 2026-11-22), each with its own
   Host and Command port. VardeFM has no bandwidth choice (its width is
   its own --mode setting), so QtC sends no BW command to it.
 

@@ -24,9 +24,8 @@ def check(name, cond, detail=""):
     print(f"{'PASS' if cond else 'FAIL'}  {name}" + (f"   {detail}" if detail and not cond else ""))
 
 D = mw._BBSEntryDialog
-# Each dialog builds its own list (VARA-protocol rows first, the
-# experimental ones only when switched on — 2026-11-14), so pick rows by
-# key from the dialog's own TRANSPORTS, never from the class list.
+# Each dialog builds its own list (VARA-protocol rows first), so pick
+# rows by key from the dialog's own TRANSPORTS, never from the class list.
 def pick(d, key):
     d.transport_combo.setCurrentIndex([k for _, k in d.TRANSPORTS].index(key))
 KEYS = [k for _, k in D().TRANSPORTS]
@@ -142,8 +141,7 @@ for e in old:
             ok = False
             print(f"        {e.get('name')}: {k} {e.get(k)!r} -> {back.get(k)!r}")
 check("B5 every VARA/Telnet entry round-trips through the dialog unchanged", ok)
-# Any transport QtC knows counts — including the experimental modems,
-# which a fresh dialog hides while that switch is off (2026-11-14).
+# Any transport QtC knows counts, including the experimental modems.
 KNOWN = set(mw.VARA_MODEMS) | {k for _, k in D.TRANSPORTS}
 check("B5 no entry silently gained a transport it did not have",
       all(e.get("transport") in KNOWN for e in cfg.get("bbs_list", [])),
