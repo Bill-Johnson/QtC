@@ -15,12 +15,16 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """Telnet logins: which one a BBS uses, and where its password is kept.
 
-Two places a login can live (Bill, 2026-11-23):
+A login lives on its BBS entry: entry["telnet_user"] / ["password"]
+(Bill, 2026-11-23). An entry with no username has no login: Terminal view
+shows the BBS's prompts and you type it; Mail view and Mail-Call won't
+connect.
 
-  My Station   config["user"]["telnet_user"] / ["password"] — the default.
-  A BBS entry  entry["telnet_user"] / ["password"] — optional. A Telnet
-               entry with its own username uses its own login; one left
-               blank uses My Station's, exactly as before.
+Up to 0.15.0 there was one login for every BBS, in My Station
+(config["user"]["telnet_user"] / ["password"]). migrate_station_login()
+copies it once into every Telnet entry that has none and removes it from
+My Station. Until that has happened (keyring locked at startup) the old
+login still works as the fallback, so nothing breaks in between.
 
 Two places a password can be stored:
 
@@ -77,10 +81,19 @@ def _entry_key(entry):
     return f"bbs:{entry['login_id']}"
 
 
+def _has_station_login(u):
+    return bool((u.get("telnet_user") or "").strip() or u.get("password")
+                or u.get("password_in_keyring"))
+
+
 def _holders(cfg):
-    """(holder_key, dict) for My Station and every Telnet entry that has
-    its own login."""
-    out = [(MYSTATION_KEY, cfg.setdefault("user", {}))]
+    """(holder_key, dict) for every Telnet entry that has its own login,
+    plus the old My Station login while it is still waiting to be
+    migrated."""
+    out = []
+    u = cfg.setdefault("user", {})
+    if _has_station_login(u):
+        out.append((MYSTATION_KEY, u))
     for e in cfg.get("bbs_list", []) or []:
         if e.get("transport") == "telnet" and e.get("telnet_user"):
             out.append((_entry_key(e), e))
@@ -103,15 +116,65 @@ def has_own_login(entry):
                 and (entry.get("telnet_user") or "").strip())
 
 
+def login_source(cfg, entry):
+    """"bbs", "mystation" (old login, not yet migrated) or "none".
+    Reads no password, so it never touches the keyring."""
+    if has_own_login(entry):
+        return "bbs"
+    u = cfg.get("user", {})
+    if (u.get("telnet_user") or "").strip():
+        return "mystation"
+    return "none"
+
+
 def resolve_telnet_login(cfg, entry):
     """(username, password, source) for a Telnet connect to `entry`.
-    source is "bbs" or "mystation". The password is read from the
-    keyring here, at connect time, when that is where it lives."""
-    if has_own_login(entry):
+    source as login_source(); "none" gives ("", "", "none"). The password
+    is read from the keyring here, at connect time, when that is where it
+    lives."""
+    src = login_source(cfg, entry)
+    if src == "bbs":
         return (entry["telnet_user"].strip(),
                 _get(_entry_key(entry), entry), "bbs")
-    u = cfg.get("user", {})
-    return (u.get("telnet_user", ""), _get(MYSTATION_KEY, u), "mystation")
+    if src == "mystation":
+        u = cfg.get("user", {})
+        return (u["telnet_user"].strip(), _get(MYSTATION_KEY, u), "mystation")
+    return ("", "", "none")
+
+
+def migrate_station_login(cfg):
+    """Move the pre-0.16 My Station login into every Telnet entry that has
+    no login of its own, then remove it from My Station (Bill, 2026-11-23).
+    Returns (changed, problems). changed=False with no problems means
+    there was nothing to do. If the old password is in a keyring that
+    can't be read right now, nothing changes and the next start tries
+    again; the old login keeps working meanwhile."""
+    u = cfg.setdefault("user", {})
+    if not _has_station_login(u):
+        for k in ("telnet_user", "password", "password_in_keyring"):
+            u.pop(k, None)
+        return False, []
+    load_passwords(cfg)
+    if u.get("_keyring_unread"):
+        # Undo load_passwords' marks; leave everything as it was.
+        for _, h in _holders(cfg):
+            if h.pop("_keyring_unread", False) or h.get("password_in_keyring"):
+                h["password"] = ""
+        return False, ["My Station login: keyring locked, will move it "
+                       "into your Telnet BBS entries next time"]
+    user = (u.get("telnet_user") or "").strip()
+    pw = u.get("password", "") or ""
+    if user:
+        for e in cfg.get("bbs_list", []) or []:
+            if e.get("transport") == "telnet" and not has_own_login(e):
+                e["telnet_user"] = user
+                e["password"] = pw
+                e.pop("password_in_keyring", None)
+    for k in ("telnet_user", "password", "password_in_keyring"):
+        u.pop(k, None)
+    problems = store_passwords(
+        cfg, bool(cfg.get("app", {}).get("use_keyring")))
+    return True, problems
 
 
 def load_passwords(cfg):

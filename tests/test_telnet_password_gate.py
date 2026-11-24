@@ -88,5 +88,23 @@ logs.clear(); s.transport.buf = "de N0CALL>"
 s._send("LM")
 check("ordinary command not masked", logs == ["[TX] LM"], logs)
 
+# No login saved for this BBS (2026-11-23): Terminal view sends nothing,
+# Mail view refuses before connecting.
+got = []
+port = server([(None, "Welcome\r\nuser: ")], got)
+t = TelnetTransport("127.0.0.1", port)
+s = bs.BBSSession(t, "N0CALL", password="", telnet_user="")
+logs = []; s._log = lambda d, txt: logs.append(txt)
+s.connect_only(); time.sleep(1.0); t.disconnect()
+check("no login, Terminal: nothing sent, not even the callsign",
+      b"".join(got) == b"", got)
+check("no login, Terminal: says to type it",
+      any("No login saved" in l for l in logs), logs)
+s = bs.BBSSession(TelnetTransport("127.0.0.1", 9), "N0CALL", telnet_user="")
+s._log = lambda *_: None
+check("no login, Mail view: refused before connecting", s.connect_and_login() is False)
+check("callsign is still the default when no login is given",
+      bs.BBSSession(TelnetTransport("127.0.0.1", 9), "n0call").telnet_user == "n0call")
+
 print(f"\n{'PASS' if not fails else 'FAIL'}: telnet password gate ({len(fails)} failures)")
 sys.exit(1 if fails else 0)

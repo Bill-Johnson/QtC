@@ -185,7 +185,7 @@ with your OS, the modem and its version, what you did, and the Debug view text
 - **VARA HF** — RF mail and file transfer with busy-channel detection, PTT keying, and live link stats (bitrate, SN, bandwidth) in the status bar
 - **VARA FM** — packet-voice frequencies with **NARROW / WIDE** bandwidth control; same UI as HF
 - **AX.25 packet** — 300 baud HF and 1200 baud VHF through **Direwolf** or **UZ7HO SoundModem / QtSoundModem**, using the modem's AGW port. The modem can run on another computer on your network (many operators keep SoundModem on a separate Windows PC) — set its address in the BBS entry
-- **Telnet** — LAN / internet nodes for local testing; auto-disconnects after the mail check completes. Each Telnet BBS can have its own username and password (blank = the My Station login). Telnet sends your login unencrypted, so use a password you don't use anywhere else. Passwords are kept in QtC's settings file (readable only by your account), or in the system keyring if you turn that on in Settings → App
+- **Telnet** — LAN / internet nodes for local testing; auto-disconnects after the mail check completes. Each Telnet BBS entry holds its own username and password (a login saved in My Station by an older QtC is moved into your Telnet entries automatically). With no login saved, connect from Terminal view and type it yourself. Telnet sends your login unencrypted, so use a password you don't use anywhere else. Passwords are kept in QtC's settings file (readable only by your account), or in the system keyring if you turn that on in Settings → App
 - **Experimental modems (dev)** — **Data2G**, **Mercury** and **VardeFM**, open-source modems that use VARA's control scheme, so each is simply another choice in the Mode and Transport drop-downs, always listed beside VARA. Each BBS entry keeps its own modem, Host / Command port and timing, and QtC names the modem in the toolbar, the BBS List and the status line, so it is always clear which one you are on. A modem only talks to the same modem at the other station, not to VARA — so the BBS must run the same modem. See [Experimental Modems Setup](#experimental-modems-setup-dev) and [dev_notes.txt](dev_notes.txt)
 - **PTT** — for VARA, RTS or DTR via serial port, with both lines set low before QtC opens the port, so opening it does not key the radio; defensive flow-control flags for Digirig / CP2105 setups. Packet modems key the radio themselves
 
@@ -365,7 +365,7 @@ Linux/Mac `.tar.gz` release. Requires Python 3.10+, PyQt6, and pyserial.
 ## First-Time Setup
 
 1. Open **File → Settings → My Station** — enter callsign, name, QTH, and Home BBS
-2. Go to the **BBS List** tab — add your BBS with its transport (VARA HF, VARA FM, Direwolf, (Qt)SoundModem, or Telnet)
+2. Go to the **BBS List** tab — add your BBS with its transport (VARA HF, VARA FM, Direwolf, (Qt)SoundModem, or Telnet; a Telnet BBS gets its username and password here)
 3. Go to the **PTT** tab — select serial port and signal (RTS recommended for Digirig)
 4. Close Settings, select your BBS from the dropdown, and click **⚡ Connect**
 5. After your first connect to your Home BBS, open **Settings → Bulletins** — QtC has already pulled the category list off the node. Tick the ones you want (SITREP, WX, …); **🔄 Refresh now** updates the list while you are connected
@@ -441,7 +441,7 @@ sqlite3 ~/.local/share/qtc/data/messages.db "DELETE FROM bulletin_tombstones; DE
 | `bbs_session.py` | BBS login, mail check, message download / send, YAPP file transfer |
 | `transport.py` | VARA HF, VARA FM, AGW packet (Direwolf / SoundModem), and Telnet transports (single-reader pattern) |
 | `ptt.py` | PTT control via serial RTS/DTR |
-| `credentials.py` | Telnet logins: per-BBS or My Station, stored in the settings file or the system keyring |
+| `credentials.py` | Telnet logins: one per BBS entry, stored in the settings file or the system keyring |
 | `database.py` | SQLite — inbox, drafts, outbox, sent, bulletins, watermarks, contacts |
 | `make_splash.py` | Pillow generator for `qtc_splash.png` — version-stamped at install/build time |
 

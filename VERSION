@@ -44,11 +44,15 @@ NEW
     Draft / Discard / Cancel. Drafts stay on your computer and never go
     to the BBS; Open Draft (or double-click) reopens one, and OK moves
     it to the Outbox.
-  - Each Telnet BBS can have its own username and password (BBS entry
-    dialog). Leave them blank to use the My Station login, as before.
-    If you point the toolbar at a different host or port, that BBS's
-    login is not sent there. The Debug log says which login a connect
-    used, never the password.
+  - Telnet logins live on each Telnet BBS entry (Username / Password in
+    the BBS entry dialog). My Station no longer has a Telnet login: on
+    first start, one saved there is copied into every Telnet entry that
+    has none, then removed (keyring included). With no login saved,
+    Terminal view lets you type it at the BBS's prompt; Mail view says
+    so and doesn't connect, and Mail-Call skips that BBS. If you point
+    the toolbar at a different host or port, a BBS's login is not sent
+    there. The Debug log says which login a connect used, never the
+    password.
   - Telnet passwords can live in the system keyring instead of
     config.json: Settings > App "Store Telnet passwords in the system
     keyring" (off by default). That's Windows Credential Manager, or

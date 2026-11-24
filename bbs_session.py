@@ -779,10 +779,12 @@ class BBSSession:
     TELNET_NUDGE_SECS = 3
 
     def __init__(self, transport, mycall: str, password: str = "",
-                 telnet_user: str = "", user_info: dict = None):
+                 telnet_user=None, user_info: dict = None):
         self.transport   = transport
         self.mycall      = mycall.upper()
-        self.telnet_user = telnet_user if telnet_user else mycall
+        # None = not given (callsign, the old default). "" = this BBS has no
+        # saved login: Terminal view leaves the prompts to the user.
+        self.telnet_user = mycall if telnet_user is None else telnet_user
         self.password    = password
         self.user_info         = user_info or {}  # name, qth, zip, home_bbs
         # True when the BBS is sitting at a listing's page prompt
@@ -1133,9 +1135,13 @@ class BBSSession:
         answer goes only once its prompt has actually arrived — if one never
         shows, the user takes it from there. The prompts still stream to the
         Terminal; the password is masked in the log by _send()."""
+        if not self.telnet_user:
+            self._log("SYS", "No login saved for this BBS — type your "
+                             "username and password")
+            return
         _, matched = self.transport.read_until_any(
             self.PROMPT_LOGIN_ALT, timeout=10)
-        if not (matched and self.telnet_user):
+        if not matched:
             self._log("SYS", "No username prompt seen — type the login yourself")
             return
         self._send(self.telnet_user)
@@ -1226,6 +1232,11 @@ class BBSSession:
 
     def _telnet_login(self) -> bool:
         """Full LinBPQ telnet login sequence."""
+        if not self.telnet_user:
+            # The GUI stops this before connecting; belt and braces.
+            self._log("SYS", "No login saved for this BBS — add one in its "
+                             "BBS entry, or log in by hand from Terminal view")
+            return False
         self.transport.connect()
         self._log("SYS", f"TCP connected to "
                          f"{self.transport.host}:{self.transport.port}")

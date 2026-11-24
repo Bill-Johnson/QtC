@@ -25,8 +25,10 @@ Transports
   on another computer on your network (many operators keep SoundModem on a
   separate Windows PC) — set its address in the BBS entry
 - Telnet — LAN / internet nodes for local testing; auto-disconnects after
-  the mail check completes. Each Telnet BBS can have its own username and
-  password (blank = the My Station login). Telnet sends your login
+  the mail check completes. Each Telnet BBS entry holds its own username
+  and password (a login saved in My Station by an older QtC is moved into
+  your Telnet entries automatically). With no login saved, connect from
+  Terminal view and type it yourself. Telnet sends your login
   unencrypted, so use a password you don't use anywhere else. Passwords
   are kept in QtC's settings file (readable only by your account), or in
   the system keyring if you turn that on in Settings > App
@@ -280,7 +282,8 @@ First-Time Setup
 1. Open File -> Settings -> My Station
    Enter callsign, name, QTH, and Home BBS
 2. Go to the BBS List tab — add your BBS with its transport (VARA HF,
-   VARA FM, Direwolf, (Qt)SoundModem, or Telnet)
+   VARA FM, Direwolf, (Qt)SoundModem, or Telnet; a Telnet BBS gets its
+   username and password here)
 3. Go to the PTT tab — select serial port and signal (RTS recommended for Digirig)
 4. Close Settings, select your BBS from the dropdown, and click Connect
 5. After your first connect to your Home BBS, open Settings -> Bulletins —
@@ -370,7 +373,7 @@ Source Files
   transport.py    — VARA HF, VARA FM, AGW packet (Direwolf / SoundModem),
                     and Telnet transports (single-reader pattern)
   ptt.py          — PTT control via serial RTS/DTR
-  credentials.py  — Telnet logins: per-BBS or My Station, settings file
+  credentials.py  — Telnet logins: one per BBS entry, settings file
                     or system keyring
   database.py     — SQLite: inbox, drafts, outbox, sent, bulletins,
                     watermarks, contacts

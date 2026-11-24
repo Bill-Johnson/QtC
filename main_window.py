@@ -463,11 +463,15 @@ class SessionWorker(QThread):
             t._log = lambda d, txt: self.sig_log.emit(f"[{d}] {txt.strip()}")
             user_info = {k: self.config["user"].get(k, "")
                          for k in ("name", "qth", "zip", "home_bbs")}
-            # This BBS's own login if it has one, else My Station's; the
-            # password comes from config.json or the keyring.
+            # This BBS's own login; the password comes from config.json or
+            # the keyring. No login saved -> "" (Terminal view: you type it).
             t_user, t_pw, src = credentials.resolve_telnet_login(self.config, e)
-            self.sig_log.emit(f"[SYS] Telnet login: {t_user or '(callsign)'} "
-                              f"({'this BBS' if src == 'bbs' else 'My Station'})")
+            if src == "none":
+                self.sig_log.emit("[SYS] Telnet: no login saved for this BBS")
+            else:
+                self.sig_log.emit(
+                    f"[SYS] Telnet login: {t_user} "
+                    f"({'this BBS' if src == 'bbs' else 'old My Station login'})")
             s = BBSSession(t,
                            mycall=self.config["user"]["callsign"],
                            password=t_pw,
@@ -2810,9 +2814,9 @@ class SettingsDialog(_RememberSize, QDialog):
         self.e_qth         = QLineEdit(u.get("qth", ""))
         self.e_zip         = QLineEdit(u.get("zip", ""))
         self.e_home_bbs    = QLineEdit(u.get("home_bbs", ""))
-        self.e_telnet_user = QLineEdit(u.get("telnet_user", ""))
-        self.e_password    = QLineEdit(u.get("password", ""))
-        self.e_password.setEchoMode(QLineEdit.EchoMode.Password)
+        # No Telnet login here any more: each Telnet BBS entry carries its
+        # own (Bill, 2026-11-23). An old one is moved into the entries at
+        # startup (credentials.migrate_station_login).
 
         self.e_callsign.setPlaceholderText("e.g. N0CALL")
         self.e_name.setPlaceholderText("e.g. Bill  (sent on first BBS registration)")
@@ -2820,31 +2824,17 @@ class SettingsDialog(_RememberSize, QDialog):
         self.e_zip.setPlaceholderText("e.g. 12345  (optional)")
         self.e_home_bbs.setPlaceholderText(
             "e.g. N0CALL.#REGION.ST.USA.NOAM  (hierarchical routing address)")
-        self.e_telnet_user.setPlaceholderText("e.g. n0call  (lowercase, case-sensitive)")
-        self.e_password.setPlaceholderText("Telnet sysop password (blank for radio)")
-
-        self.chk_show_pw = QCheckBox("Show")
-        self.chk_show_pw.toggled.connect(
-            lambda v: self.e_password.setEchoMode(
-                QLineEdit.EchoMode.Normal if v else QLineEdit.EchoMode.Password))
-
-        pw_row = QHBoxLayout()
-        pw_row.addWidget(self.e_password)
-        pw_row.addWidget(self.chk_show_pw)
 
         form.addRow("Callsign:",         self.e_callsign)
         form.addRow("Name:",             self.e_name)
         form.addRow("QTH:",              self.e_qth)
         form.addRow("Zip/Postcode:",     self.e_zip)
         form.addRow("Home BBS:",         self.e_home_bbs)
-        form.addRow("Telnet username:",  self.e_telnet_user)
-        form.addRow("Telnet password:",  pw_row)
-        form.addRow("",                  _cleartext_note())
 
         note = QLabel(
             "<i>Name, QTH, Zip and Home BBS are auto-sent during new user "
             "registration on first connect to a BBS.<br>"
-            "Telnet username is case-sensitive on LinBPQ nodes.<br>"
+            "Telnet logins are set on each Telnet BBS entry.<br>"
             "Callsign is always sent uppercase over radio.</i>")
         note.setStyleSheet(f"color: {self._note_color}; font-size:11px;")
         note.setWordWrap(True)
@@ -4322,8 +4312,6 @@ class SettingsDialog(_RememberSize, QDialog):
         self._cfg["user"]["qth"]         = self.e_qth.text().strip()
         self._cfg["user"]["zip"]         = self.e_zip.text().strip()
         self._cfg["user"]["home_bbs"]    = self.e_home_bbs.text().strip().upper()
-        self._cfg["user"]["telnet_user"] = self.e_telnet_user.text().strip()
-        self._cfg["user"]["password"]    = self.e_password.text()
 
         if not self._cfg["user"]["callsign"]:
             QMessageBox.warning(self, "Missing Field",
@@ -4647,12 +4635,12 @@ class _BBSEntryDialog(_RememberSize, QDialog):
         telnet_form.addRow("Host:", self.e_host)
         telnet_form.addRow("Port:", self.e_port)
 
-        # Optional login for THIS BBS (2026-11-23). Blank = the My Station
-        # login, which is how every entry worked before.
+        # This BBS's Telnet login (2026-11-23). Blank = none saved: Terminal
+        # view lets you type it, Mail view and Mail-Call won't connect.
         self._login_id = e.get("login_id", "")
         self._kr_unread = bool(e.get("_keyring_unread"))
         self.e_bbs_user = QLineEdit(e.get("telnet_user", ""))
-        self.e_bbs_user.setPlaceholderText("blank = use My Station login")
+        self.e_bbs_user.setPlaceholderText("e.g. n0call  (case-sensitive on LinBPQ)")
         self.e_bbs_user.setMaxLength(80)
         self.e_bbs_pw = QLineEdit(e.get("password", ""))
         self.e_bbs_pw.setEchoMode(QLineEdit.EchoMode.Password)
@@ -5112,6 +5100,18 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.config  = load_config()
+        # 0.16: the old My Station Telnet login moves into the Telnet BBS
+        # entries, once (credentials.migrate_station_login).
+        _moved, _mprobs = credentials.migrate_station_login(self.config)
+        if _moved:
+            save_config(self.config)
+        self._login_migration_msgs = (
+            (["Telnet login moved from My Station into your Telnet BBS "
+              "entries"] if _moved else []) + list(_mprobs))
+        if self._login_migration_msgs:
+            QTimer.singleShot(0, lambda: [
+                self.debug_view.append(f"[SYS] {m}\n", "#888888")
+                for m in self._login_migration_msgs])
         _default_data = os.path.join(_APP_DIR, "data")
         _data_dir_cfg = self.config["app"].get("data_dir") or ""
         # Treat relative or empty data_dir as relative to _APP_DIR, not cwd.
@@ -5870,8 +5870,8 @@ class MainWindow(QMainWindow):
                                        host.upper().split(".")[0])
             # A BBS's own login belongs to its own host:port. If the
             # toolbar now points somewhere else, use the saved Telnet entry
-            # for THAT address if there is one, else My Station's login —
-            # never this entry's password sent to a different host.
+            # for THAT address if there is one, else no login (type it in
+            # Terminal view) — never this entry's password sent elsewhere.
             same = (base.get("transport") == "telnet"
                     and base.get("host", "") == entry["host"]
                     and int(base.get("telnet_port", 8010) or 8010)
@@ -5976,6 +5976,21 @@ class MainWindow(QMainWindow):
             return
         if transport != "telnet" and not entry.get("callsign"):
             QMessageBox.warning(self, "No Callsign", "Enter the BBS callsign to connect to.")
+            return
+        # Mail view and Mail-Call log in by themselves, so they need a saved
+        # login. Terminal / Debug view can go without: you type it there.
+        if (transport == "telnet" and not self._hands_on_view()
+                and credentials.login_source(self.config, entry) == "none"):
+            where = f"{entry['host']}:{entry['telnet_port']}"
+            if self._mc_active_entry is not None:
+                self._on_log(f"[SCHED] Skipped — no Telnet login saved for {where}")
+                self._mc_active_entry  = None
+                self._mc_session_owned = False
+                return
+            QMessageBox.information(self, "No Telnet login",
+                f"No Telnet login is saved for {where}.\n\n"
+                "Set a username and password for it in the BBS list, or "
+                "switch to Terminal view to log in by hand.")
             return
 
         self.btn_connect.setEnabled(False)
