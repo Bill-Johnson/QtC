@@ -28,14 +28,14 @@ install_system_deps() {
 
     if command -v dnf &>/dev/null; then
         echo "  Detected Fedora/RHEL — installing via dnf..."
-        sudo dnf install -y python3 python3-pip python3-pyqt6 python3-pyserial 2>/dev/null || true
+        sudo dnf install -y python3 python3-pip python3-pyqt6 python3-pyserial python3-keyring 2>/dev/null || true
     elif command -v apt-get &>/dev/null; then
         echo "  Detected Debian/Ubuntu — installing via apt..."
         sudo apt-get update -qq
-        sudo apt-get install -y python3 python3-pip python3-pyqt6 python3-serial 2>/dev/null || true
+        sudo apt-get install -y python3 python3-pip python3-pyqt6 python3-serial python3-keyring 2>/dev/null || true
     elif command -v pacman &>/dev/null; then
         echo "  Detected Arch — installing via pacman..."
-        sudo pacman -S --noconfirm python python-pyqt6 python-pyserial 2>/dev/null || true
+        sudo pacman -S --noconfirm python python-pyqt6 python-pyserial python-keyring 2>/dev/null || true
     else
         echo "  Unknown distro — will try pip install."
     fi
@@ -51,6 +51,13 @@ install_pip_deps() {
     if ! python3 -c "import serial" &>/dev/null 2>&1; then
         echo "  Installing pyserial via pip..."
         pip3 install --user pyserial
+    fi
+    # Optional: lets Settings > App keep Telnet passwords in the system
+    # keyring. QtC runs fine without it (the box is greyed out).
+    if ! python3 -c "import keyring" &>/dev/null 2>&1; then
+        echo "  Installing keyring (optional) via pip..."
+        pip3 install --user keyring &>/dev/null || \
+            echo "  keyring not installed (optional). To use the system keyring, install python3-keyring."
     fi
     echo "  Dependencies OK."
 }
@@ -116,7 +123,7 @@ install_app_files() {
     # Verify all files carry matching version headers
     echo "  Verifying file versions..."
     mismatch=0
-    for f in main_window.py bbs_session.py transport.py database.py ptt.py; do
+    for f in main_window.py bbs_session.py transport.py database.py ptt.py credentials.py; do
         ver=$(head -1 "$INSTALL_DIR/$f" 2>/dev/null | grep -o "v[0-9.a-z-]*" | head -1)
         if [ -z "$ver" ]; then
             echo "  WARNING: $f has no version header"
@@ -124,12 +131,12 @@ install_app_files() {
         fi
     done
     # Check they all match
-    vers=$(for f in main_window.py bbs_session.py transport.py database.py ptt.py; do
+    vers=$(for f in main_window.py bbs_session.py transport.py database.py ptt.py credentials.py; do
         head -1 "$INSTALL_DIR/$f" 2>/dev/null | grep -o "v[0-9.a-z-]*" | head -1
     done | sort -u | wc -l)
     if [ "$vers" -gt 1 ]; then
         echo "  WARNING: Version mismatch detected across files!"
-        for f in main_window.py bbs_session.py transport.py database.py ptt.py; do
+        for f in main_window.py bbs_session.py transport.py database.py ptt.py credentials.py; do
             echo "    $(head -1 "$INSTALL_DIR/$f" 2>/dev/null)"
         done
     else

@@ -1,2 +1,3 @@
 PyQt6>=6.4.0
 pyserial>=3.5
+keyring>=24  # optional: Settings > App keyring box

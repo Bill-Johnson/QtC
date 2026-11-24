@@ -38,6 +38,17 @@ a = Analysis(
         'transport',
         'database',
         'ptt',
+        'credentials',
+        # Optional system keyring for Telnet passwords (credentials.py).
+        # Windows Credential Manager backend; keyring finds its backends
+        # through importlib.metadata entry points, which needs 'email'.
+        'keyring',
+        'keyring.backends',
+        'keyring.backends.Windows',
+        'keyring.backends.chainer',
+        'keyring.backends.fail',
+        'keyring.backends.null',
+        'win32ctypes.core',
     ],
     hookspath=[],
     hooksconfig={},
@@ -50,10 +61,9 @@ a = Analysis(
         'pandas',
         'scipy',
         'PIL',
-        'email',
-        'html',
-        'http',
-        'urllib',
+        # NOT 'email', 'http' or 'urllib': keyring needs them
+        # (importlib.metadata, jaraco.context). NOT 'html' either:
+        # main_window.py escapes BBS text with html.escape.
         'xml',
         'xmlrpc',
         'test',

@@ -537,7 +537,8 @@ class TestAPI(QObject):
 
 
         if verb == "screenshot":
-            path = args.strip() or "/tmp/qtc.png"
+            # dev-only, reachable only after the per-run token
+            path = args.strip() or "/tmp/qtc.png"  # nosec B108
             w.grab().save(path)
             return {"ok": True, "path": path}
 

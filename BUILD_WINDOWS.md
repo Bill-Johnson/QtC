@@ -14,7 +14,7 @@ in before running it. Commands are for **PowerShell**.
 
 Python 3.10 or newer and Git for Windows, then in PowerShell:
 ```
-pip install pyinstaller pillow pyqt6 pyserial
+pip install pyinstaller pillow pyqt6 pyserial keyring
 ```
 
 If `C:\Ham\QtC\` does not exist yet, clone it and switch to the `windows`

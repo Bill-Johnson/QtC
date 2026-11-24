@@ -61,6 +61,7 @@ AGW_DEFAULT_PORT = 8000   # Direwolf and QtSoundModem both default here
 from bbs_session import BBSSession, BBSMailSummary, DownloadAborted
 
 from database import MessageDatabase, ContactsDB
+import credentials
 
 # Carried on sig_yapp_error to mean "the user pressed Abort", which is not
 # a failure and must not raise an error box. A sentinel rather than a second
@@ -462,10 +463,15 @@ class SessionWorker(QThread):
             t._log = lambda d, txt: self.sig_log.emit(f"[{d}] {txt.strip()}")
             user_info = {k: self.config["user"].get(k, "")
                          for k in ("name", "qth", "zip", "home_bbs")}
+            # This BBS's own login if it has one, else My Station's; the
+            # password comes from config.json or the keyring.
+            t_user, t_pw, src = credentials.resolve_telnet_login(self.config, e)
+            self.sig_log.emit(f"[SYS] Telnet login: {t_user or '(callsign)'} "
+                              f"({'this BBS' if src == 'bbs' else 'My Station'})")
             s = BBSSession(t,
                            mycall=self.config["user"]["callsign"],
-                           password=self.config["user"].get("password", ""),
-                           telnet_user=self.config["user"].get("telnet_user", ""),
+                           password=t_pw,
+                           telnet_user=t_user,
                            user_info=user_info)
 
         elif transport in VARA_MODEMS:
@@ -2743,6 +2749,9 @@ class SettingsDialog(_RememberSize, QDialog):
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
         self._cfg = copy.deepcopy(config)
+        # Real passwords in this private copy, wherever they are stored,
+        # so the login fields can show them. Saved back in _on_accept.
+        credentials.load_passwords(self._cfg)
         self._orig_home_bbs = (config.get("user", {}) or {}).get("home_bbs", "")
         self._dark = bool(config.get("app", {}).get("dark_mode", False))
         self._note_color = "#aaaaaa" if self._dark else "#666666"
@@ -2830,6 +2839,7 @@ class SettingsDialog(_RememberSize, QDialog):
         form.addRow("Home BBS:",         self.e_home_bbs)
         form.addRow("Telnet username:",  self.e_telnet_user)
         form.addRow("Telnet password:",  pw_row)
+        form.addRow("",                  _cleartext_note())
 
         note = QLabel(
             "<i>Name, QTH, Zip and Home BBS are auto-sent during new user "
@@ -4281,6 +4291,25 @@ class SettingsDialog(_RememberSize, QDialog):
         note.setWordWrap(True)
         form.addRow("", note)
 
+        # Where Telnet passwords are kept (2026-11-23). Off by default:
+        # config.json, readable only by this account. On: the system
+        # keyring. Passwords move when Settings is saved.
+        kr_ok, kr_why = credentials.keyring_status()
+        self.chk_keyring = QCheckBox("Store Telnet passwords in the system keyring")
+        self.chk_keyring.setChecked(bool(a.get("use_keyring", False)) and kr_ok)
+        self.chk_keyring.setEnabled(kr_ok or bool(a.get("use_keyring", False)))
+        kr_note = QLabel(
+            "Off: kept in QtC's settings file, readable only by your account. "
+            "On: Windows Credential Manager or your desktop's keyring."
+            if kr_ok else
+            f"Not available: {kr_why}. Passwords are kept in QtC's "
+            f"settings file, readable only by your account.")
+        kr_note.setTextFormat(Qt.TextFormat.PlainText)
+        kr_note.setStyleSheet(f"color: {self._note_color}; font-size:11px;")
+        kr_note.setWordWrap(True)
+        form.addRow("Passwords:", self.chk_keyring)
+        form.addRow("", kr_note)
+
         return w
 
     # ── Accept: write edited values back into _cfg ─────────────────
@@ -4427,6 +4456,13 @@ class SettingsDialog(_RememberSize, QDialog):
                 f"{mc_off_reason}<br><br>"
                 "Turn it back on in the Mail-Call !!! tab once that's fixed.")
 
+        problems = credentials.store_passwords(
+            self._cfg, self.chk_keyring.isChecked())
+        if problems:
+            QMessageBox.warning(self, "Passwords",
+                "Some passwords could not be stored in the system keyring "
+                "and were kept where they were:\n\n" + "\n".join(problems))
+
         self.accept()
 
     @staticmethod
@@ -4459,6 +4495,16 @@ class SettingsDialog(_RememberSize, QDialog):
 # ─────────────────────────────────────────────────────────────────────────────
 # BBS Entry sub-dialog  (used by SettingsDialog BBS tab)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _cleartext_note() -> QLabel:
+    """The one grey line under every Telnet login (Bill, 2026-11-23)."""
+    lbl = QLabel("Telnet sends your login unencrypted. "
+                 "Use a password you don't use anywhere else.")
+    lbl.setTextFormat(Qt.TextFormat.PlainText)
+    lbl.setWordWrap(True)
+    lbl.setStyleSheet("color: #888888; font-size: 11px;")
+    return lbl
+
 
 class _BBSEntryDialog(_RememberSize, QDialog):
     """Add or edit a single BBS entry."""
@@ -4600,6 +4646,33 @@ class _BBSEntryDialog(_RememberSize, QDialog):
 
         telnet_form.addRow("Host:", self.e_host)
         telnet_form.addRow("Port:", self.e_port)
+
+        # Optional login for THIS BBS (2026-11-23). Blank = the My Station
+        # login, which is how every entry worked before.
+        self._login_id = e.get("login_id", "")
+        self._kr_unread = bool(e.get("_keyring_unread"))
+        self.e_bbs_user = QLineEdit(e.get("telnet_user", ""))
+        self.e_bbs_user.setPlaceholderText("blank = use My Station login")
+        self.e_bbs_user.setMaxLength(80)
+        self.e_bbs_pw = QLineEdit(e.get("password", ""))
+        self.e_bbs_pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self.e_bbs_pw.setMaxLength(128)
+        self.e_bbs_pw.setPlaceholderText("password for this BBS")
+        self.chk_bbs_pw = QCheckBox("Show")
+        self.chk_bbs_pw.toggled.connect(
+            lambda v: self.e_bbs_pw.setEchoMode(
+                QLineEdit.EchoMode.Normal if v else QLineEdit.EchoMode.Password))
+        bbs_pw_row = QHBoxLayout()
+        bbs_pw_row.addWidget(self.e_bbs_pw)
+        bbs_pw_row.addWidget(self.chk_bbs_pw)
+        self.e_bbs_user.textChanged.connect(
+            lambda t: (self.e_bbs_pw.setEnabled(bool(t.strip())),
+                       self.chk_bbs_pw.setEnabled(bool(t.strip()))))
+        self.e_bbs_pw.setEnabled(bool(self.e_bbs_user.text().strip()))
+        self.chk_bbs_pw.setEnabled(bool(self.e_bbs_user.text().strip()))
+        telnet_form.addRow("Username:", self.e_bbs_user)
+        telnet_form.addRow("Password:", bbs_pw_row)
+        telnet_form.addRow("", _cleartext_note())
         layout.addWidget(self.telnet_group)
 
         # ── Packet (AGW modem) fields panel ────────────
@@ -4794,7 +4867,7 @@ class _BBSEntryDialog(_RememberSize, QDialog):
         port = self.e_port.text().strip()
         agw_port = self.e_agw_port.text().strip()
         is_agw = key in AGW_MODEMS
-        return {
+        out = {
             "name":        self.e_name.text().strip(),
             "callsign":    self.e_callsign.text().strip().upper(),
             "transport":   key,
@@ -4817,6 +4890,15 @@ class _BBSEntryDialog(_RememberSize, QDialog):
                               else None),
             "notes":       self.e_notes.text().strip(),
         }
+        if key == "telnet" and self.e_bbs_user.text().strip():
+            out["telnet_user"] = self.e_bbs_user.text().strip()
+            out["password"] = self.e_bbs_pw.text()
+            if self._login_id:
+                out["login_id"] = self._login_id   # keeps its keyring item
+            if self._kr_unread and not out["password"]:
+                out["_keyring_unread"] = True      # locked keyring: keep item
+                out["password_in_keyring"] = True
+        return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5786,6 +5868,29 @@ class MainWindow(QMainWindow):
             entry["telnet_port"] = int(port_str) if port_str.isdigit() else 8010
             entry["callsign"]    = call or entry.get("callsign",
                                        host.upper().split(".")[0])
+            # A BBS's own login belongs to its own host:port. If the
+            # toolbar now points somewhere else, use the saved Telnet entry
+            # for THAT address if there is one, else My Station's login —
+            # never this entry's password sent to a different host.
+            same = (base.get("transport") == "telnet"
+                    and base.get("host", "") == entry["host"]
+                    and int(base.get("telnet_port", 8010) or 8010)
+                        == entry["telnet_port"])
+            if not same:
+                for k in ("telnet_user", "password", "password_in_keyring",
+                          "login_id"):
+                    entry.pop(k, None)
+                for saved in self.config.get("bbs_list", []):
+                    if (saved.get("transport") == "telnet"
+                            and saved.get("host", "") == entry["host"]
+                            and int(saved.get("telnet_port", 8010) or 8010)
+                                == entry["telnet_port"]
+                            and credentials.has_own_login(saved)):
+                        for k in ("telnet_user", "password",
+                                  "password_in_keyring", "login_id"):
+                            if k in saved:
+                                entry[k] = saved[k]
+                        break
         else:
             mode_str = self.mode_combo.currentText()
             call     = self.call_edit.text().strip().upper()

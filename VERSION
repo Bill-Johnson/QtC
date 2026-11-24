@@ -44,6 +44,20 @@ NEW
     Draft / Discard / Cancel. Drafts stay on your computer and never go
     to the BBS; Open Draft (or double-click) reopens one, and OK moves
     it to the Outbox.
+  - Each Telnet BBS can have its own username and password (BBS entry
+    dialog). Leave them blank to use the My Station login, as before.
+    If you point the toolbar at a different host or port, that BBS's
+    login is not sent there. The Debug log says which login a connect
+    used, never the password.
+  - Telnet passwords can live in the system keyring instead of
+    config.json: Settings > App "Store Telnet passwords in the system
+    keyring" (off by default). That's Windows Credential Manager, or
+    the desktop keyring on Linux. Turning it off moves them back. A
+    keyring that is locked when Settings opens is left alone, never
+    emptied. No keyring on the computer = the box is greyed out with
+    the reason. The installers add the optional 'keyring' package.
+  - A grey note under each Telnet login: Telnet sends your login
+    unencrypted, so use a password you don't use anywhere else.
 
 FIXED
   - Packet through Direwolf or (Qt)SoundModem stopped working on this
@@ -115,7 +129,10 @@ FOR DEVELOPERS
     automatically in the QtC data folder.
   - New offline tests: test_html_injection.py, test_send_sanitize.py,
     test_config_safety.py, test_telnet_password_gate.py,
-    test_rx_limits.py, test_send_limits.py, test_api_auth.py.
+    test_rx_limits.py, test_send_limits.py, test_api_auth.py,
+    test_credentials.py, test_bbs_logins_gui.py.
+  - credentials.py is a new source file (Telnet logins + keyring); it
+    carries the version header like the others.
   - tests/fake_bbs_vara.py: a small LinBPQ-style mailbox behind any
     VARA-protocol modem, for testing without a real BBS.
   - tests/modem_tune.py: hold a TUNE tone while setting levels.

@@ -75,9 +75,23 @@ try {
     & $pyCmd -m pip install --user pyserial
 }
 
+# Optional: lets Settings > App keep Telnet passwords in Windows
+# Credential Manager. QtC runs fine without it (the box is greyed out).
+Write-Host "Checking keyring (optional)..." -NoNewline
+$null = & $pyCmd -c "import keyring" 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Host " OK" -ForegroundColor Green
+} else {
+    Write-Host " installing..." -ForegroundColor Yellow
+    & $pyCmd -m pip install --user keyring 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  keyring not installed (optional) - QtC works without it." -ForegroundColor Yellow
+    }
+}
+
 # --- 3. Verify all source files match version ---
 Write-Host "Verifying version headers..."
-$files = @("main_window.py","bbs_session.py","transport.py","database.py","ptt.py")
+$files = @("main_window.py","bbs_session.py","transport.py","database.py","ptt.py","credentials.py")
 foreach ($f in $files) {
     if (-not (Test-Path $f)) {
         Write-Host "  ERROR: $f not found in current directory." -ForegroundColor Red

@@ -357,7 +357,8 @@ class MessageDatabase:
         if table is None:
             raise ValueError(f"delete_message: unknown folder {folder!r}")
         with self._conn() as conn:
-            conn.execute(f"DELETE FROM {table} WHERE id=?", (row_id,))
+            # table comes from the fixed _FOLDER_TABLE map, never from input
+            conn.execute(f"DELETE FROM {table} WHERE id=?", (row_id,))  # nosec B608
 
     # ── Outbox ─────────────────────────────────────────────────────
 
