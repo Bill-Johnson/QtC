@@ -7,7 +7,7 @@ only place that records what changed and when.
 
 
 ========================================================================
-0.16.0-dev  (2026-11-18)  — development branch, not a release
+0.16.0-dev  (2026-11-23)  — development branch, not a release
 ========================================================================
 
 WHAT THIS IS
@@ -78,7 +78,44 @@ FIXED
     test copy with its own XDG_DATA_HOME still runs beside the daily
     one.
 
+SECURITY
+  A review of how QtC handles what a BBS (or anyone on frequency) sends
+  it, and what QtC sends back:
+  - A message subject or other BBS text containing HTML (for example an
+    <img> tag) was drawn as HTML in the message header and status bar.
+    One bad subject could make QtC use up all memory and close. BBS
+    text is now always shown as plain text.
+  - A line reading /EX in the body of a message you send ended the
+    message there, and the rest went to the BBS as commands. Such lines
+    are now sent indented by one space, so they arrive as text.
+    Control characters (Ctrl-Z also ends a message) are removed, and
+    To / @BBS / Subject can no longer carry a line break.
+  - The Telnet password is sent only after the BBS asks for it. A
+    mistyped host or port no longer receives it; the login stops with
+    "password NOT sent". A password you type yourself in the Terminal
+    is shown as ******** in the logs.
+  - config.json is saved safely: a crash can't leave it half written,
+    the previous copy is kept as config.json.bak, and a damaged file is
+    kept and restored from that copy with a warning, instead of being
+    silently replaced with defaults.
+  - On Linux the QtC data folder, config.json and the mail database
+    can be read only by you (other accounts on the computer could read
+    them before on systems like Raspberry Pi OS).
+  - Limits on what QtC will take in: a station sending text without
+    end, or a YAPP file bigger than it announced (or over 10 MB), is
+    stopped instead of filling memory and disk. The Terminal and Debug
+    views keep the last 100,000 lines.
+  - YAPP files are saved under the name you asked for, never as a
+    hidden "dot" file or a Windows device name.
+  - Length limits on To / @BBS (80), Subject (128) and a Terminal line
+    (512), and new-user registration answers at most 8 questions.
+
 FOR DEVELOPERS
+  - --test-api now needs a per-run token; qtc_ctl.py finds it
+    automatically in the QtC data folder.
+  - New offline tests: test_html_injection.py, test_send_sanitize.py,
+    test_config_safety.py, test_telnet_password_gate.py,
+    test_rx_limits.py, test_send_limits.py, test_api_auth.py.
   - tests/fake_bbs_vara.py: a small LinBPQ-style mailbox behind any
     VARA-protocol modem, for testing without a real BBS.
   - tests/modem_tune.py: hold a TUNE tone while setting levels.

@@ -1,4 +1,4 @@
-# QtC v0.16.0-dev — main_window.py  (built 2026-11-20)
+# QtC v0.16.0-dev — main_window.py  (built 2026-11-23)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -18,7 +18,7 @@ APP_VERSION = "0.16.0-dev"  # keep in sync with header comment
 QtC — Main Window (PyQt6)
 v0.2 — Quick-connect bar, auto-download, terminal swap button
 """
-import sys, json, os, copy, re, time, threading, base64
+import sys, json, os, copy, re, time, threading, base64, html, shutil
 from datetime import datetime, timedelta
 
 from PyQt6.QtWidgets import (
@@ -85,26 +85,78 @@ def _get_app_dir() -> str:
                                            ".local", "share"))
         d = os.path.join(xdg, "qtc")
     os.makedirs(d, exist_ok=True)
+    # Owner-only (security review 2026-11-23, #3): this folder holds the
+    # Telnet password (config.json), all mail and downloads. On distros
+    # with world-readable home folders (Debian, Raspberry Pi OS) other
+    # local accounts could read them. Windows %APPDATA% is per-user.
+    if os.name == "posix":
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
     return d
 
 _APP_DIR     = _get_app_dir()
 _CONFIG_PATH = os.path.join(_APP_DIR, "config.json")
 
+_CONFIG_BAK  = _CONFIG_PATH + ".bak"
+_config_lock = threading.Lock()
+# Set by load_config() when config.json had to be recovered; main() shows
+# it once the window is up. None = nothing happened.
+_CONFIG_RECOVERY = None
+
+def _read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
 def load_config():
+    """Load config.json. Never silently throws settings away (security
+    review 2026-11-23, #4): a damaged file is kept as
+    config.json.corrupt-<time>, and the last good copy (config.json.bak,
+    written by save_config) is used before falling back to defaults."""
+    global _CONFIG_RECOVERY
     if not os.path.exists(_CONFIG_PATH):
         # First run — create a default config and continue
         _write_default_config()
-    # Check for empty file — installer may have written a blank
+    # Empty file: the installer may have written a blank. Use the last
+    # good copy if there is one, otherwise defaults (first run).
     if os.path.getsize(_CONFIG_PATH) == 0:
-        _write_default_config()
-    with open(_CONFIG_PATH, encoding="utf-8") as f:
         try:
-            return json.load(f)
-        except json.JSONDecodeError:
-            # Corrupted config — overwrite with defaults
+            cfg = _read_json(_CONFIG_BAK)
+            save_config(cfg)
+            return cfg
+        except (OSError, ValueError):
             _write_default_config()
-            with open(_CONFIG_PATH, encoding="utf-8") as f2:
-                return json.load(f2)
+    if os.name == "posix":
+        try:
+            os.chmod(_CONFIG_PATH, 0o600)    # older installs wrote it 0644
+        except OSError:
+            pass
+    try:
+        return _read_json(_CONFIG_PATH)
+    except ValueError:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        kept = f"{_CONFIG_PATH}.corrupt-{stamp}"
+        try:
+            os.replace(_CONFIG_PATH, kept)
+        except OSError:
+            kept = "(could not be kept)"
+        try:
+            cfg = _read_json(_CONFIG_BAK)
+            save_config(cfg)
+            _CONFIG_RECOVERY = (
+                "Your settings file was damaged, so QtC restored the last "
+                "good copy it had saved.\n\n"
+                f"The damaged file was kept as:\n{kept}")
+            return cfg
+        except (OSError, ValueError):
+            _write_default_config()
+            _CONFIG_RECOVERY = (
+                "Your settings file was damaged and no good copy was "
+                "found, so QtC started with default settings. Your "
+                "messages are not affected.\n\n"
+                f"The damaged file was kept as:\n{kept}")
+            return _read_json(_CONFIG_PATH)
 
 def _write_default_config():
     """Write a valid default config.json — used on first run or if file is corrupt."""
@@ -118,12 +170,38 @@ def _write_default_config():
         "app": {"page_limit": 20}
     }
     os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
-    with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(default, f, indent=4)
+    _write_json_atomic(_CONFIG_PATH, default)
+
+def _write_json_atomic(path, data):
+    """Write JSON so a crash or power cut can never leave a half-written
+    file: write a temp file beside it, flush it to disk, then swap it in
+    with os.replace (atomic on Linux and Windows)."""
+    tmp = f"{path}.tmp"
+    # 0o600: config.json holds the Telnet password. (Ignored on Windows.)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    if os.name == "posix":
+        os.chmod(tmp, 0o600)         # in case an old .tmp was left wider
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 def save_config(cfg):
-    with open(_CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4)
+    """Save config.json atomically. Called from the GUI thread and the
+    session worker, so one lock serialises writers. Before replacing a
+    good file, keep it as config.json.bak for load_config() to fall
+    back on."""
+    with _config_lock:
+        try:
+            if os.path.getsize(_CONFIG_PATH) > 0:
+                _read_json(_CONFIG_PATH)            # only back up a good file
+                shutil.copyfile(_CONFIG_PATH, _CONFIG_BAK)
+                if os.name == "posix":
+                    os.chmod(_CONFIG_BAK, 0o600)
+        except (OSError, ValueError):
+            pass
+        _write_json_atomic(_CONFIG_PATH, cfg)
 
 
 # ── Remembered window sizes (Bill, 2026-11-22) ───────────────────────────────
@@ -1294,6 +1372,12 @@ class ComposeDialog(_RememberSize, QDialog):
 
         self.at_bbs_edit  = QLineEdit()
         self.subject_edit = QLineEdit()
+        # Length caps (security review 2026-11-23, #7): generous for any
+        # real callsign / H-address / title, but a paste accident can't send
+        # a 30 KB line into the BBS's input handling.
+        self.to_edit.setMaxLength(80)
+        self.at_bbs_edit.setMaxLength(80)
+        self.subject_edit.setMaxLength(128)
         self.type_combo   = QComboBox()
         self.type_combo.addItems(["Personal (P)", "Bulletin (B)"])
         self.at_bbs_edit.setPlaceholderText(
@@ -1538,6 +1622,10 @@ class TerminalWidget(QWidget):
         self.output = QTextEdit()
         self.output.setReadOnly(True)
         self.output.setFont(QFont("Courier New", 10))
+        # Bounded (security review 2026-11-23, #6): a station streaming text
+        # for hours can't grow this without limit. 100k lines is far more
+        # than any real session; past it the oldest lines drop off.
+        self.output.document().setMaximumBlockCount(100_000)
         self.output.setStyleSheet(
             "background:#0d0d0d; color:#00ff00;"
             "border:1px solid #2a2a2a; border-radius:4px;")
@@ -1550,6 +1638,7 @@ class TerminalWidget(QWidget):
         prompt.setStyleSheet("color:#00ff00; background:#0d0d0d; padding:2px 6px;")
 
         self.input_line = QLineEdit()
+        self.input_line.setMaxLength(512)   # one BBS command line (security #7)
         self.input_line.setFont(QFont("Courier New", 10))
         self.input_line.setStyleSheet(
             "background:#1a1a1a; color:#00ff00;"
@@ -1711,6 +1800,10 @@ class DebugWidget(QWidget):
         self.output = QTextEdit()
         self.output.setReadOnly(True)
         self.output.setFont(QFont("Courier New", 9))
+        # Bounded (security review 2026-11-23, #6): a station streaming text
+        # for hours can't grow this without limit. 100k lines is far more
+        # than any real session; past it the oldest lines drop off.
+        self.output.document().setMaximumBlockCount(100_000)
         self.output.setStyleSheet(
             "background:#0a0a1a; color:#8888ff;"
             "border:1px solid #2a2a4a; border-radius:4px;")
@@ -2408,31 +2501,38 @@ class MailView(QWidget):
         self.btn_delete.setEnabled(True)   # enabled for all folders including bulletins
         self.btn_reply.setEnabled(folder in ("inbox", "drafts"))
 
+        # Every value below comes from the BBS (or a draft the user typed).
+        # QLabel renders HTML, so a subject like <img src="/dev/zero"> would
+        # be loaded as an image and exhaust memory. Escape each value; only
+        # our own <b> labels are markup.
+        def e(v):
+            return html.escape(str(v), quote=False)
+
         if folder == "drafts":
-            h = (f"<b>Draft to:</b> {rd.get('to_call') or '(none)'} &nbsp;"
-                 f"<b>Subject:</b> {rd.get('subject') or '(none)'} &nbsp;"
-                 f"<b>Saved:</b> {str(rd.get('created_at',''))[:16]}")
+            h = (f"<b>Draft to:</b> {e(rd.get('to_call') or '(none)')} &nbsp;"
+                 f"<b>Subject:</b> {e(rd.get('subject') or '(none)')} &nbsp;"
+                 f"<b>Saved:</b> {e(str(rd.get('created_at',''))[:16])}")
         elif folder == "outbox":
-            h = (f"<b>To:</b> {rd.get('to_call','')} &nbsp;"
-                 f"<b>Subject:</b> {rd.get('subject') or '(none)'} &nbsp;"
-                 f"<b>Queued:</b> {str(rd.get('created_at',''))[:16]}")
+            h = (f"<b>To:</b> {e(rd.get('to_call',''))} &nbsp;"
+                 f"<b>Subject:</b> {e(rd.get('subject') or '(none)')} &nbsp;"
+                 f"<b>Queued:</b> {e(str(rd.get('created_at',''))[:16])}")
         elif folder == "sent":
-            h = (f"<b>To:</b> {rd.get('to_call','')} &nbsp;"
-                 f"<b>Subject:</b> {rd.get('subject') or '(none)'} &nbsp;"
-                 f"<b>Sent:</b> {str(rd.get('sent_at',''))[:16]}")
+            h = (f"<b>To:</b> {e(rd.get('to_call',''))} &nbsp;"
+                 f"<b>Subject:</b> {e(rd.get('subject') or '(none)')} &nbsp;"
+                 f"<b>Sent:</b> {e(str(rd.get('sent_at',''))[:16])}")
         elif is_bulletin:
             cat = rd.get("category", "")
             at  = rd.get("at_bbs", "")
-            h = (f"<b>Category:</b> {cat}"
-                 + (f"@{at}" if at else "") + " &nbsp;"
-                 f"<b>From:</b> {rd.get('from_call','')} &nbsp;"
-                 f"<b>Subject:</b> {rd.get('subject') or '(none)'} &nbsp;"
-                 f"<b>Date:</b> {str(rd.get('date') or '')[:16]}")
+            h = (f"<b>Category:</b> {e(cat)}"
+                 + (f"@{e(at)}" if at else "") + " &nbsp;"
+                 f"<b>From:</b> {e(rd.get('from_call',''))} &nbsp;"
+                 f"<b>Subject:</b> {e(rd.get('subject') or '(none)')} &nbsp;"
+                 f"<b>Date:</b> {e(str(rd.get('date') or '')[:16])}")
         else:
-            h = (f"<b>From:</b> {rd.get('from_call','')} &nbsp;"
-                 f"<b>To:</b> {rd.get('to_call','')} &nbsp;"
-                 f"<b>Subject:</b> {rd.get('subject') or '(none)'} &nbsp;"
-                 f"<b>Date:</b> {str(rd.get('date') or '')[:16]}")
+            h = (f"<b>From:</b> {e(rd.get('from_call',''))} &nbsp;"
+                 f"<b>To:</b> {e(rd.get('to_call',''))} &nbsp;"
+                 f"<b>Subject:</b> {e(rd.get('subject') or '(none)')} &nbsp;"
+                 f"<b>Date:</b> {e(str(rd.get('date') or '')[:16])}")
         self.preview_header.setText(h)
         self.preview_body.setPlainText(
             rd["body"] or "(message body not yet downloaded)")
@@ -5314,6 +5414,7 @@ class MainWindow(QMainWindow):
         self.conn_light = QLabel("●")
         self.conn_light.setStyleSheet("color:#888888; font-size:18px;")
         self.conn_label = QLabel("  Not connected")
+        self.conn_label.setTextFormat(Qt.TextFormat.PlainText)  # may show BBS text
         self.conn_label.setMinimumWidth(120)
         self.conn_label.setMaximumWidth(480)
         self.conn_label.setStyleSheet("padding-right: 4px;")
@@ -5388,15 +5489,18 @@ class MainWindow(QMainWindow):
 
         # Main status label — occupies full width when idle
         self.status_label = QLabel("Ready")
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)  # may show BBS text
         sb.addWidget(self.status_label, 1)
 
         # Progress detail label — replaces status text during operations
         self._prog_detail = QLabel("")
+        self._prog_detail.setTextFormat(Qt.TextFormat.PlainText)  # may show BBS text
         self._prog_detail.setVisible(False)
         sb.addWidget(self._prog_detail, 1)
 
         # VARA link info — SN, bitrate, BW — shown right side during connection
         self._vara_info_label = QLabel("")
+        self._vara_info_label.setTextFormat(Qt.TextFormat.PlainText)  # may show BBS text
         self._vara_info_label.setStyleSheet(
             "color: #888888; font-size: 11px; padding: 0 6px;")
         self._vara_info_label.setVisible(False)
@@ -5405,6 +5509,7 @@ class MainWindow(QMainWindow):
         # Mail-Call status — "Next Mail-Call: 14:00 Local (in 1h 47m)" or
         # "Mail-Call: disabled" / error text. Hidden when empty.
         self._mc_status_label = QLabel("")
+        self._mc_status_label.setTextFormat(Qt.TextFormat.PlainText)  # may show BBS text
         self._mc_status_label.setStyleSheet(
             "color:#88aa88; font-size: 11px; padding: 0 6px;")
         self._mc_status_label.setVisible(False)
@@ -7932,6 +8037,9 @@ def main():
     win.show()
     if splash is not None:
         splash.finish(win)
+
+    if _CONFIG_RECOVERY:
+        QMessageBox.warning(win, "Settings restored", _CONFIG_RECOVERY)
 
     if test_api_port is not None:
         try:

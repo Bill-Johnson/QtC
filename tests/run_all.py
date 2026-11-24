@@ -43,8 +43,12 @@ def main(argv):
         name = os.path.basename(f)
         print(f"{name:<{width}}  ", end="", flush=True)
         t0 = time.time()
+        # UTF-8 both ways: Windows would otherwise decode the harnesses'
+        # output (em dashes, arrows) as cp1252 and crash the runner.
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
         proc = subprocess.run([sys.executable, f],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", env=env)
         dt = time.time() - t0
         ok = proc.returncode == 0
 

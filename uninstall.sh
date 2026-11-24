@@ -17,7 +17,9 @@ if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
     exit 0
 fi
 
-# Save config and database before removal
+# Save config and database before removal. umask 077: the backups hold
+# the Telnet password and all mail, so only this user may read them.
+umask 077
 if [ -f "$INSTALL_DIR/config.json" ]; then
     cp "$INSTALL_DIR/config.json" "$HOME/qtc_config_backup.json"
     echo "→ Config saved to ~/qtc_config_backup.json"

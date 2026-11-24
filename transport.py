@@ -1,4 +1,4 @@
-# QtC v0.15.0-beta — transport.py  (built 2026-10-04)
+# QtC v0.15.0-beta — transport.py  (built 2026-11-23)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -29,6 +29,19 @@ except ImportError:
 # box-drawing / block graphics. All are single-byte (cp437/cp850) or
 # self-synchronizing (utf-8), so per-chunk decoding in the reader is safe.
 SUPPORTED_TEXT_CODECS = ("utf-8", "cp437", "cp850")
+
+# Security review 2026-11-23, #6: nothing used to bound what a station
+# could make QtC buffer. A host streaming text with no prompt grew the
+# receive buffer forever, and the silence-based timeout never fired while
+# bytes kept coming. 2 MB is hours of VARA/packet airtime and far beyond
+# any real BBS reply; past it the oldest bytes are dropped (the prompt we
+# wait for is at the end), and a read waiting on a prompt gives up as if
+# it had timed out. Silence timeouts are unchanged.
+MAX_RX_BUFFER = 2 * 1024 * 1024
+
+
+def _capped(buf: bytes) -> bytes:
+    return buf[-MAX_RX_BUFFER:] if len(buf) > MAX_RX_BUFFER else buf
 
 def _validate_codec(codec: str) -> str:
     """Return a known-good codec name, defaulting to utf-8 for anything
@@ -158,7 +171,7 @@ class TelnetTransport:
             if not chunk:
                 continue
             with self._lock:
-                self._buf += chunk
+                self._buf = _capped(self._buf + chunk)
             if not self._terminal_mode:
                 line_buf = ""
                 continue
@@ -282,7 +295,7 @@ class TelnetTransport:
                     result = self._buf[:end]
                     self._buf = self._buf[end:]
                     return result.decode(self._text_codec, errors="replace")
-                if time.time() >= deadline:
+                if time.time() >= deadline or len(self._buf) >= MAX_RX_BUFFER:
                     result = self._buf
                     self._buf = b""
                     return result.decode(self._text_codec, errors="replace")
@@ -335,7 +348,7 @@ class TelnetTransport:
                     self._buf = self._buf[end:]
                     return (result.decode(self._text_codec,
                                           errors="replace"), best[0])
-                if time.time() >= deadline:
+                if time.time() >= deadline or len(self._buf) >= MAX_RX_BUFFER:
                     result = self._buf
                     self._buf = b""
                     return (result.decode(self._text_codec,
@@ -861,7 +874,7 @@ class VaraTransport:
 
             # Always buffer the bytes — read_until/read_raw_bytes consume from here
             with self._data_lock:
-                self._data_buf += chunk
+                self._data_buf = _capped(self._data_buf + chunk)
 
             # Stream to [RX] only when the user is watching (Terminal/Debug view)
             if not self._terminal_mode:
@@ -1214,7 +1227,8 @@ class VaraTransport:
                 lost = self._link_lost()
                 if lost:
                     raise ConnectionError(lost)
-                if self._silence_over(deadline, timeout, last_data):
+                if (self._silence_over(deadline, timeout, last_data)
+                        or len(self._data_buf) >= MAX_RX_BUFFER):
                     result = self._data_buf
                     self._data_buf = b""
                     return result.decode(self._text_codec, errors="replace")
@@ -1273,7 +1287,8 @@ class VaraTransport:
                 lost = self._link_lost()
                 if lost:
                     raise ConnectionError(lost)
-                if self._silence_over(deadline, timeout, last_data):
+                if (self._silence_over(deadline, timeout, last_data)
+                        or len(self._data_buf) >= MAX_RX_BUFFER):
                     result = self._data_buf
                     self._data_buf = b""
                     return (result.decode(self._text_codec,
@@ -1581,7 +1596,7 @@ class AGWTransport:
     def _handle_frame(self, kind, call_from, call_to, data):
         if kind == "D":
             with self._data_lock:
-                self._data_buf += data
+                self._data_buf = _capped(self._data_buf + data)
             if self._terminal_mode:
                 self._stream_lines(data)
             else:

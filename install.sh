@@ -103,6 +103,9 @@ install_app_files() {
         cp "$SCRIPT_DIR/config.json" "$INSTALL_DIR/"
         echo "  Created default config.json"
     fi
+    # Owner-only: config.json holds the Telnet password, data/ holds all mail.
+    chmod 700 "$INSTALL_DIR"
+    chmod 600 "$INSTALL_DIR/config.json"
     echo "  Files installed."
     # Restore database backup if present (preserves inbox, address book, sent)
     if [ ! -f "$INSTALL_DIR/data/messages.db" ] && [ -f "$HOME/qtc_messages_backup.db" ]; then

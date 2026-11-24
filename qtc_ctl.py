@@ -71,6 +71,22 @@ def show(line, res, negate=False):
     return ok
 
 
+def _token(port):
+    """The per-run token QtC wrote when --test-api started (see
+    qtc_test_api.token_path — same folder rule, kept here so this client
+    doesn't import Qt)."""
+    import os
+    if os.name == "nt":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.environ.get("XDG_DATA_HOME",
+                              os.path.join(os.path.expanduser("~"),
+                                           ".local", "share"))
+    path = os.path.join(base, "qtc", f"test_api_{port}.token")
+    with open(path, encoding="utf-8") as f:
+        return f.read().strip()
+
+
 def connect(port, wait):
     """Open the control socket, optionally retrying while QtC starts.
 
@@ -107,6 +123,15 @@ def main(argv):
         print("Start QtC with:  python3 main_window.py --test-api")
         return 2
     sock.settimeout(None)      # `wait` can legitimately block for minutes
+    try:
+        res = send(sock, f"auth {_token(port)}")
+    except (OSError, ConnectionError, ValueError) as e:
+        print(f"Could not authenticate to the QtC test API — {e}")
+        print("Is this the same user / XDG_DATA_HOME as the running QtC?")
+        return 2
+    if not res.get("ok"):
+        print(f"QtC refused the test API token: {res}")
+        return 2
 
     all_ok = True
     with sock:

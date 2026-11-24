@@ -18,7 +18,9 @@
 #     typed by hand.
 
 import json
+import os
 import re
+import secrets
 import socket
 import threading
 import queue
@@ -29,6 +31,19 @@ from PyQt6.QtCore import QObject, pyqtSignal, Qt
 API_HOST = "127.0.0.1"
 API_PORT = 8787
 
+
+
+def token_path(port):
+    """Where the per-run auth token lives: QtC's own data folder (mode
+    0700), the same rule as main_window._get_app_dir. qtc_ctl.py reads it
+    from here, so only this user's processes can drive QtC."""
+    if os.name == "nt":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.environ.get("XDG_DATA_HOME",
+                              os.path.join(os.path.expanduser("~"),
+                                           ".local", "share"))
+    return os.path.join(base, "qtc", f"test_api_{port}.token")
 
 class _Request:
     """One command in flight, with somewhere to put the answer."""
@@ -74,6 +89,17 @@ class TestAPI(QObject):
                 f"use that one, or start this with --test-api=<other port>."
             ) from e
         self._srv.listen(4)
+        # Security review 2026-11-23, #8: any local process — or a web
+        # page doing fetch() to 127.0.0.1 — could otherwise type commands,
+        # click dialogs or `connect` (which keys the transmitter). Every
+        # connection must start with "auth <token>"; the token is written
+        # owner-only for qtc_ctl.py and changes every run.
+        self._token = secrets.token_hex(16)
+        self._token_file = token_path(self.port)
+        fd = os.open(self._token_file,
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(self._token)
         threading.Thread(target=self._accept_loop, daemon=True,
                          name="qtc-test-api").start()
         self.win.setWindowTitle(self.win.windowTitle() + "   [TEST API]")
@@ -82,6 +108,10 @@ class TestAPI(QObject):
 
     def stop(self):
         self._stop.set()
+        try:
+            os.remove(self._token_file)
+        except (OSError, AttributeError):
+            pass
         if self._srv:
             try:
                 self._srv.close()
@@ -130,6 +160,7 @@ class TestAPI(QObject):
         # the line it matched.
         with self._log_lock:
             cursor = [len(self._log)]
+        authed = False
         with conn:
             while not self._stop.is_set():
                 try:
@@ -144,7 +175,24 @@ class TestAPI(QObject):
                     text = line.decode("utf-8", "replace").strip()
                     if not text:
                         continue
-                    out = self._handle(text, cursor)
+                    if not authed:
+                        # First line must be the token. Anything else (an
+                        # HTTP request, a stray client) is dropped unanswered
+                        # beyond one error line — nothing it sent runs.
+                        if secrets.compare_digest(text, f"auth {self._token}"):
+                            authed = True
+                            out = {"ok": True, "auth": "accepted"}
+                        else:
+                            self._note("[API] Refused a connection without "
+                                       "the token")
+                            try:
+                                conn.sendall(b'{"ok": false, "error": '
+                                             b'"auth required"}\n')
+                            except OSError:
+                                pass
+                            return
+                    else:
+                        out = self._handle(text, cursor)
                     try:
                         conn.sendall(
                             (json.dumps(out, default=str) + "\n").encode())

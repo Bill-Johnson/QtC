@@ -1,4 +1,4 @@
-# QtC v0.15.0-beta — bbs_session.py  (built 2026-10-01)
+# QtC v0.15.0-beta — bbs_session.py  (built 2026-11-23)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -84,6 +84,10 @@ class YappReceiver:
     """
 
     TIMEOUT = 60   # seconds to wait for any single frame
+
+    # Largest file QtC will accept over YAPP. YAPP is used over RF, where
+    # 10 MB is days of airtime; anything bigger is a fault or an attack.
+    MAX_FILE_BYTES = 10 * 1024 * 1024
 
     def __init__(self, transport, progress_cb=None, log_cb=None):
         self.transport   = transport
@@ -464,6 +468,21 @@ class YappReceiver:
                 received.extend(block)
                 block_num += 1
 
+                # Security review 2026-11-23, #6: the sender decides how
+                # much it sends. Stop at the size its own header announced
+                # (plus one block of slack) and never past MAX_FILE_BYTES,
+                # so a broken or hostile sender can't fill RAM and disk.
+                limit = self.MAX_FILE_BYTES
+                if filesize:
+                    limit = min(limit, filesize + 256)
+                if len(received) > limit:
+                    self._abort_and_drain(
+                        f"sender passed {limit} bytes "
+                        f"(header said {filesize or '?'})")
+                    raise IOError(
+                        f"YAPP: file larger than announced/allowed "
+                        f"({len(received)} > {limit} bytes) — not saved")
+
                 if self.progress_cb:
                     self.progress_cb(len(received), filesize)
                 total_str = str(filesize) if filesize else "?"
@@ -596,6 +615,51 @@ def wrap_body(body: str, width: int = WRAP_COLUMNS) -> List[str]:
         )
         out.extend(prefix + p for p in pieces) if pieces else out.append(line)
     return out
+
+
+# C0 control characters (except TAB) that have no business in a message.
+# Ctrl-Z (0x1A) ends a message on BPQ/FBB-style BBSes just like /EX.
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def clean_field(text: str) -> str:
+    """One-line field (To, @BBS, subject): drop CR/LF and control chars so
+    a pasted field can never become a second command line."""
+    return _CTRL_RE.sub("", (text or "").replace("\r", " ").replace("\n", " "))
+
+
+def neutralize_body(lines: List[str]) -> List[str]:
+    """Make sure the body can't end the message early (security review
+    2026-11-23, #5). A body line that starts with /EX would close the
+    message at that point and the BBS would run every line after it as a
+    command — KM included. Indent such lines by one space, which BPQ
+    treats as text, and strip control characters (Ctrl-Z also ends a
+    message). Every other line passes through untouched."""
+    out = []
+    for line in lines:
+        line = _CTRL_RE.sub("", line)
+        if line.lstrip().upper().startswith("/EX"):
+            line = " " + line.lstrip()
+        out.append(line)
+    return out
+
+
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL",
+                 *(f"COM{i}" for i in range(1, 10)),
+                 *(f"LPT{i}" for i in range(1, 10))}
+
+
+def safe_download_name(name: str) -> str:
+    """A file name that is safe to create in the user's save folder:
+    letters, digits, . _ - only (no path separators), no leading dot
+    (hidden / dot-files), no trailing dot, and not a Windows device
+    name such as CON or COM1."""
+    keep = "".join(c for c in (name or "")
+                   if c.isascii() and (c.isalnum() or c in "._-"))
+    keep = keep.lstrip(".").rstrip(".")
+    if keep.split(".")[0].upper() in _WIN_RESERVED:
+        keep = "_" + keep
+    return keep[:120] or "yapp_download"
 
 
 # ─────────────────────────────────────────────
@@ -745,11 +809,29 @@ class BBSSession:
         print(entry)
 
     def _send(self, text: str):
-        # Redact password from log — never show it in output
-        display = "********" if text == self.password and self.password else \
-                  (text if text else "<blank>")
+        # Redact passwords from the log — never show them in output. The
+        # saved password is masked wherever it goes; anything typed right
+        # after a password prompt is masked too (security review
+        # 2026-11-23, #12), so a password typed by hand in the Terminal
+        # never lands in the Debug view, a saved log or stdout.
+        if text and ((self.password and text == self.password)
+                     or self._at_password_prompt()):
+            display = "********"
+        else:
+            display = text if text else "<blank>"
         self._log("TX", display)
         self.transport.send(text)
+
+    def _at_password_prompt(self) -> bool:
+        """True when the last thing the BBS sent ends in a password prompt."""
+        peek = getattr(self.transport, "peek_input", None)
+        if not peek:
+            return False
+        try:
+            tail = peek()[-200:].rstrip().lower()
+        except Exception:
+            return False
+        return tail.endswith("password:") or tail.endswith("password")
 
     def _reply_wait(self, timeout: int = None) -> int:
         """Seconds of SILENCE to allow while waiting on a BBS reply.
@@ -1159,9 +1241,16 @@ class BBSSession:
         self._send(self.telnet_user)
 
         # Step 2: password
+        # Security review 2026-11-23, #2: the password goes ONLY to a
+        # password prompt. Telnet is cleartext, so sending it blind after a
+        # wrong host/port (or to a server that isn't a BPQ node) hands it to
+        # whatever answered. No prompt = stop here; the caller reports
+        # "Login failed" and disconnects.
         pwd_prompt = self._expect(self.PROMPT_PASSWORD, timeout=10)
         if self.PROMPT_PASSWORD.lower() not in pwd_prompt.lower():
-            self._log("SYS", "WARNING: Did not see 'password:' prompt")
+            self._log("SYS", "Did not see a 'password:' prompt — password "
+                             "NOT sent. Check the BBS host and port.")
+            return False
         self._send(self.password)
 
         # Step 3: read the welcome banner
@@ -1192,6 +1281,10 @@ class BBSSession:
             if extra.strip():
                 bbs_response += extra
                 deadline = _time.time() + 2.0  # reset timer on new data
+                # A host that never stops talking can't keep us here or
+                # grow this forever (security review 2026-11-23, #6).
+                if len(bbs_response) > 64 * 1024:
+                    break
             else:
                 break
 
@@ -1306,6 +1399,8 @@ class BBSSession:
     # BPQ user-database field commands. Bare value works for the name
     # prompt; the others must be sent as `<CMD> <value>` because BPQ treats
     # those field-names as dual-purpose commands (bare = query, with arg = set).
+    MAX_REGISTRATION_ROUNDS = 8
+
     REGISTRATION_WIRE_PREFIX = {
         "name":     "",
         "qth":      "QTH ",
@@ -1354,7 +1449,10 @@ class BBSSession:
         handled = False
         current = banner
 
-        while True:
+        # Cap the rounds (security review 2026-11-23, #7): a station that
+        # keeps asking "your name?" must not get answers on the air forever.
+        # LinBPQ asks at most four questions (name, QTH, zip, home BBS).
+        for _round in range(self.MAX_REGISTRATION_ROUNDS):
             field = self._registration_field(current)
             if not field:
                 break  # no more registration prompts — we're done
@@ -1376,6 +1474,12 @@ class BBSSession:
 
             # Wait for next prompt or final BBS prompt
             current = self._expect(self.PROMPT_BBS, timeout=15)
+        else:
+            if self._registration_field(current):
+                self._log("SYS",
+                    f"New user registration: still asking after "
+                    f"{self.MAX_REGISTRATION_ROUNDS} answers — stopped "
+                    f"answering. Finish it in the Terminal.")
 
         return handled, current
 
@@ -1710,7 +1814,9 @@ class BBSSession:
           5. We send the body lines then /EX on its own line
           6. BBS confirms: "Message NNN entered"  then returns to ">"
         """
-        to_call = to_call.upper()
+        to_call = clean_field(to_call).strip().upper()
+        at_bbs  = clean_field(at_bbs).strip()
+        subject = clean_field(subject)
 
         if msg_type.upper() == "P":
             cmd = f"sp {to_call}"
@@ -1755,7 +1861,7 @@ class BBSSession:
         # wrap_body() enforces the 72-column packet convention; see its
         # docstring. It never splits a word and leaves already-short lines
         # byte-for-byte alone.
-        lines = wrap_body(body)
+        lines = neutralize_body(wrap_body(body))
         from transport import AGWTransport
         if isinstance(self.transport, AGWTransport):
             # Packet: hand the modem the whole body as ONE block. Direwolf
@@ -2140,17 +2246,16 @@ class BBSSession:
             )
             rcvd_name, data = receiver.receive()
 
-            # Prefer the filename the BBS sent in the YAPP header;
-            # fall back to the requested name if the header was empty.
-            save_name = rcvd_name.strip() if rcvd_name.strip() \
-                        else os.path.basename(filename)
-
-            # Sanitize — keep alphanumeric, dots, dashes, underscores only
-            safe = set("abcdefghijklmnopqrstuvwxyz"
-                       "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                       "0123456789._-")
-            save_name = "".join(c for c in save_name if c in safe) \
-                        or "yapp_download"
+            # Save under the name the USER asked for (security review
+            # 2026-11-23, #8). The header name is chosen by the sender: with
+            # "Save to" set to a home folder it could create a dot-file such
+            # as .bash_aliases. Fall back to the header name only if the
+            # request had none. safe_download_name() strips the rest.
+            asked = os.path.basename(filename or "").strip()
+            save_name = safe_download_name(asked or rcvd_name)
+            if rcvd_name.strip() and rcvd_name.strip() != asked:
+                self._log("SYS", f"YAPP header named the file "
+                                 f"{rcvd_name.strip()!r}; saving as {save_name!r}")
 
             save_path = os.path.join(save_dir, save_name)
             # Avoid silently overwriting an existing file

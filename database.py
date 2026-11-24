@@ -1,4 +1,4 @@
-# QtC v0.15.0-beta — database.py  (built 2026-11-18)
+# QtC v0.15.0-beta — database.py  (built 2026-11-23)
 # VARA BBS Client — A modern BBS client for LinBPQ/BPQ32 nodes
 # via VARA HF, VARA FM, and Telnet.
 #
@@ -35,7 +35,22 @@ def _get_conn(db_file=None):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    _make_private(path)
     return conn
+
+
+_private_done = set()
+
+def _make_private(path):
+    """Owner-only mail database (security review 2026-11-23, #3).
+    SQLite gives its journal files the same mode as the database."""
+    if os.name != "posix" or path in _private_done:
+        return
+    try:
+        os.chmod(path, 0o600)
+        _private_done.add(path)
+    except OSError:
+        pass
 
 
 def init_db(db_file=None):

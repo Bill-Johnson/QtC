@@ -24,7 +24,13 @@ _scr = os.path.join(_tmp, "screen.json")
 json.dump({"screens": [{"name": "s1", "x": 0, "y": 0, "width": 1920,
                         "height": 1080, "logicalDpi": 96,
                         "logicalBaseDpi": 96, "dpr": 1}]}, open(_scr, "w"))
-os.environ["QT_QPA_PLATFORM"] = f"offscreen:configfile={_scr}"
+# Qt splits platform options on ':', so a Windows drive letter ("C:")
+# would cut the path short. Drop the drive; the temp dir is on the same
+# drive as the working folder in practice.
+_scr_opt = _scr.replace("\\", "/")
+if os.name == "nt" and len(_scr_opt) > 1 and _scr_opt[1] == ":":
+    _scr_opt = _scr_opt[2:]
+os.environ["QT_QPA_PLATFORM"] = f"offscreen:configfile={_scr_opt}"
 cfg_path = os.path.join(_tmp, "config.json")
 json.dump({
     "user": {"callsign": "N0CALL", "name": "", "qth": "", "zip": "",
