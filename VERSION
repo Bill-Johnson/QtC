@@ -14,11 +14,23 @@ WHAT THIS IS
   The public dev branch. Run it from a git clone (see README.md); there
   are no release downloads for -dev builds. It adds three experimental
   open-source modems that use VARA's control scheme — Mercury, Data2G
-  and VardeFM — as drop-down choices right beside VARA, and the fixes
-  that made them work.
+  and VardeFM — as drop-down choices right beside VARA, with the fixes
+  that made them work. It also adds CAT PTT for VARA, through flrig or
+  Hamlib rigctld.
   What we measured on the air is in dev_notes.txt.
 
 NEW
+  - CAT PTT for VARA: Settings > PTT has two new modes, "CAT via flrig"
+    and "CAT via Hamlib rigctld", each with its own Host and Port
+    (127.0.0.1:12345 / 127.0.0.1:4532 by default). For radios keyed
+    over CAT (Xiegu X6100, IC-705 and others with a built-in USB sound
+    card), QtC asks flrig or rigctld to key the radio when VARA sends
+    PTT ON / OFF, so the CAT port stays with that program and no second
+    serial port is needed. Every call gives up after 2 s; unkeying is
+    checked and retried, with a warning if the radio still reports TX;
+    and QtC releases PTT itself after 30 s keyed without a PTT OFF.
+    Test PTT works for both. flrig passed on the air with an X6100 on
+    Windows 11 (key-up about 0.2 s); rigctld so far offline only.
   - Mercury, Data2G and VardeFM are always in the Mode lists and the
     BBS entry dialog, beside VARA. (Early dev builds hid them behind a
     Settings > App > "Experimental modems" switch, which confused

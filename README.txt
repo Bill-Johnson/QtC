@@ -42,8 +42,14 @@ Transports
   other station, not to VARA — so the BBS must run the same modem
 - PTT — for VARA, RTS or DTR via serial port, with both lines set low
   before QtC opens the port, so opening it does not key the radio;
-  defensive flow-control flags for Digirig / CP2105 setups. Packet modems
-  key the radio themselves
+  defensive flow-control flags for Digirig / CP2105 setups. Packet and
+  the experimental modems key the radio themselves
+- CAT PTT (new on dev) — for radios keyed over CAT (Xiegu X6100, IC-705
+  and others with a built-in USB sound card), QtC asks flrig or Hamlib
+  rigctld to key the radio when VARA sends PTT ON / OFF. The CAT port
+  stays with flrig, so no second serial port is needed. QtC checks the
+  radio really unkeyed, and releases PTT itself if it is ever keyed for
+  more than 30 seconds without a PTT OFF. See "CAT PTT Setup" below
 
 Mail
 - Bounded mail check — every listing is limited by something you
@@ -176,7 +182,8 @@ Requirements
   the system keyring"; the installers add it)
 - For VARA: the VARA HF and/or VARA FM modem (registered or trial) — run
   natively on Windows; run under Wine or Crossover on Linux / Pi — and a
-  VOX or serial PTT interface
+  VOX, serial (RTS/DTR) or CAT PTT interface — CAT PTT (dev) needs
+  flrig or Hamlib rigctld running
 - For packet: Direwolf, UZ7HO SoundModem (Windows) or QtSoundModem
   (Linux / Pi)
 - USB Soundcard — Signalink, Rigblaster, Digirig
@@ -284,7 +291,8 @@ First-Time Setup
 2. Go to the BBS List tab — add your BBS with its transport (VARA HF,
    VARA FM, Direwolf, (Qt)SoundModem, or Telnet; a Telnet BBS gets its
    username and password here)
-3. Go to the PTT tab — select serial port and signal (RTS recommended for Digirig)
+3. Go to the PTT tab — select serial port and signal (RTS recommended for Digirig),
+   or CAT via flrig / rigctld (dev) for a radio keyed over CAT
 4. Close Settings, select your BBS from the dropdown, and click Connect
 5. After your first connect to your Home BBS, open Settings -> Bulletins —
    QtC has already pulled the category list off the node. Tick the ones you
@@ -302,7 +310,39 @@ VARA Setup
 - VARA command port: 8300 (default)
 - VARA data port: 8301 (default)
 - Set your callsign in VARA to match the callsign in QtC Settings
-- Set VARA's PTT setting to None — QtC keys the radio via RTS/DTR directly
+- Set VARA's PTT setting to None — QtC keys the radio via RTS/DTR directly,
+  or over CAT (see below)
+
+------------------------------------------------------------------------
+
+CAT PTT Setup (dev)
+
+For VARA HF / FM with a radio that is keyed over CAT. Packet and the
+experimental modems key the radio themselves, so this is only for VARA.
+
+flrig:
+1. Start flrig with the radio connected, and set flrig to key the
+   radio over CAT (its PTT setting)
+2. Settings -> PTT -> PTT Mode "CAT via flrig" — Host 127.0.0.1,
+   Port 12345 (flrig's default)
+3. Test PTT — the radio keys for 1 second, and flrig's PTT button lights
+
+Hamlib rigctld:
+1. Start rigctld for your radio, e.g.
+     rigctld -m <model> -r /dev/ttyUSB0 -s 115200     (Windows: -r COM8)
+   "rigctl -l" lists the model numbers
+2. Settings -> PTT -> PTT Mode "CAT via Hamlib rigctld" — Host
+   127.0.0.1, Port 4532
+3. Test PTT
+
+- flrig / rigctld can run on another computer — put its address in Host
+- QtC asks flrig / rigctld to key; it never opens the CAT port itself,
+  so a logger or another program that also talks to flrig keeps working
+- Keying over CAT takes about 0.2 s through flrig (RTS is instant).
+  VARA handled that fine on the air
+- Safety: QtC checks that the radio really unkeyed, and warns you if it
+  did not. If the radio is keyed for more than 30 seconds without a
+  PTT OFF from VARA, QtC releases it and tells you
 
 ------------------------------------------------------------------------
 
@@ -372,7 +412,8 @@ Source Files
                     YAPP file transfer
   transport.py    — VARA HF, VARA FM, AGW packet (Direwolf / SoundModem),
                     and Telnet transports (single-reader pattern)
-  ptt.py          — PTT control via serial RTS/DTR
+  ptt.py          — PTT control via serial RTS/DTR, or CAT via flrig /
+                    Hamlib rigctld
   credentials.py  — Telnet logins: one per BBS entry, settings file
                     or system keyring
   database.py     — SQLite: inbox, drafts, outbox, sent, bulletins,
@@ -384,7 +425,10 @@ Source Files
 
 Known Limitations (Beta)
 
-- No rig control yet — set frequency manually on your radio
+- No frequency control yet — set frequency manually on your radio (dev
+  has CAT PTT only; tuning the radio to each BBS's frequency is planned)
+- CAT PTT: flrig tested on the air (Xiegu X6100, Windows 11); rigctld
+  has passed offline tests only so far — reports welcome
 - Experimental modems are in testing. Data2G and Mercury have passed
   full mail sessions on HF; VardeFM has not yet been tested on the air;
   YAPP file transfer over them is untested

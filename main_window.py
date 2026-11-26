@@ -1,4 +1,4 @@
-# QtC v0.16.0-dev — main_window.py  (built 2026-11-23)
+# QtC v0.16.0-dev — main_window.py  (built 2026-11-26)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -505,24 +505,31 @@ class SessionWorker(QThread):
             # Wire remote-disconnect callback so BBS/VARA timeout updates the GUI
             t._on_disconnected_cb = lambda: self.sig_disconnected.emit()
 
-            # Attach PTT controller if configured
-            ptt_cfg = self.config.get("ptt", {})
-            ptt_mode = ptt_cfg.get("mode", "none")
-            ptt_port = ptt_cfg.get("port", "")
-            ptt_signal = ptt_cfg.get("signal", "rts")
-            if ptt_mode != "none" and ptt_port:
-                from ptt import PTTController
-                ptt = PTTController(port=ptt_port, mode=ptt_signal)
+            # Attach PTT controller if configured (COM RTS/DTR, flrig, rigctld)
+            from ptt import make_ptt, PTTController
+            ptt = make_ptt(self.config.get("ptt", {}))
+            if ptt is not None:
                 ptt._log = lambda d, txt: self.sig_log.emit(f"[{d}] {txt.strip()}")
+                if not isinstance(ptt, PTTController):
+                    # Stuck key / 30 s watchdog — fired from a worker
+                    # thread, so it goes out through a signal, never a
+                    # QMessageBox here.
+                    ptt._on_alert = lambda m: self.sig_error.emit(m)
                 ptt.open()
                 if not ptt.is_open:
                     # Don't abort the connect — VOX users and "I'll fix it later"
                     # users can still operate. But shout about it so the user
                     # isn't watching the waterfall transmit with a silent radio.
-                    msg = (f"PTT port {ptt_port!r} did not open: "
-                           f"{ptt.last_error or 'unknown error'}. "
-                           f"This port may be open in Vara Terminal or another "
-                           f"app — close it and reconnect.")
+                    if isinstance(ptt, PTTController):
+                        msg = (f"PTT port {ptt.port!r} did not open: "
+                               f"{ptt.last_error or 'unknown error'}. "
+                               f"This port may be open in Vara Terminal or another "
+                               f"app — close it and reconnect.")
+                    else:
+                        msg = (f"PTT: could not reach {ptt.KIND} at {ptt.where}: "
+                               f"{ptt.last_error or 'unknown error'}. "
+                               f"Start {ptt.KIND} (with the radio connected) "
+                               f"and reconnect.")
                     self.sig_log.emit(f"[PTT] *** {msg} ***")
                     self.sig_error.emit(msg)
                 t.ptt = ptt
@@ -2996,8 +3003,11 @@ class SettingsDialog(_RememberSize, QDialog):
 
     # ── Tab: PTT ──────────────────────────────────────────────────
 
+    # Combo index ↔ config "mode"
+    _PTT_MODES = ("none", "com", "flrig", "rigctld")
+
     def _build_ptt_tab(self) -> QWidget:
-        from ptt import list_serial_ports
+        from ptt import FLRIG_DEFAULT_PORT, RIGCTLD_DEFAULT_PORT
 
         w = QWidget()
         outer = QVBoxLayout(w)
@@ -3005,6 +3015,18 @@ class SettingsDialog(_RememberSize, QDialog):
         outer.setSpacing(14)
 
         ptt = self._cfg.get("ptt", {})
+        mode = (ptt.get("mode") or "none").lower()
+        if mode not in self._PTT_MODES:
+            mode = "com"          # anything else old configs wrote meant a COM port
+
+        # Host/port per CAT program, so flipping between them keeps both.
+        self._ptt_net = {
+            "flrig":   [ptt.get("flrig_host") or "127.0.0.1",
+                        int(ptt.get("flrig_port") or FLRIG_DEFAULT_PORT)],
+            "rigctld": [ptt.get("rigctld_host") or "127.0.0.1",
+                        int(ptt.get("rigctld_port") or RIGCTLD_DEFAULT_PORT)],
+        }
+        self._ptt_net_shown = None    # which program the host/port boxes hold
 
         # ── Mode + port + signal ───────────────────────
         mode_group = QFrame()
@@ -3013,10 +3035,14 @@ class SettingsDialog(_RememberSize, QDialog):
         mode_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         mode_layout.setVerticalSpacing(10)
         mode_layout.setContentsMargins(12, 12, 12, 12)
+        self._ptt_form = mode_layout
 
         self.ptt_mode = QComboBox()
-        self.ptt_mode.addItems(["None (VOX / disabled)", "COM Port"])
-        self.ptt_mode.setCurrentIndex(0 if ptt.get("mode", "none") == "none" else 1)
+        self.ptt_mode.addItems(["None (VOX / disabled)",
+                                "COM Port (RTS / DTR)",
+                                "CAT via flrig",
+                                "CAT via Hamlib rigctld"])
+        self.ptt_mode.setCurrentIndex(self._PTT_MODES.index(mode))
         self.ptt_mode.currentIndexChanged.connect(self._ptt_mode_changed)
         mode_layout.addRow("PTT Mode:", self.ptt_mode)
 
@@ -3031,6 +3057,7 @@ class SettingsDialog(_RememberSize, QDialog):
             lambda: self._ptt_refresh_ports(self.ptt_port.currentText()))
         port_row.addWidget(btn_refresh)
         port_row.addStretch()
+        self._ptt_port_row = port_row
         mode_layout.addRow("Serial port:", port_row)
 
         self.ptt_signal = QComboBox()
@@ -3038,6 +3065,18 @@ class SettingsDialog(_RememberSize, QDialog):
         sig_map = {"rts": 0, "dtr": 1, "rts+dtr": 2}
         self.ptt_signal.setCurrentIndex(sig_map.get(ptt.get("signal", "rts"), 0))
         mode_layout.addRow("PTT signal:", self.ptt_signal)
+
+        self.ptt_host = QLineEdit()
+        self.ptt_host.setMinimumWidth(160)
+        self.ptt_host.setToolTip(
+            "127.0.0.1 when flrig / rigctld runs on this computer; "
+            "otherwise the IP address of the computer it runs on.")
+        mode_layout.addRow("Host:", self.ptt_host)
+
+        self.ptt_net_port = QSpinBox()
+        self.ptt_net_port.setRange(1, 65535)
+        self.ptt_net_port.setFixedWidth(90)
+        mode_layout.addRow("Port:", self.ptt_net_port)
 
         outer.addWidget(mode_group)
 
@@ -3055,8 +3094,21 @@ class SettingsDialog(_RememberSize, QDialog):
         test_row.addStretch()
         outer.addLayout(test_row)
 
-        # ── Help note ──────────────────────────────────
-        note = QLabel(
+        # ── Help note (changes with the mode) ──────────
+        self.ptt_note = QLabel()
+        self.ptt_note.setStyleSheet(f"color: {self._note_color}; font-size:11px;")
+        self.ptt_note.setWordWrap(True)
+        outer.addWidget(self.ptt_note)
+        outer.addStretch()
+
+        self._ptt_mode_changed(self.ptt_mode.currentIndex())
+        return w
+
+    _PTT_NOTES = {
+        "none": (
+            "<i>No PTT from QtC: the radio keys itself (VOX, a SignaLink, "
+            "or VARA's own PTT setting).</i>"),
+        "com": (
             "<i><b>Digirig Mobile:</b> select its ttyUSB port, signal = RTS.<br>"
             "VARA sends PTT ON / PTT OFF on its command port — this app keys<br>"
             "the radio accordingly.  Set VARA's own PTT setting to <b>None</b>.<br><br>"
@@ -3065,14 +3117,29 @@ class SettingsDialog(_RememberSize, QDialog):
             "close it before testing here or before connecting.<br><br>"
             "<b>CP2105 dual-port devices</b> (some Digirig models, etc.):<br>"
             "PTT is typically on the <i>Standard</i> port, not the <i>Enhanced</i> port.<br><br>"
-            "Test PTT keys the radio for 1 second without connecting to a station.</i>")
-        note.setStyleSheet(f"color: {self._note_color}; font-size:11px;")
-        note.setWordWrap(True)
-        outer.addWidget(note)
-        outer.addStretch()
-
-        self._ptt_mode_changed(self.ptt_mode.currentIndex())
-        return w
+            "Test PTT keys the radio for 1 second without connecting to a station.</i>"),
+        "flrig": (
+            "<i>For radios keyed over <b>CAT</b> (Xiegu X6100, IC-705, most rigs "
+            "with a built-in USB sound card).<br>"
+            "Start <b>flrig</b> first, with the radio connected and its PTT set "
+            "to CAT. QtC asks flrig to key the radio, so the CAT port stays "
+            "with flrig and other programs (Data2G, logging) can share it.<br><br>"
+            "flrig listens on port <b>12345</b>. Set VARA's own PTT setting to "
+            "<b>None</b>.<br>"
+            "QtC releases PTT by itself if it is ever keyed for more than "
+            "30 seconds.<br><br>"
+            "Test PTT keys the radio for 1 second without connecting to a station.</i>"),
+        "rigctld": (
+            "<i>For radios keyed over <b>CAT</b>, through Hamlib's "
+            "<b>rigctld</b>.<br>"
+            "Start it first, e.g. <code>rigctld -m &lt;model&gt; -r COM8 "
+            "-s 115200</code> (<code>rigctl -l</code> lists the model numbers).<br>"
+            "It listens on port <b>4532</b>. Set VARA's own PTT setting to "
+            "<b>None</b>.<br>"
+            "QtC releases PTT by itself if it is ever keyed for more than "
+            "30 seconds.<br><br>"
+            "Test PTT keys the radio for 1 second without connecting to a station.</i>"),
+    }
 
     def _ptt_refresh_ports(self, select_port: str = ""):
         from ptt import list_serial_ports
@@ -3087,38 +3154,82 @@ class SettingsDialog(_RememberSize, QDialog):
                 self.ptt_port.setCurrentText(select_port)
         self.ptt_port.blockSignals(False)
 
+    def _ptt_stash_net(self):
+        """Keep what's in Host/Port for the program they were showing."""
+        if self._ptt_net_shown:
+            self._ptt_net[self._ptt_net_shown] = [
+                self.ptt_host.text().strip() or "127.0.0.1",
+                self.ptt_net_port.value()]
+
     def _ptt_mode_changed(self, index: int):
-        enabled = (index == 1)
-        self.ptt_port.setEnabled(enabled)
-        self.ptt_signal.setEnabled(enabled)
-        self.btn_ptt_test.setEnabled(enabled)
+        mode = self._PTT_MODES[index]
+        com, net = mode == "com", mode in ("flrig", "rigctld")
+        form = self._ptt_form
+        form.setRowVisible(self._ptt_port_row, com)
+        form.setRowVisible(self.ptt_signal, com)
+        form.setRowVisible(self.ptt_host, net)
+        form.setRowVisible(self.ptt_net_port, net)
+        self._ptt_stash_net()
+        if net:
+            host, port = self._ptt_net[mode]
+            self.ptt_host.setText(host)
+            self.ptt_net_port.setValue(port)
+        self._ptt_net_shown = mode if net else None
+        self.btn_ptt_test.setEnabled(mode != "none")
+        self.ptt_note.setText(self._PTT_NOTES[mode])
+
+    def _ptt_cfg_from_dialog(self) -> dict:
+        """The "ptt" config dict for what the tab shows now."""
+        self._ptt_stash_net()
+        mode = self._PTT_MODES[self.ptt_mode.currentIndex()]
+        sig_map = {0: "rts", 1: "dtr", 2: "rts+dtr"}
+        port = self.ptt_port.currentText()
+        return {
+            "mode":   mode,
+            "port":   port if mode == "com" and not port.startswith("(") else "",
+            "signal": sig_map[self.ptt_signal.currentIndex()],
+            "flrig_host":   self._ptt_net["flrig"][0],
+            "flrig_port":   self._ptt_net["flrig"][1],
+            "rigctld_host": self._ptt_net["rigctld"][0],
+            "rigctld_port": self._ptt_net["rigctld"][1],
+        }
 
     def _ptt_test(self):
         """Key the radio for 1 second using current settings — no station needed."""
         import threading
-        from ptt import PTTController
-        sig_map = {0: "rts", 1: "dtr", 2: "rts+dtr"}
-        port   = self.ptt_port.currentText()
-        signal = sig_map[self.ptt_signal.currentIndex()]
-        if not port or port.startswith("("):
+        from ptt import make_ptt, PTTController
+        cfg = self._ptt_cfg_from_dialog()
+        if cfg["mode"] == "com" and not cfg["port"]:
             QMessageBox.warning(self, "No Port", "Select a serial port first.")
+            return
+        ptt = make_ptt(cfg)
+        if ptt is None:
             return
         self.btn_ptt_test.setEnabled(False)
         self.btn_ptt_test.setText("🔴  Keying…")
         def _do_test():
             err = ""
             try:
-                ptt = PTTController(port=port, mode=signal)
                 ptt.open()
                 if not ptt.is_open:
-                    err = (f"Could not open {port}:\n\n"
-                           f"{ptt.last_error or 'unknown error'}\n\n"
-                           f"This port may be open in Vara Terminal or another "
-                           f"PTT-driving app — only one program can hold the "
-                           f"COM port. Close it and try again.")
+                    if isinstance(ptt, PTTController):
+                        err = (f"Could not open {ptt.port}:\n\n"
+                               f"{ptt.last_error or 'unknown error'}\n\n"
+                               f"This port may be open in Vara Terminal or another "
+                               f"PTT-driving app — only one program can hold the "
+                               f"COM port. Close it and try again.")
+                    else:
+                        err = (f"Could not reach {ptt.KIND} at {ptt.where}:\n\n"
+                               f"{ptt.last_error or 'unknown error'}\n\n"
+                               f"Start {ptt.KIND} with the radio connected, "
+                               f"then try again.")
                 else:
+                    alerts = []
+                    ptt._on_alert = alerts.append
                     ptt.test(duration=1.0)
                     ptt.close()
+                    if alerts:
+                        err = alerts[-1]
             except Exception as exc:
                 err = str(exc) or exc.__class__.__name__
             try:
@@ -4355,12 +4466,7 @@ class SettingsDialog(_RememberSize, QDialog):
         }
 
         # PTT tab
-        sig_map = {0: "rts", 1: "dtr", 2: "rts+dtr"}
-        self._cfg["ptt"] = {
-            "mode":   "none" if self.ptt_mode.currentIndex() == 0 else "com",
-            "port":   self.ptt_port.currentText() if self.ptt_mode.currentIndex() == 1 else "",
-            "signal": sig_map[self.ptt_signal.currentIndex()],
-        }
+        self._cfg["ptt"] = self._ptt_cfg_from_dialog()
 
         # Mail-Call !!! tab — validate custom-times 2hr gap before accepting
         mc_mode = (
