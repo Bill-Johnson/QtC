@@ -1,4 +1,4 @@
-# QtC v0.15.0-beta — transport.py  (built 2026-11-23)
+# QtC v0.15.0-beta — transport.py  (built 2026-11-26)
 # Copyright (C) 2025-2026 Bill Johnson, KC9MTP
 #
 # This program is free software: you can redistribute it and/or modify
@@ -98,6 +98,16 @@ class TelnetTransport:
     WONT = bytes([252])
     WILL = bytes([251])
 
+    # Terminal view only: print a half-line that has sat unfinished this
+    # long with nothing new arriving. Catches prompts that end in neither
+    # CR/LF nor > : ? — a BBS menu app's "Press [Enter] to restore
+    # master menu loop configuration..." stayed hidden until Bill typed
+    # something (2026-11-25). Telnet ONLY: the two halves of a TCP-split
+    # line land milliseconds apart, so 2 s can never cut a real line in
+    # two. RF frame gaps can run several seconds — the RF readers keep
+    # the no-timer rule (Bill, 2026-11-26).
+    PARTIAL_FLUSH_S = 2.0
+
     def __init__(self, host, port, timeout=30):
         self.host    = host
         self.port    = port
@@ -153,11 +163,13 @@ class TelnetTransport:
 
         When _terminal_mode is True, also emits complete lines as [RX]
         log entries, via _stream_rx_lines: CR/LF, or a prompt character
-        that is the last thing in the chunk. Never on socket timeout, so
-        a BBS line split across two recv() calls is reassembled, not
-        printed in pieces.
+        that is the last thing in the chunk. A line split across two
+        recv() calls is reassembled, not printed in pieces. A half-line
+        left waiting PARTIAL_FLUSH_S with no new data is printed anyway
+        (CR-less prompts that end in some other character).
         """
         line_buf = ""
+        last_rx = time.monotonic()
 
         def _emit_line(s: str):
             if s and self._log:
@@ -169,7 +181,18 @@ class TelnetTransport:
                 continue
             chunk = self._recv_chunk(timeout=0.5)
             if not chunk:
+                # Print a held half-line after a quiet spell, or at once
+                # if the BBS just closed the connection — one BBS menu app
+                # hangs up 1 s after "Session Terminated", before the
+                # timer, and the held text was silently lost (2026-11-26).
+                if (line_buf.strip() and self._terminal_mode
+                        and (not self.connected
+                             or time.monotonic() - last_rx
+                             >= self.PARTIAL_FLUSH_S)):
+                    _emit_line(line_buf.strip())
+                    line_buf = ""
                 continue
+            last_rx = time.monotonic()
             with self._lock:
                 self._buf = _capped(self._buf + chunk)
             if not self._terminal_mode:

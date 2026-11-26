@@ -7,7 +7,7 @@ only place that records what changed and when.
 
 
 ========================================================================
-0.16.0-dev  (2026-11-23)  — development branch, not a release
+0.16.0-dev  (2026-11-26)  — development branch, not a release
 ========================================================================
 
 WHAT THIS IS
@@ -95,6 +95,10 @@ FIXED
     anything. A crash or power loss never leaves you locked out. A
     test copy with its own XDG_DATA_HOME still runs beside the daily
     one.
+  - Terminal view over Telnet: a BBS prompt that does not end in >, :
+    or ? (for example "Press [Enter] to continue...") stayed hidden
+    until you typed something. It now shows after 2 seconds of quiet,
+    or straight away if the BBS hangs up.
 
 SECURITY
   A review of how QtC handles what a BBS (or anyone on frequency) sends
